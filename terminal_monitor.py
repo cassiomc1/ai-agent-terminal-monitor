@@ -73,6 +73,29 @@ DEFAULT_PREFERRED_ANSWERS: tuple[str, ...] = (
     "approve",
 )
 
+SPECIAL_KEY_CODES: dict[str, int] = {
+    "tab": 9,
+    "\t": 9,
+    "enter": 13,
+    "return": 13,
+    "\r": 13,
+    "\n": 10,
+    "esc": 27,
+    "escape": 27,
+    "\x1b": 27,
+    "ctrl+c": 3,
+    "ctrl_c": 3,
+    "\x03": 3,
+    "ctrl+p": 16,
+    "ctrl_p": 16,
+    "\x10": 16,
+    "ctrl+d": 4,
+    "ctrl_d": 4,
+    "\x04": 4,
+    "backspace": 127,
+    "delete": 127,
+}
+
 
 def match_pattern(pattern: str, text: str) -> bool:
     """Match a pattern against text safely, supporting regex or substring."""
@@ -85,6 +108,20 @@ def match_pattern(pattern: str, text: str) -> bool:
             return bool(re.search(pattern, text, re.IGNORECASE | re.MULTILINE))
         except re.error:
             pass
+    return False
+
+
+def is_table_or_box_line(line: str) -> bool:
+    """Check if a line is part of a markdown or unicode box/table."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if re.search(r"[┌├└┬┴┼─━═]", stripped):
+        return True
+    if stripped.count("│") >= 2 or stripped.count("|") >= 2:
+        return True
+    if re.match(r"^[\s|+_=-]+$", stripped):
+        return True
     return False
 
 
@@ -107,6 +144,10 @@ class AgentProfile:
     preferred_answers: list[str] = field(default_factory=lambda: list(DEFAULT_PREFERRED_ANSWERS))
     auto_permission_payload: str = ""
     default_continue_text: str | None = None
+    mode_patterns: dict[str, str] = field(default_factory=dict)
+    plan_ready_patterns: list[str] = field(default_factory=list)
+    mode_switch_key: str = "tab"
+    completion_patterns: list[str] = field(default_factory=list)
 
     def matches_thinking(self, history_tail: str) -> bool:
         return any(match_pattern(pat, history_tail) for pat in self.thinking_patterns)
@@ -117,21 +158,57 @@ class AgentProfile:
     def matches_question(self, history_tail: str) -> bool:
         if any(match_pattern(pat, history_tail) for pat in self.question_indicators):
             return True
-        # If multiple structured options are present in tail
-        if len(self.extract_options(history_tail)) >= 2:
-            return True
+        options = self.extract_options(history_tail)
+        if len(options) >= 2:
+            prompt_cue = any(
+                re.search(pat, history_tail, re.IGNORECASE)
+                for pat in (r"\?", r"question", r"select", r"choose", r"option", r"recommended", r"⇆", r"\(1-", r"\[y/n\]", r"enter confirm")
+            )
+            if prompt_cue:
+                return True
         return False
 
+    def matches_completion(self, history_tail: str) -> bool:
+        if not self.completion_patterns:
+            return False
+        return any(match_pattern(pat, history_tail) for pat in self.completion_patterns)
+
+    def detect_mode(self, history_tail: str) -> str | None:
+        """Detect the active TUI mode from history tail if patterns are configured."""
+        if not self.mode_patterns:
+            return None
+        for mode, pattern in self.mode_patterns.items():
+            if re.search(pattern, history_tail, re.IGNORECASE | re.MULTILINE):
+                return mode
+        return None
+
+    def is_plan_ready(self, history_tail: str) -> bool:
+        """Detect if the agent has finished planning and is waiting for approval."""
+        if not self.plan_ready_patterns:
+            return False
+        return any(match_pattern(pat, history_tail) for pat in self.plan_ready_patterns)
+
     def extract_options(self, history_tail: str) -> list[tuple[str, bool]]:
+        """Extract selectable options and their recommendation status from history tail."""
         options: list[tuple[str, bool]] = []
+        in_code_block = False
         for line in history_tail.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                in_code_block = not in_code_block
+                continue
+            if in_code_block:
+                continue
+            if is_table_or_box_line(line):
+                continue
+
             is_option = any(match_pattern(pat, line) for pat in self.option_patterns)
             if not is_option and re.search(r"recommended", line, re.IGNORECASE):
                 is_option = True
 
             if is_option:
                 clean = clean_option(line)
-                if clean:
+                if clean and len(clean) >= 2:
                     is_rec = bool(re.search(r"recommended", line, re.IGNORECASE))
                     options.append((clean, is_rec))
         return options
@@ -147,22 +224,49 @@ BUILTIN_PROFILES: dict[str, AgentProfile] = {
             "preparing write",
             "thinking...",
             "working...",
+            r"~ (writing|updating|reading|running)",
         ],
         permission_patterns=[
             r"allow.*deny",
             "allow once",
+            "allow always",
             "permission required",
+            "do you want to run",
         ],
         question_indicators=[
             "(recommended)",
-            r"^\s*[●○◉]\s+\S",
             r"\b(choose|select|which option|pick one|what should)\b",
+            "⇆ tab",
+            "⇆ select",
+            "enter confirm",
         ],
         option_patterns=[
-            r"^\s*[●○◉]\s+\S",
+            r"^\s*[●○◉❯]\s+\S",
             r"^\s*\d+[.)\]]\s+\S",
         ],
         auto_permission_payload="",
+        mode_patterns={
+            "plan": r"Plan\s*·\s*\w+",
+            "build": r"Build\s*·\s*\w+",
+        },
+        plan_ready_patterns=[
+            "plano pronto",
+            "plan ready",
+            "plan complete",
+            "aprove para eu sair do modo plano",
+            "ready to build",
+        ],
+        mode_switch_key="tab",
+        completion_patterns=[
+            "100% concluído",
+            "todas as tarefas estão concluídas",
+            "todas as 20 tasks estão concluídas",
+            "não há próxima task",
+            "não há trabalho restante no plano",
+            "all tasks completed",
+            "plan is complete",
+            "todos os prs mergeados",
+        ],
     ),
     "claude": AgentProfile(
         name="claude",
@@ -194,12 +298,20 @@ BUILTIN_PROFILES: dict[str, AgentProfile] = {
             "(recommended)",
             r"\b(select|choose|which option|pick)\b",
             r"\b(approve|deny|reject)\b",
+            r"\[yes\]:",
+            r"\(y\)es/\(n\)o",
+            r"\bquestion\b",
         ],
         option_patterns=[
             r"^\s*[●○◉❯>]\s+\S",
             r"^\s*\d+[.)\]]\s+\S",
         ],
         auto_permission_payload="y",
+        completion_patterns=[
+            "all tasks complete",
+            "task completed successfully",
+            "done with all tasks",
+        ],
     ),
     "claude-code": AgentProfile(
         name="claude-code",
@@ -228,12 +340,19 @@ BUILTIN_PROFILES: dict[str, AgentProfile] = {
         question_indicators=[
             "(recommended)",
             r"\b(select|choose|which option|pick)\b",
+            r"\[yes\]:",
+            r"\(y\)es/\(n\)o",
+            r"\bquestion\b",
         ],
         option_patterns=[
             r"^\s*[●○◉❯>]\s+\S",
             r"^\s*\d+[.)\]]\s+\S",
         ],
         auto_permission_payload="y",
+        completion_patterns=[
+            "all tasks complete",
+            "task completed successfully",
+        ],
     ),
     "aider": AgentProfile(
         name="aider",
@@ -299,12 +418,12 @@ BUILTIN_PROFILES: dict[str, AgentProfile] = {
         description="Generic fallback profile for any AI CLI agent",
         thinking_patterns=[
             "thinking...",
-            "esc interrupt",
-            "preparing write",
             "working...",
-            "please wait",
             "processing...",
-            "running...",
+            "generating...",
+            "please wait...",
+            "esc to cancel",
+            "esc interrupt",
         ],
         permission_patterns=[
             r"allow.*deny",
@@ -352,6 +471,10 @@ def get_profile(name_or_process: str | None = None, custom_profiles: dict[str, A
                 preferred_answers=val.get("preferred_answers", list(DEFAULT_PREFERRED_ANSWERS)),
                 auto_permission_payload=val.get("auto_permission_payload", ""),
                 default_continue_text=val.get("default_continue_text"),
+                mode_patterns=val.get("mode_patterns", {}),
+                plan_ready_patterns=val.get("plan_ready_patterns", []),
+                mode_switch_key=val.get("mode_switch_key", "tab"),
+                completion_patterns=val.get("completion_patterns", []),
             )
 
     # Match in built-in profiles
@@ -376,6 +499,10 @@ def get_profile(name_or_process: str | None = None, custom_profiles: dict[str, A
         unsafe_phrases=list(generic.unsafe_phrases),
         preferred_answers=list(generic.preferred_answers),
         auto_permission_payload=generic.auto_permission_payload,
+        mode_patterns=dict(generic.mode_patterns),
+        plan_ready_patterns=list(generic.plan_ready_patterns),
+        mode_switch_key=generic.mode_switch_key,
+        completion_patterns=list(generic.completion_patterns),
     )
 
 
@@ -408,7 +535,7 @@ class Config(NamedTuple):
     auto_allow_permissions: bool
     once: bool
     dry_run: bool
-    state_dir: str
+    state_dir: str = "/tmp/terminal-monitor"
 
 
 @dataclass
@@ -433,6 +560,12 @@ class MonitorConfig:
     project_dir: str = "."
     unsafe_phrases: list[str] = field(default_factory=lambda: list(UNSAFE_PHRASES))
     custom_profiles: dict[str, Any] = field(default_factory=dict)
+    # Supervision & Autonomous Extensions
+    supervise: bool = False
+    auto_switch_modes: bool = True
+    smart_nudges: bool = True
+    completion_check: bool = True
+    status_json_path: str | None = None
 
     def to_legacy_config(self) -> Config:
         return Config(
@@ -455,54 +588,87 @@ class MonitorConfig:
 # Terminal Backends
 # ---------------------------------------------------------------------------
 
-def validate_process_name(value: str) -> str:
-    """Ensure process name contains only safe characters."""
-    if not re.fullmatch(r"[A-Za-z0-9_.+-]+", value):
-        raise ValueError("process name may contain only letters, numbers, . _ + and -")
-    return value
+def validate_process_name(process: str) -> str:
+    """Ensure process name contains only safe alphanumeric/dash/underscore characters."""
+    clean = process.strip()
+    if not clean or not re.match(r"^[A-Za-z0-9_.-]+$", clean):
+        raise ValueError(f"Invalid process name: {process!r}")
+    return clean
 
 
 def applescript_escape(value: str) -> str:
-    """Escape strings for AppleScript literals."""
+    """Escape backslashes and double quotes for AppleScript literal strings."""
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def run_osascript(source: str, timeout: float = 12.0) -> tuple[int, str]:
-    """Execute an AppleScript string via osascript with a timeout."""
+def run_osascript(script: str) -> tuple[int, str]:
+    """Execute AppleScript via osascript subprocess safely."""
     try:
         proc = subprocess.run(
-            ["osascript", "-e", source],
+            ["/usr/bin/osascript", "-e", script],
             capture_output=True,
             text=True,
-            timeout=timeout,
             check=False,
         )
-    except subprocess.TimeoutExpired:
-        return 124, "osascript timeout"
-    except OSError as exc:
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        return proc.returncode, out or err
+    except Exception as exc:
         return 1, str(exc)
-    output = (proc.stdout or "").strip()
-    error = (proc.stderr or "").strip()
-    return proc.returncode, error or output if proc.returncode else output
 
 
-def parse_tab_output(output: str) -> dict[str, str | bool]:
-    """Parse tab metadata and history from AppleScript output."""
-    if not output or output == "MISSING":
+def run_command(cmd: list[str], cwd: str | None = None) -> tuple[int, str, str]:
+    """Run a local command and return returncode, stdout, stderr."""
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            check=False,
+        )
+        return proc.returncode, (proc.stdout or "").strip(), (proc.stderr or "").strip()
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def parse_tab_output(raw: str) -> dict[str, str | bool]:
+    """Parse key-value output emitted by AppleScript tab queries."""
+    if raw.strip() == "MISSING":
         return {"ok": False, "error": "matching Terminal tab not found"}
-    head, marker, history = output.partition("\nHIST=")
-    if not marker:
-        return {"ok": False, "error": "unexpected Terminal response"}
-    result: dict[str, str | bool] = {"ok": True, "error": "", "hist": history}
-    for line in head.splitlines():
-        key, separator, value = line.partition("=")
-        if separator:
-            result[key.lower()] = value
-    return result
+
+    data: dict[str, str | bool] = {"ok": True, "error": ""}
+    lines = raw.splitlines()
+    hist_lines: list[str] = []
+    in_hist = False
+
+    for line in lines:
+        if in_hist:
+            hist_lines.append(line)
+            continue
+        if "=" in line:
+            key, val = line.split("=", 1)
+            key = key.strip()
+            if key == "WIN":
+                data["win"] = val
+            elif key == "TAB":
+                data["tab"] = val
+            elif key == "TITLE":
+                data["title"] = val
+            elif key == "BUSY":
+                data["busy"] = val.lower() == "true"
+            elif key == "WNAME":
+                data["wname"] = val
+            elif key == "HIST":
+                in_hist = True
+                hist_lines.append(val)
+
+    data["hist"] = "\n".join(hist_lines)
+    return data
 
 
 class BaseTerminalBackend:
-    """Abstract interface for terminal interaction."""
+    """Abstract base class for terminal interaction backends."""
 
     def name(self) -> str:
         raise NotImplementedError
@@ -513,14 +679,24 @@ class BaseTerminalBackend:
     def send(self, process: str, title: str | None, payload: str) -> tuple[bool, str]:
         raise NotImplementedError
 
+    def send_key(self, process: str, title: str | None, key: str) -> tuple[bool, str]:
+        """Send a special key or control sequence to the target tab."""
+        return self.send(process, title, key)
+
     def get_pids(self, process: str) -> list[int]:
-        try:
-            output = subprocess.check_output(
-                ["pgrep", "-x", validate_process_name(process)], text=True
-            )
-        except (OSError, subprocess.CalledProcessError):
+        """Return list of active process IDs matching process name."""
+        process = validate_process_name(process)
+        if not shutil.which("pgrep"):
             return []
-        return [int(item) for item in output.split() if item.isdigit()]
+        code, out, _ = run_command(["pgrep", "-x", process])
+        if code != 0 or not out:
+            return []
+        pids: list[int] = []
+        for line in out.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.append(int(line))
+        return pids
 
 
 class TerminalAppBackend(BaseTerminalBackend):
@@ -592,6 +768,45 @@ end tell
         code, output = run_osascript(script)
         return code == 0 and output == "SENT", output
 
+    def send_key(self, process: str, title: str | None, key: str) -> tuple[bool, str]:
+        """Send a special key code directly via native AppleScript without System Events."""
+        process_literal = applescript_escape(validate_process_name(process))
+        key_normalized = key.lower().strip()
+        char_id = SPECIAL_KEY_CODES.get(key_normalized)
+        if char_id is None:
+            if len(key) == 1:
+                char_id = ord(key)
+            else:
+                return self.send(process, title, key)
+
+        title_check = "set titleOK to true"
+        if title:
+            wanted = applescript_escape(title)
+            title_check = f'set titleOK to ((ttitle contains "{wanted}") or (wname contains "{wanted}"))'
+        script = f'''
+tell application "Terminal"
+  repeat with w from 1 to count of windows
+    repeat with t from 1 to count of tabs of window w
+      if ((processes of tab t of window w) as string) contains "{process_literal}" then
+        set ttitle to ""
+        try
+          set ttitle to (custom title of tab t of window w) as string
+        end try
+        set wname to (name of window w) as string
+        {title_check}
+        if titleOK then
+          do script (character id {char_id}) in tab t of window w
+          return "SENT"
+        end if
+      end if
+    end repeat
+  end repeat
+  return "MISSING"
+end tell
+'''
+        code, output = run_osascript(script)
+        return code == 0 and output == "SENT", output
+
 
 class ITerm2Backend(BaseTerminalBackend):
     """Native macOS iTerm2 backend via AppleScript."""
@@ -600,28 +815,21 @@ class ITerm2Backend(BaseTerminalBackend):
         return "iterm2"
 
     def get_tab(self, process: str, title: str | None = None) -> dict[str, str | bool]:
-        process = validate_process_name(process)
-        process_literal = applescript_escape(process)
+        process_literal = applescript_escape(validate_process_name(process))
         title_check = "set titleOK to true"
         if title:
             wanted = applescript_escape(title)
             title_check = f'set titleOK to (sname contains "{wanted}")'
-
         script = f'''
 tell application "iTerm2"
   repeat with w in windows
     repeat with t in tabs of w
       repeat with s in sessions of t
-        set sname to (name of s) as string
-        set scmd to ""
-        try
-          set scmd to (current command of s) as string
-        end try
-        if (sname contains "{process_literal}") or (scmd contains "{process_literal}") then
+        if (variable named "commandLine" of s as string) contains "{process_literal}" or (name of s as string) contains "{process_literal}" then
+          set sname to (name of s) as string
           {title_check}
           if titleOK then
-            set stext to (text of s) as string
-            return "WIN=1" & linefeed & "TAB=1" & linefeed & "TITLE=" & sname & linefeed & "BUSY=false" & linefeed & "HIST=" & stext
+            return "WIN=" & (id of w) & linefeed & "TAB=" & (id of t) & linefeed & "TITLE=" & sname & linefeed & "BUSY=false" & linefeed & "WNAME=" & sname & linefeed & "HIST=" & (text of s as string)
           end if
         end if
       end repeat
@@ -642,18 +850,13 @@ end tell
             wanted = applescript_escape(title)
             title_check = f'set titleOK to (sname contains "{wanted}")'
         escaped_payload = applescript_escape(re.sub(r"\s+", " ", payload).strip())
-
         script = f'''
 tell application "iTerm2"
   repeat with w in windows
     repeat with t in tabs of w
       repeat with s in sessions of t
-        set sname to (name of s) as string
-        set scmd to ""
-        try
-          set scmd to (current command of s) as string
-        end try
-        if (sname contains "{process_literal}") or (scmd contains "{process_literal}") then
+        if (variable named "commandLine" of s as string) contains "{process_literal}" or (name of s as string) contains "{process_literal}" then
+          set sname to (name of s) as string
           {title_check}
           if titleOK then
             tell s to write text "{escaped_payload}"
@@ -669,71 +872,128 @@ end tell
         code, output = run_osascript(script)
         return code == 0 and output == "SENT", output
 
+    def send_key(self, process: str, title: str | None, key: str) -> tuple[bool, str]:
+        """Send a special key code directly via iTerm2 write text without newline."""
+        process_literal = applescript_escape(validate_process_name(process))
+        key_normalized = key.lower().strip()
+        char_id = SPECIAL_KEY_CODES.get(key_normalized)
+        if char_id is None:
+            if len(key) == 1:
+                char_id = ord(key)
+            else:
+                return self.send(process, title, key)
+
+        title_check = "set titleOK to true"
+        if title:
+            wanted = applescript_escape(title)
+            title_check = f'set titleOK to (sname contains "{wanted}")'
+        script = f'''
+tell application "iTerm2"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        if (variable named "commandLine" of s as string) contains "{process_literal}" or (name of s as string) contains "{process_literal}" then
+          set sname to (name of s) as string
+          {title_check}
+          if titleOK then
+            tell s to write text (character id {char_id}) without newline
+            return "SENT"
+          end if
+        end if
+      end repeat
+    end repeat
+  end repeat
+  return "MISSING"
+end tell
+'''
+        code, output = run_osascript(script)
+        return code == 0 and output == "SENT", output
+
 
 class TmuxBackend(BaseTerminalBackend):
-    """tmux backend (cross-platform, works on macOS, Linux, WSL, remote servers)."""
+    """Cross-platform terminal backend using tmux capture-pane and send-keys."""
 
     def name(self) -> str:
         return "tmux"
 
-    def _find_pane(self, process: str, title: str | None = None) -> str | None:
+    def _find_target(self, process: str, title: str | None = None) -> str | None:
         if not shutil.which("tmux"):
             return None
-        try:
-            cmd = ["tmux", "list-panes", "-a", "-F", "#{pane_id}:#{pane_current_command}:#{window_name}:#{pane_title}"]
-            out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
-        except (subprocess.SubprocessError, OSError):
+        code, out, _ = run_command(["tmux", "list-panes", "-a", "-F", "#{session_name}:#{window_index}.#{pane_index} #{pane_current_command} #{pane_title}"])
+        if code != 0 or not out:
             return None
-
-        process_clean = process.lower()
-        title_clean = (title or "").lower()
-
         for line in out.splitlines():
-            parts = line.strip().split(":", 3)
-            if len(parts) >= 2:
-                pane_id, pane_cmd = parts[0], parts[1].lower()
-                w_name = parts[2].lower() if len(parts) > 2 else ""
-                p_title = parts[3].lower() if len(parts) > 3 else ""
-
-                if process_clean in pane_cmd or process_clean in w_name or process_clean in p_title:
-                    if not title_clean or (title_clean in w_name or title_clean in p_title):
-                        return pane_id
+            parts = line.strip().split(maxsplit=2)
+            if not parts:
+                continue
+            target = parts[0]
+            cmd = parts[1] if len(parts) > 1 else ""
+            pane_title = parts[2] if len(parts) > 2 else ""
+            if process.lower() in cmd.lower() or process.lower() in pane_title.lower():
+                if not title or title.lower() in pane_title.lower():
+                    return target
         return None
 
     def get_tab(self, process: str, title: str | None = None) -> dict[str, str | bool]:
-        pane_id = self._find_pane(process, title)
-        if not pane_id:
+        target = self._find_target(process, title)
+        if not target:
             return {"ok": False, "error": "matching tmux pane not found"}
-        try:
-            cmd = ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-200"]
-            out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
-            return {
-                "ok": True,
-                "error": "",
-                "hist": out,
-                "tab": pane_id,
-                "title": pane_id,
-                "busy": "false",
-            }
-        except (subprocess.SubprocessError, OSError) as exc:
-            return {"ok": False, "error": str(exc)}
+        code, out, err = run_command(["tmux", "capture-pane", "-p", "-t", target, "-S", "-300"])
+        if code != 0:
+            return {"ok": False, "error": err or "tmux capture-pane failed"}
+        return {
+            "ok": True,
+            "error": "",
+            "win": target,
+            "tab": target,
+            "title": target,
+            "busy": False,
+            "wname": target,
+            "hist": out,
+        }
 
     def send(self, process: str, title: str | None, payload: str) -> tuple[bool, str]:
-        pane_id = self._find_pane(process, title)
-        if not pane_id:
+        target = self._find_target(process, title)
+        if not target:
             return False, "matching tmux pane not found"
-        try:
-            clean_payload = re.sub(r"\s+", " ", payload).strip()
-            if clean_payload:
-                subprocess.run(["tmux", "send-keys", "-t", pane_id, "-l", clean_payload], check=True)
-            subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"], check=True)
-            return True, "SENT"
-        except (subprocess.SubprocessError, OSError) as exc:
-            return False, str(exc)
+        clean = re.sub(r"\s+", " ", payload).strip()
+        code, out, err = run_command(["tmux", "send-keys", "-t", target, clean, "Enter"])
+        return code == 0, "SENT" if code == 0 else err or out
+
+    def send_key(self, process: str, title: str | None, key: str) -> tuple[bool, str]:
+        target = self._find_target(process, title)
+        if not target:
+            return False, "matching tmux pane not found"
+        tmux_key_map = {
+            "tab": "Tab",
+            "\t": "Tab",
+            "enter": "Enter",
+            "return": "Enter",
+            "\r": "Enter",
+            "\n": "Enter",
+            "esc": "Escape",
+            "escape": "Escape",
+            "\x1b": "Escape",
+            "ctrl+c": "C-c",
+            "ctrl_c": "C-c",
+            "ctrl+p": "C-p",
+            "ctrl_p": "C-p",
+            "ctrl+d": "C-d",
+            "ctrl_d": "C-d",
+            "up": "Up",
+            "down": "Down",
+            "left": "Left",
+            "right": "Right",
+            "space": "Space",
+            "backspace": "BSpace",
+        }
+        tmux_key = tmux_key_map.get(key.lower().strip(), key)
+        code, out, err = run_command(["tmux", "send-keys", "-t", target, tmux_key])
+        return code == 0, "SENT" if code == 0 else err or out
 
 
 def get_backend(backend_name: str = "auto") -> BaseTerminalBackend:
-    """Return backend instance based on name or auto-detection."""
+    """Resolve terminal backend instance by name or environment."""
     choice = backend_name.lower().strip()
     if choice == "auto":
         if os.environ.get("TMUX") and shutil.which("tmux"):
@@ -744,7 +1004,7 @@ def get_backend(backend_name: str = "auto") -> BaseTerminalBackend:
             return TmuxBackend()
         return TerminalAppBackend()
 
-    if choice in ("terminal", "terminal.app", "macos"):
+    if choice in ("terminal", "terminal.app", "apple"):
         return TerminalAppBackend()
     if choice in ("iterm", "iterm2"):
         return ITerm2Backend()
@@ -771,6 +1031,92 @@ def send_to_terminal(process: str, title: str | None, payload: str) -> tuple[boo
 
 
 # ---------------------------------------------------------------------------
+# Git Context Engine & Smart Nudges
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GitStatus:
+    """Git workspace status snapshot."""
+
+    is_repo: bool = False
+    branch: str = ""
+    dirty: bool = False
+    modified_count: int = 0
+    untracked_count: int = 0
+    commits_ahead: int = 0
+    open_prs_count: int = 0
+    last_commit: str = ""
+    summary: str = ""
+
+
+def get_git_status(repo_dir: str = ".") -> GitStatus:
+    """Inspect git repository status safely without mutating workspace."""
+    try:
+        code, out, _ = run_command(["git", "rev-parse", "--is-inside-work-tree"], cwd=repo_dir)
+        if code != 0 or "true" not in out:
+            return GitStatus(is_repo=False)
+
+        branch_code, branch_out, _ = run_command(["git", "branch", "--show-current"], cwd=repo_dir)
+        branch = branch_out.strip() if branch_code == 0 else ""
+
+        status_code, status_out, _ = run_command(["git", "status", "--porcelain"], cwd=repo_dir)
+        status_lines = [l for l in status_out.splitlines() if l.strip() and not l.strip().endswith(".DS_Store")]
+        dirty = len(status_lines) > 0
+        untracked = sum(1 for l in status_lines if l.startswith("??"))
+        modified = len(status_lines) - untracked
+
+        log_code, log_out, _ = run_command(["git", "log", "-n", "1", "--oneline"], cwd=repo_dir)
+        last_commit = log_out.strip() if log_code == 0 else ""
+
+        open_prs = 0
+        if shutil.which("gh"):
+            gh_code, gh_out, _ = run_command(["gh", "pr", "list", "--state", "open", "--json", "number"], cwd=repo_dir)
+            if gh_code == 0:
+                try:
+                    open_prs = len(json.loads(gh_out))
+                except Exception:
+                    pass
+
+        summary = f"branch={branch} dirty={dirty} mod={modified} untracked={untracked} prs={open_prs}"
+        return GitStatus(
+            is_repo=True,
+            branch=branch,
+            dirty=dirty,
+            modified_count=modified,
+            untracked_count=untracked,
+            commits_ahead=0,
+            open_prs_count=open_prs,
+            last_commit=last_commit,
+            summary=summary,
+        )
+    except Exception:
+        return GitStatus(is_repo=False)
+
+
+def generate_smart_nudge(git_status: GitStatus, default_nudge: str = "") -> str:
+    """Generate a context-aware nudge based on git repository status."""
+    if not git_status.is_repo:
+        return default_nudge or "Continue with the next task according to the plan."
+
+    if git_status.dirty:
+        return (
+            f"You have uncommitted changes on branch '{git_status.branch}'. "
+            "Execute targeted tests for the current task, verify everything passes, and commit your changes."
+        )
+
+    if git_status.open_prs_count > 0:
+        return "Check the status of open Pull Requests and CI checks, and proceed with merging once all checks pass."
+
+    if git_status.branch not in ("main", "master", ""):
+        return (
+            f"Your working tree on branch '{git_status.branch}' is clean. "
+            "Run full verification, push your branch, create a Pull Request and merge it."
+        )
+
+    return default_nudge or "Continue with the next task according to the plan."
+
+
+# ---------------------------------------------------------------------------
 # Classification and Decision Engine
 # ---------------------------------------------------------------------------
 
@@ -787,7 +1133,7 @@ def normalize_snapshot(history: str) -> str:
 
 
 def classify_state(history: str, profile: AgentProfile | None = None) -> str:
-    """Classify the current terminal state (thinking, permission, question, idle)."""
+    """Classify the current terminal state (thinking, permission, question, completed, idle)."""
     prof = profile or BUILTIN_PROFILES["opencode"]
     tail = "\n".join(history.splitlines()[-50:])
 
@@ -797,6 +1143,8 @@ def classify_state(history: str, profile: AgentProfile | None = None) -> str:
         return "permission"
     if prof.matches_question(tail):
         return "question"
+    if prof.matches_completion(tail):
+        return "completed"
     return "idle"
 
 
@@ -850,7 +1198,7 @@ def decide_question(history: str, profile: AgentProfile | None = None) -> str | 
 
 def append_log(path: str, message: str) -> None:
     """Append a timestamped log line to file."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(f"{now_iso()} {message}\n")
 
@@ -919,67 +1267,69 @@ def load_config_file(path: str | Path) -> dict[str, Any]:
         return json.loads(text)
     except Exception:
         if tomllib is not None:
-            return tomllib.loads(text)
-        raise ValueError(f"Could not parse config file '{file_path}' as JSON.")
+            try:
+                return tomllib.loads(text)
+            except Exception:
+                pass
+        raise ValueError(f"Could not parse configuration file as JSON or TOML: {file_path}")
 
 
 def generate_starter_config(format_type: str = "json") -> str:
-    """Generate a starter configuration template string."""
-    fmt = format_type.lower().strip()
-    sample_data = {
-        "profile": "claude",
-        "process": "claude",
-        "title": None,
-        "backend": "auto",
-        "continue_text": "Proceed from the next incomplete step. Stop if you need human guidance.",
-        "poll_seconds": 3.0,
-        "idle_seconds": 15.0,
-        "cooldown_seconds": 20.0,
-        "gone_seconds": 25.0,
-        "max_sends": 100,
-        "auto_allow_permissions": False,
-        "state_dir": "/tmp/terminal-monitor",
-        "unsafe_phrases": list(UNSAFE_PHRASES),
-        "custom_profiles": {
-            "my-agent": {
-                "process": "myagent",
-                "description": "Custom agent profile example",
-                "thinking_patterns": ["agent is thinking...", "processing..."],
-                "permission_patterns": ["do you authorize this action?"],
-                "auto_permission_payload": "y",
-            }
-        },
-    }
-
-    if fmt == "json":
-        return json.dumps(sample_data, indent=2, ensure_ascii=False) + "\n"
-    elif fmt == "toml":
-        return """# Terminal Monitor Configuration File
-profile = "claude"
-process = "claude"
-backend = "auto"
-continue_text = "Proceed from the next incomplete step. Stop if you need human guidance."
+    """Generate a starter configuration template in JSON or TOML."""
+    if format_type.lower() == "json":
+        return json.dumps(
+            {
+                "profile": "opencode",
+                "process": "opencode",
+                "continue_text": "Continue with the next task according to the plan.",
+                "poll_seconds": 3.0,
+                "idle_seconds": 15.0,
+                "cooldown_seconds": 20.0,
+                "gone_seconds": 25.0,
+                "max_sends": 100,
+                "auto_allow_permissions": True,
+                "supervise": True,
+                "smart_nudges": True,
+                "auto_switch_modes": True,
+                "completion_check": True,
+                "unsafe_phrases": list(UNSAFE_PHRASES),
+                "custom_profiles": {
+                    "my-agent": {
+                        "process": "myagent",
+                        "description": "Custom agent CLI configuration",
+                        "thinking_patterns": ["agent is thinking...", "processing..."],
+                        "permission_patterns": ["do you authorize this action?"],
+                        "auto_permission_payload": "y",
+                        "mode_patterns": {"plan": "Plan Mode", "build": "Build Mode"},
+                        "completion_patterns": ["all tasks complete"],
+                    }
+                },
+            },
+            indent=2,
+        )
+    elif format_type.lower() == "toml":
+        return """profile = "opencode"
+process = "opencode"
+continue_text = "Continue with the next task according to the plan."
 poll_seconds = 3.0
 idle_seconds = 15.0
 cooldown_seconds = 20.0
-gone_seconds = 25.0
 max_sends = 100
-auto_allow_permissions = false
-state_dir = "/tmp/terminal-monitor"
-unsafe_phrases = [
-  "bypass",
-  "delete",
-  "rm -rf",
-  "reset --hard",
-  "drop database"
-]
+auto_allow_permissions = true
+supervise = true
+smart_nudges = true
+auto_switch_modes = true
+completion_check = true
+
+unsafe_phrases = ["bypass", "delete", "rm -rf", "reset --hard"]
 
 [custom_profiles.my-agent]
 process = "myagent"
-description = "Custom agent profile example"
+description = "Custom agent CLI configuration"
 thinking_patterns = ["agent is thinking...", "processing..."]
 permission_patterns = ["do you authorize this action?"]
 auto_permission_payload = "y"
+completion_patterns = ["all tasks complete"]
 """
     else:
         raise ValueError(f"Unsupported format: {format_type}. Use 'json' or 'toml'.")
@@ -990,7 +1340,7 @@ auto_permission_payload = "y"
 # ---------------------------------------------------------------------------
 
 class TerminalMonitor:
-    """Main monitor engine supporting event callbacks and step/run lifecycle."""
+    """Main monitor engine supporting event callbacks, mode management, and step/run lifecycle."""
 
     def __init__(
         self,
@@ -1017,32 +1367,69 @@ class TerminalMonitor:
         self.attention_path = os.path.join(self.state_dir, "attention.txt")
         self.answer_path = os.path.join(self.state_dir, "answer.txt")
         self.stop_path = os.path.join(self.state_dir, "stop")
+        self.status_json_path = config.status_json_path
 
         # Internal state tracking
         self.last_digest = ""
         self.last_change = time.monotonic()
-        self.last_send = 0.0
         self.last_seen = time.monotonic()
+        self.last_send = 0.0
         self.sends = 0
         self.current_state = "unknown"
+        self.current_mode: str | None = None
 
-        # Event callbacks
+        # Callbacks
         self.on_state_change: Callable[[str, str], None] | None = None
+        self.on_mode_change: Callable[[str | None, str | None], None] | None = None
         self.on_send: Callable[[str, str, bool], None] | None = None
         self.on_attention: Callable[[str, str], None] | None = None
+        self.on_complete: Callable[[str], None] | None = None
         self.on_tick: Callable[[str, int], None] | None = None
 
     def log(self, message: str) -> None:
         append_log(self.log_path, message)
 
+    def export_status_json(self, pids: list[int], state: str, extra: dict[str, Any] | None = None) -> None:
+        """Export live structured status for IDEs, dashboards, or subagents."""
+        if not self.status_json_path:
+            return
+        git_status = get_git_status(self.config.project_dir)
+        data: dict[str, Any] = {
+            "running": True,
+            "pids": pids,
+            "process": self.config.process,
+            "profile": self.profile.name,
+            "state": state,
+            "mode": self.current_mode,
+            "sends": self.sends,
+            "stable_seconds": round(time.monotonic() - self.last_change, 1),
+            "git": {
+                "branch": git_status.branch,
+                "dirty": git_status.dirty,
+                "modified": git_status.modified_count,
+                "untracked": git_status.untracked_count,
+                "open_prs": git_status.open_prs_count,
+                "last_commit": git_status.last_commit,
+            },
+            "timestamp": now_iso(),
+        }
+        if extra:
+            data.update(extra)
+        try:
+            target_path = Path(self.status_json_path).resolve()
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
     def inspect(self) -> dict[str, Any]:
-        """Perform a single read-only inspection of the terminal tab and process."""
+        """Query current tab state and return structured status snapshot."""
         pids = self.backend.get_pids(self.config.process)
         tab = self.backend.get_tab(self.config.process, self.config.title)
         if not tab.get("ok"):
             return {
                 "ok": False,
-                "error": tab.get("error", "unknown error"),
+                "error": tab.get("error"),
                 "pids": pids,
                 "state": "missing",
             }
@@ -1050,10 +1437,12 @@ class TerminalMonitor:
         history = str(tab.get("hist", ""))
         snapshot = normalize_snapshot(history)
         state = classify_state(history, self.profile)
+        mode = self.profile.detect_mode(history)
         return {
             "ok": True,
             "pids": pids,
             "state": state,
+            "mode": mode,
             "snapshot": snapshot,
             "tab": tab,
         }
@@ -1065,12 +1454,14 @@ class TerminalMonitor:
         If exit_code is None, the monitor should continue running.
         """
         if os.path.exists(self.stop_path):
+            self.export_status_json([], "cancelled", {"running": False})
             return 0, "CANCELLED"
 
         pids = self.backend.get_pids(self.config.process)
         if pids:
             self.last_seen = time.monotonic()
         elif time.monotonic() - self.last_seen >= self.config.gone_seconds:
+            self.export_status_json([], "process_gone", {"running": False})
             return 0, "PROCESS_GONE"
 
         tab = self.backend.get_tab(self.config.process, self.config.title)
@@ -1083,20 +1474,37 @@ class TerminalMonitor:
         snapshot = normalize_snapshot(history)
         digest = hashlib.sha256(snapshot.encode("utf-8", "replace")).hexdigest()[:16]
         state = classify_state(history, self.profile)
+        mode = self.profile.detect_mode(history)
+
+        if mode != self.current_mode:
+            if self.on_mode_change:
+                self.on_mode_change(self.current_mode, mode)
+            self.current_mode = mode
 
         if state != self.current_state:
             if self.on_state_change:
                 self.on_state_change(self.current_state, state)
             self.current_state = state
 
+        self.export_status_json(pids, state)
+
         if self.config.once:
-            return 0, f"STATE={state} PID_COUNT={len(pids)}"
+            return 0, f"STATE={state} MODE={mode} PID_COUNT={len(pids)}"
 
         if digest != self.last_digest:
             self.last_digest = digest
             self.last_change = time.monotonic()
 
         stable_for = time.monotonic() - self.last_change
+
+        # Handle Completion State
+        if state == "completed" and self.config.completion_check:
+            self.log("SUCCESS: Completion indicators detected. Work complete.")
+            if self.on_complete:
+                self.on_complete(snapshot)
+            self.export_status_json(pids, "completed", {"done": True})
+            return 0, "COMPLETED"
+
         threshold = 4.0 if state in ("permission", "question") else self.config.idle_seconds
         if self.config.idle_seconds == 0.0:
             threshold = 0.0
@@ -1108,6 +1516,18 @@ class TerminalMonitor:
 
         if time.monotonic() - self.last_send < self.config.cooldown_seconds:
             return None, "COOLDOWN"
+
+        mode_threshold = 0.0 if self.config.idle_seconds == 0.0 else 4.0
+        # Handle Plan Mode Auto-Transition
+        if self.config.auto_switch_modes and mode == "plan" and self.profile.is_plan_ready(history) and stable_for >= mode_threshold:
+            self.log("MODE: Plan completed. Auto-switching mode via switch key.")
+            ok, detail = self.backend.send_key(self.config.process, self.config.title, self.profile.mode_switch_key)
+            self.last_send = time.monotonic()
+            self.last_change = time.monotonic()
+            if self.config.continue_text:
+                time.sleep(0.5)
+                self.backend.send(self.config.process, self.config.title, self.config.continue_text)
+            return None, "MODE_SWITCH_SENT"
 
         manual_answer = consume_manual_answer(self.answer_path)
         payload: str | None = manual_answer or self.config.continue_text
@@ -1121,6 +1541,10 @@ class TerminalMonitor:
         elif state == "question":
             payload = decide_question(history, self.profile)
             reason = "question"
+        elif state == "idle" and self.config.smart_nudges:
+            git_info = get_git_status(self.config.project_dir)
+            payload = generate_smart_nudge(git_info, self.config.continue_text)
+            reason = "smart_nudge"
 
         if payload is None:
             with open(self.attention_path, "w", encoding="utf-8") as handle:
@@ -1150,183 +1574,164 @@ class TerminalMonitor:
         return None, f"SENT kind={reason} n={self.sends}"
 
     def run(self) -> int:
-        """Run monitor loop until completion or exit condition."""
-        self.log(f"START process={self.config.process} profile={self.profile.name} dry_run={self.config.dry_run}")
+        """Run monitor loop continuously until exit condition is met."""
+        self.log(f"START process={self.config.process} profile={self.profile.name} backend={self.backend.name()}")
         while True:
             code, msg = self.step()
             if code is not None:
-                print(msg, flush=True)
+                self.log(f"EXIT code={code} msg={msg}")
                 return code
-            if "SENT" in msg or "SEND_FAILED" in msg:
-                print(msg, flush=True)
             time.sleep(self.config.poll_seconds)
 
 
 # ---------------------------------------------------------------------------
-# CLI Argument Parsing and Main Entrypoint
+# CLI Parser and Entrypoint
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    """Construct CLI argument parser with profile, backend, and config support."""
+    """Build comprehensive CLI argument parser."""
     parser = argparse.ArgumentParser(
-        description="Monitor any AI CLI agent in macOS Terminal.app, iTerm2, or tmux and send safe nudges."
+        prog="terminal_monitor",
+        description="Monitor and safely nudge AI CLI coding agents running in Terminal.app, iTerm2, or tmux.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--profile", help="agent profile (e.g. claude, opencode, aider, goose, generic)")
-    parser.add_argument("--process", default=None, help="exact process name to monitor (defaults to profile process)")
-    parser.add_argument("--title", help="optional substring of the Terminal tab title or window name")
-    parser.add_argument("--backend", default="auto", choices=["auto", "terminal", "iterm2", "tmux"], help="terminal backend to use")
-    parser.add_argument("--config", help="path to custom JSON or TOML config file")
-    parser.add_argument("--project-dir", default=".", help="project directory containing .terminal-monitor config")
 
-    source = parser.add_mutually_exclusive_group(required=False)
-    source.add_argument("--continue-text", help="text sent when the CLI becomes idle")
-    source.add_argument("--continue-file", help="UTF-8 file containing continuation text")
+    # Subcommands
+    subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
 
-    parser.add_argument("--poll-seconds", type=float, default=None, help="polling interval in seconds (default: 3.0)")
-    parser.add_argument("--idle-seconds", type=float, default=None, help="seconds of inactivity to declare idle (default: 15.0)")
-    parser.add_argument("--cooldown-seconds", type=float, default=None, help="seconds between nudges (default: 20.0)")
-    parser.add_argument("--gone-seconds", type=float, default=None, help="seconds before missing process exits (default: 25.0)")
-    parser.add_argument("--max-sends", type=int, default=None, help="maximum number of nudges to send (default: 100)")
-    parser.add_argument("--auto-allow-permissions", action="store_true", default=None, help="auto-approve permission prompts")
-    parser.add_argument("--once", action="store_true", help="inspect once and exit without sending")
-    parser.add_argument("--dry-run", action="store_true", help="monitor and print decisions without sending")
-    parser.add_argument("--state-dir", default=None, help="state and logs directory (default: /tmp/terminal-monitor)")
-    parser.add_argument("--add-unsafe-phrase", action="append", default=[], help="additional unsafe phrase to block")
-    parser.add_argument("--list-profiles", action="store_true", help="list available built-in and configured profiles")
-    parser.add_argument("--init-config", choices=["json", "toml"], help="generate a starter configuration file")
+    # init config subcommand
+    init_parser = subparsers.add_parser("init", help="Generate a starter configuration file")
+    init_parser.add_argument("--format", choices=["json", "toml"], default="json", help="Configuration format (default: json)")
+    init_parser.add_argument("-o", "--output", help="Output file path (default: .terminal-monitor.<format>)")
+
+    # list profiles subcommand
+    subparsers.add_parser("profiles", help="List built-in and discovered agent profiles")
+
+    # supervise subcommand
+    supervise_parser = subparsers.add_parser("supervise", help="Run autonomous supervision daemon")
+    _add_monitor_args(supervise_parser)
+    supervise_parser.add_argument("--status-json", dest="status_json_path", help="Path to write real-time status JSON")
+
+    # Main monitor arguments
+    _add_monitor_args(parser)
+    parser.add_argument("--status-json", dest="status_json_path", help="Path to write real-time status JSON")
 
     return parser
 
 
+def _add_monitor_args(parser: argparse.ArgumentParser) -> None:
+    """Add standard monitor flags to a parser with None defaults so config files take effect."""
+    parser.add_argument("--process", "-p", default=None, help="Agent process name to track (default: opencode)")
+    parser.add_argument("--profile", default=None, help="Agent profile to use (e.g. claude, opencode, aider, goose)")
+    parser.add_argument("--title", "-t", default=None, help="Window title substring filter")
+    parser.add_argument("--continue-text", "-c", default=None, help="Text sent on idle or nudge")
+    parser.add_argument("--continue-file", "-f", default=None, help="Path to file whose content is sent on idle")
+    parser.add_argument("--poll-seconds", type=float, default=None, help="Loop interval (default: 3.0s)")
+    parser.add_argument("--idle-seconds", type=float, default=None, help="Seconds before idle trigger (default: 15.0s)")
+    parser.add_argument("--cooldown-seconds", type=float, default=None, help="Cooldown after sending (default: 20.0s)")
+    parser.add_argument("--gone-seconds", type=float, default=None, help="Seconds before process gone (default: 25.0s)")
+    parser.add_argument("--max-sends", type=int, default=None, help="Maximum sends before exit (default: 100)")
+    parser.add_argument("--auto-allow-permissions", "-a", action="store_true", default=None, help="Auto-allow safe permission prompts")
+    parser.add_argument("--supervise", "-S", action="store_true", default=None, help="Enable autonomous supervisor mode")
+    parser.add_argument("--no-smart-nudges", action="store_true", help="Disable git-aware context smart nudges")
+    parser.add_argument("--no-mode-switch", action="store_true", help="Disable automatic Plan->Build mode switching")
+    parser.add_argument("--no-completion-check", action="store_true", help="Disable completion state auto-detection")
+    parser.add_argument("--backend", "-b", choices=["auto", "terminal", "iterm2", "tmux"], default=None, help="Terminal backend")
+    parser.add_argument("--project-dir", "-d", default=None, help="Project directory for config discovery and git status")
+    parser.add_argument("--config", default=None, help="Explicit configuration file path")
+    parser.add_argument("--state-dir", default=None, help="Directory for state/logs (default: /tmp/terminal-monitor)")
+    parser.add_argument("--unsafe-phrase", action="append", dest="unsafe_phrases", help="Add custom unsafe phrases")
+    parser.add_argument("--once", action="store_true", default=False, help="Inspect status once and exit")
+    parser.add_argument("--dry-run", action="store_true", default=False, help="Simulate actions without sending keystrokes")
+
+
 def config_from_args(args: argparse.Namespace) -> MonitorConfig:
     """Build MonitorConfig merging defaults, discovered config file, and CLI flags."""
-    # Handle list profiles and init config special flags
-    if getattr(args, "list_profiles", False) or getattr(args, "init_config", None):
-        return MonitorConfig()
-
-    # Discover and load config file if present
-    file_data: dict[str, Any] = {}
-    config_path = args.config
-    if config_path:
-        file_data = load_config_file(config_path)
-    else:
-        discovered = discover_config_file(getattr(args, "project_dir", "."))
+    project_dir = getattr(args, "project_dir", None) or "."
+    file_cfg: dict[str, Any] = {}
+    if getattr(args, "config", None):
+        file_cfg = load_config_file(args.config)
+    elif project_dir:
+        discovered = discover_config_file(project_dir)
         if discovered:
-            file_data = load_config_file(discovered)
+            file_cfg = load_config_file(discovered)
 
-    # Determine profile
-    profile_name = args.profile or file_data.get("profile") or "opencode"
-    custom_profiles = file_data.get("custom_profiles", {})
-    profile_obj = get_profile(profile_name, custom_profiles)
+    continue_text = args.continue_text if getattr(args, "continue_text", None) is not None else file_cfg.get("continue_text", "")
+    if getattr(args, "continue_file", None):
+        continue_path = Path(args.continue_file).resolve()
+        if continue_path.is_file():
+            continue_text = continue_path.read_text(encoding="utf-8").strip()
 
-    # Determine process name
-    process_name = args.process or file_data.get("process") or profile_obj.process or "opencode"
-    process_name = validate_process_name(process_name)
+    is_supervise = bool(getattr(args, "supervise", False) or getattr(args, "command", "") == "supervise" or file_cfg.get("supervise", False))
+    auto_allow = bool(args.auto_allow_permissions if getattr(args, "auto_allow_permissions", None) is not None else (is_supervise or file_cfg.get("auto_allow_permissions", False)))
+    smart_nudges = not getattr(args, "no_smart_nudges", False) and bool(is_supervise or file_cfg.get("smart_nudges", True))
+    auto_switch = not getattr(args, "no_mode_switch", False) and bool(is_supervise or file_cfg.get("auto_switch_modes", True))
+    completion_check = not getattr(args, "no_completion_check", False) and bool(is_supervise or file_cfg.get("completion_check", True))
 
-    # Determine continue text
-    continue_text = ""
-    if args.continue_file:
-        with open(args.continue_file, encoding="utf-8") as handle:
-            continue_text = handle.read().strip()
-    elif args.continue_text:
-        continue_text = args.continue_text.strip()
-    elif file_data.get("continue_file"):
-        with open(file_data["continue_file"], encoding="utf-8") as handle:
-            continue_text = handle.read().strip()
-    elif file_data.get("continue_text"):
-        continue_text = str(file_data["continue_text"]).strip()
-    elif profile_obj.default_continue_text:
-        continue_text = profile_obj.default_continue_text.strip()
+    process = args.process or file_cfg.get("process", "opencode")
+    profile = args.profile or file_cfg.get("profile", process)
 
-    # For commands like --once, empty continue_text is permissible
-    if not continue_text and not args.once and not getattr(args, "dry_run", False):
-        raise ValueError("continuation text cannot be empty (provide --continue-text or --continue-file)")
-
-    # Timing parameters
-    poll_seconds = args.poll_seconds if args.poll_seconds is not None else float(file_data.get("poll_seconds", 3.0))
-    idle_seconds = args.idle_seconds if args.idle_seconds is not None else float(file_data.get("idle_seconds", 15.0))
-    cooldown_seconds = args.cooldown_seconds if args.cooldown_seconds is not None else float(file_data.get("cooldown_seconds", 20.0))
-    gone_seconds = args.gone_seconds if args.gone_seconds is not None else float(file_data.get("gone_seconds", 25.0))
-    max_sends = args.max_sends if args.max_sends is not None else int(file_data.get("max_sends", 100))
-
-    for name, val in [
-        ("poll_seconds", poll_seconds),
-        ("idle_seconds", idle_seconds),
-        ("cooldown_seconds", cooldown_seconds),
-        ("gone_seconds", gone_seconds),
-    ]:
-        if val <= 0:
-            raise ValueError(f"{name.replace('_', '-')} must be greater than zero")
-    if max_sends < 1:
-        raise ValueError("max-sends must be at least 1")
-
-    # Booleans & paths
-    auto_allow = args.auto_allow_permissions if args.auto_allow_permissions is not None else bool(file_data.get("auto_allow_permissions", False))
-    state_dir = args.state_dir or file_data.get("state_dir") or "/tmp/terminal-monitor"
-    backend = args.backend if args.backend != "auto" else file_data.get("backend", "auto")
-    title = args.title if args.title is not None else file_data.get("title")
-
-    # Unsafe phrases
-    unsafe_phrases = list(UNSAFE_PHRASES)
-    if "unsafe_phrases" in file_data and isinstance(file_data["unsafe_phrases"], list):
-        unsafe_phrases = list(file_data["unsafe_phrases"])
-    if args.add_unsafe_phrase:
-        unsafe_phrases.extend(args.add_unsafe_phrase)
+    def _val(arg_val: Any, cfg_key: str, default_val: Any) -> Any:
+        if arg_val is not None:
+            return arg_val
+        return file_cfg.get(cfg_key, default_val)
 
     return MonitorConfig(
-        process=process_name,
-        profile=profile_name,
-        title=title,
+        process=process,
+        profile=profile,
+        title=_val(getattr(args, "title", None), "title", None),
         continue_text=continue_text,
-        poll_seconds=poll_seconds,
-        idle_seconds=idle_seconds,
-        cooldown_seconds=cooldown_seconds,
-        gone_seconds=gone_seconds,
-        max_sends=max_sends,
+        continue_file=getattr(args, "continue_file", None),
+        poll_seconds=float(_val(getattr(args, "poll_seconds", None), "poll_seconds", 3.0)),
+        idle_seconds=float(_val(getattr(args, "idle_seconds", None), "idle_seconds", 15.0)),
+        cooldown_seconds=float(_val(getattr(args, "cooldown_seconds", None), "cooldown_seconds", 20.0)),
+        gone_seconds=float(_val(getattr(args, "gone_seconds", None), "gone_seconds", 25.0)),
+        max_sends=int(_val(getattr(args, "max_sends", None), "max_sends", 100)),
         auto_allow_permissions=auto_allow,
-        once=bool(args.once),
-        dry_run=bool(args.dry_run),
-        state_dir=state_dir,
-        backend=backend,
-        project_dir=getattr(args, "project_dir", "."),
-        unsafe_phrases=unsafe_phrases,
-        custom_profiles=custom_profiles,
+        once=bool(getattr(args, "once", False)),
+        dry_run=bool(getattr(args, "dry_run", False)),
+        state_dir=str(_val(getattr(args, "state_dir", None), "state_dir", "/tmp/terminal-monitor")),
+        backend=str(_val(getattr(args, "backend", None), "backend", "auto")),
+        project_dir=str(project_dir),
+        unsafe_phrases=getattr(args, "unsafe_phrases", None) or file_cfg.get("unsafe_phrases", list(UNSAFE_PHRASES)),
+        custom_profiles=file_cfg.get("custom_profiles", {}),
+        supervise=is_supervise,
+        auto_switch_modes=auto_switch,
+        smart_nudges=smart_nudges,
+        completion_check=completion_check,
+        status_json_path=getattr(args, "status_json_path", None) or file_cfg.get("status_json_path"),
     )
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Main CLI entry point."""
+def main() -> int:
+    """CLI entrypoint."""
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args()
 
-    if args.list_profiles:
-        custom_profiles: dict[str, Any] = {}
-        cfg_file = discover_config_file(getattr(args, "project_dir", "."))
-        if cfg_file:
-            try:
-                custom_profiles = load_config_file(cfg_file).get("custom_profiles", {})
-            except Exception:
-                pass
-        profiles = list_profiles(custom_profiles)
-        print("Available Agent Profiles:")
-        for name, desc in sorted(profiles.items()):
-            print(f"  • {name:<12} : {desc}")
+    # Handle init subcommand
+    if args.command == "init":
+        fmt = getattr(args, "format", "json")
+        out_path = getattr(args, "output", None) or f".terminal-monitor.{fmt}"
+        content = generate_starter_config(fmt)
+        Path(out_path).write_text(content + "\n", encoding="utf-8")
+        print(f"Created configuration template: {out_path}")
         return 0
 
-    if args.init_config:
-        try:
-            content = generate_starter_config(args.init_config)
-            print(content, end="")
-            return 0
-        except Exception as exc:
-            parser.error(str(exc))
+    # Handle profiles subcommand
+    if args.command == "profiles":
+        print("Available Agent Profiles:")
+        for name, desc in list_profiles().items():
+            print(f"  • {name:<12} - {desc}")
+        return 0
 
-    try:
-        config = config_from_args(args)
-    except (OSError, ValueError) as exc:
-        parser.error(str(exc))
-
+    config = config_from_args(args)
     monitor = TerminalMonitor(config)
+
+    if config.once:
+        inspected = monitor.inspect()
+        print(json.dumps(inspected, indent=2))
+        return 0 if inspected.get("ok") else 2
+
     return monitor.run()
 
 
