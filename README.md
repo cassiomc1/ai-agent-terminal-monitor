@@ -2,7 +2,7 @@
 
 # 🤖 AI Agent Terminal Monitor
 
-**Universal, autonomous watcher and safe continuation driver for any AI coding agent CLI running in macOS Terminal.app, iTerm2, or tmux.**
+**Universal, autonomous watcher, TUI controller, and safe continuation supervisor for any AI coding agent CLI running in macOS Terminal.app, iTerm2, or tmux.**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20WSL-brightgreen.svg)]()
@@ -16,9 +16,9 @@
 
 ## 📌 Overview
 
-When running autonomous AI coding agents (such as **Anthropic Claude Code**, **OpenCode**, **Aider**, **Block Goose**, **Devin**, or custom in-house agent CLIs), agents frequently pause waiting for continuation prompts, permission grants, or selection choices.
+When running autonomous AI coding agents (such as **Anthropic Claude Code**, **OpenCode**, **Aider**, **Block Goose**, **Devin**, or custom in-house agent CLIs), agents frequently pause waiting for continuation prompts, permission grants, mode transitions, or selection choices.
 
-**AI Agent Terminal Monitor** is a generic, modular, and extensible supervisor that watches your terminal, intelligently classifies agent lifecycle states (`thinking`, `permission`, `question`, `idle`), auto-resolves safe prompts, blocks unsafe/destructive operations, and nudges the agent to keep progressing autonomously.
+**AI Agent Terminal Monitor** is a generic, modular, and extensible supervisor that watches your terminal, intelligently classifies agent lifecycle states (`thinking`, `permission`, `question`, `completed`, `idle`), auto-resolves safe prompts, manages TUI modes (`Plan` vs `Build`), blocks unsafe/destructive operations, generates context-aware Git nudges, exports real-time status JSON, and keeps the agent progressing autonomously to goal completion.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -34,10 +34,12 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
              ▼                          ▼                         ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                  Terminal History & State Classification                    │
-│      [Thinking...] ──► [Permission Request] ──► [Question/Menu] ──► [Idle]  │
+│   [Thinking...] ──► [Permission] ──► [Question/Menu] ──► [Idle] ──► [Done]  │
+│       │                                                            │        │
+│   [TUI Mode] (Plan ──Tab──► Build)                [Git Context Smart Nudge] │
 └──────────────────────────────────────┬──────────────────────────────────────┘
                                        │
-                         Auto-Nudge / Attention / Log
+                         Auto-Nudge / Control / Status JSON
                                        ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                           Target Agent CLI Tab                              │
@@ -49,6 +51,15 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
 ## ✨ Key Features
 
 - 🧠 **Multi-Agent Profile Engine**: Built-in specialized detection heuristics for **Claude Code**, **OpenCode**, **Aider**, and **Goose**, with zero-config support for any custom CLI (`generic`).
+- 🎛️ **TUI Mode Awareness & Auto-Transition**: Automatically detects agent interactive modes (e.g. `Plan` vs `Build` in OpenCode). When plan generation finishes, dispatches native switch keystrokes (`Tab`) and start approvals without human intervention.
+- ⌨️ **Native Special Keys & Control Sequences**: Direct native dispatch for special characters (`Tab`, `Esc`, `Enter`, `Ctrl+C`, `Ctrl+P`) via native backend character codes without macOS Accessibility permission hurdles.
+- 🌿 **Git-Aware Context Smart Nudges**: Inspects repository status dynamically to send targeted prompts:
+  - *Uncommitted changes:* Prompts agent to run targeted tests and commit the task.
+  - *Clean feature branch:* Prompts agent to run full verification, push branch and create PR.
+  - *Open PRs:* Prompts agent to verify CI checks and merge into `main`.
+- 🏁 **Completion Engine & Stop Conditions**: Detects when all plan tasks are 100% completed and merged, gracefully stopping the supervisor and firing completion events.
+- 🔍 **Refined Question vs Table Disambiguation**: Excludes Markdown/Unicode summary tables and code blocks from option parsing, eliminating false-positive dialog loops.
+- 📊 **Real-time Status JSON Export**: Continuously exports live structured JSON (`status.json`) with PIDs, state, mode, git details, uptime, and send counts for IDE or dashboard integrations.
 - 🖥️ **Universal Terminal Backends**:
   - `terminal`: Native macOS Terminal.app via AppleScript.
   - `iterm2`: Native macOS iTerm2 via AppleScript.
@@ -56,17 +67,21 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
   - `auto`: Auto-detects active environment.
 - 🛡️ **Fail-Closed Safety Engine**: Blocks dangerous actions (`rm -rf`, `delete`, `drop database`, `reset --hard`, `bypass`, etc.). Ambiguous or risky prompts halt the monitor with exit code `3` and export a snapshot to `attention.txt`.
 - 📁 **Hierarchical Project Configuration**: Reads project settings from `.terminal-monitor.json` or `.terminal-monitor.toml` in your repository root, or globally from `~/.config/terminal-monitor/`.
-- ✍️ **Live Human-in-the-Loop Override**: Need to guide the agent manually? Simply write your message into `/tmp/terminal-monitor/answer.txt` — it is consumed, dispatched, and cleaned up automatically.
-- 🐍 **Python SDK & OOP API**: Clean object-oriented library API (`TerminalMonitor`, `MonitorConfig`, `AgentProfile`) with lifecycle hooks (`on_state_change`, `on_send`, `on_attention`, `on_tick`).
+- ✍️ **Live Human-in-the-Loop Override**: Write a message into `/tmp/terminal-monitor/answer.txt` — it is consumed, dispatched, and cleaned up automatically.
+- 🐍 **Python SDK & OOP API**: Clean object-oriented library API (`TerminalMonitor`, `MonitorConfig`, `AgentProfile`) with lifecycle hooks (`on_state_change`, `on_mode_change`, `on_send`, `on_attention`, `on_complete`, `on_tick`).
 - ⚡ **Zero External Dependencies**: Pure Python standard library. No pip installation required.
 
 ---
 
 ## 🚀 Quick Start (CLI)
 
-### 1. List Available Profiles
+### 1. Autonomous Supervision Mode (`supervise` / `-S`)
+Run full autonomous supervision with automatic mode switching, safe permission approval, Git-aware smart nudges, real-time status export, and completion detection:
+
 ```bash
-python3 terminal_monitor.py --list-profiles
+python3 terminal_monitor.py supervise \
+  --profile opencode \
+  --status-json /tmp/terminal-monitor/status.json
 ```
 
 ### 2. Monitor Anthropic Claude Code
@@ -76,12 +91,12 @@ python3 terminal_monitor.py \
   --continue-text "Proceed with the remaining tasks and run the test suite."
 ```
 
-### 3. Monitor OpenCode
+### 3. Monitor OpenCode in a specific window/tab
 ```bash
 python3 terminal_monitor.py \
   --profile opencode \
   --title my-project \
-  --continue-text "Proceed from the next incomplete step."
+  --auto-allow-permissions
 ```
 
 ### 4. Monitor Aider in a tmux session
@@ -92,24 +107,17 @@ python3 terminal_monitor.py \
   --continue-file instructions.txt
 ```
 
-### 5. Monitor Any Custom Agent CLI
-```bash
-python3 terminal_monitor.py \
-  --process my-custom-agent \
-  --continue-text "Continue" \
-  --auto-allow-permissions
-```
-
-### 6. Inspect Without Sending (`--once` / `--dry-run`)
+### 5. Inspect Without Sending (`--once` / `--dry-run`)
 ```bash
 # One-shot inspection
-python3 terminal_monitor.py --profile claude --once
+python3 terminal_monitor.py --profile opencode --once
 
 # Monitor in dry-run mode (logs decisions without typing to terminal)
 python3 terminal_monitor.py --profile claude --dry-run
 ```
 
-To stop a running monitor, simply create the stop file:
+### 6. Graceful Stop
+To gracefully stop a running supervisor or monitor daemon:
 ```bash
 touch /tmp/terminal-monitor/stop
 ```
@@ -122,63 +130,68 @@ Generate a configuration template in your repository root:
 
 ```bash
 # JSON Format
-python3 terminal_monitor.py --init-config json > .terminal-monitor.json
+python3 terminal_monitor.py init --format json -o .terminal-monitor.json
 
 # TOML Format
-python3 terminal_monitor.py --init-config toml > .terminal-monitor.toml
+python3 terminal_monitor.py init --format toml -o .terminal-monitor.toml
 ```
 
 ### Example `.terminal-monitor.json`
 ```json
 {
-  "profile": "claude",
-  "process": "claude",
+  "profile": "opencode",
+  "process": "opencode",
   "title": "my-project",
   "backend": "auto",
-  "continue_text": "Proceed from the next incomplete step. Stop if you need human guidance.",
+  "continue_text": "Continue with the next task according to the plan.",
   "poll_seconds": 3.0,
   "idle_seconds": 15.0,
   "cooldown_seconds": 20.0,
   "gone_seconds": 25.0,
   "max_sends": 100,
-  "auto_allow_permissions": false,
+  "auto_allow_permissions": true,
+  "supervise": true,
+  "smart_nudges": true,
+  "auto_switch_modes": true,
+  "completion_check": true,
   "state_dir": "/tmp/terminal-monitor",
+  "status_json_path": "/tmp/terminal-monitor/status.json",
   "unsafe_phrases": [
     "bypass",
     "delete",
     "discard",
     "drop database",
     "force",
+    "format disk",
     "hard reset",
+    "no-verify",
     "overwrite",
     "purge",
     "remove protection",
     "reset --hard",
     "rm -rf",
-    "skip validation"
+    "skip validation",
+    "weaken"
   ],
   "custom_profiles": {
     "my-agent": {
       "process": "myagent",
-      "description": "Custom in-house agent profile",
-      "thinking_patterns": ["thinking...", "running tool"],
-      "permission_patterns": ["authorize action? [y/n]"],
-      "auto_permission_payload": "y"
+      "description": "Custom agent CLI configuration",
+      "thinking_patterns": ["agent is thinking...", "processing..."],
+      "permission_patterns": ["do you authorize this action?"],
+      "auto_permission_payload": "y",
+      "mode_patterns": { "plan": "Plan Mode", "build": "Build Mode" },
+      "completion_patterns": ["all tasks complete"]
     }
   }
 }
 ```
 
-When `.terminal-monitor.json` or `.terminal-monitor.toml` is present in the working directory, simply run:
-```bash
-python3 terminal_monitor.py
-```
-
 ---
 
-## 🐍 Python API & SDK
+## 🐍 Python SDK API
 
-Integrate Terminal Monitor directly into your Python scripts, orchestrators, or agent teams:
+You can embed `TerminalMonitor` directly into your Python tools, test suites, or custom agent frameworks:
 
 ```python
 from terminal_monitor import (
@@ -188,89 +201,71 @@ from terminal_monitor import (
     get_backend,
 )
 
-# 1. Initialize configuration
+# 1. Configure monitor
 config = MonitorConfig(
-    profile="claude",
-    continue_text="Proceed with the next pending task.",
-    backend="auto",
-    idle_seconds=10.0,
-    max_sends=50,
+    process="opencode",
+    profile="opencode",
+    supervise=True,
+    smart_nudges=True,
+    auto_switch_modes=True,
+    completion_check=True,
+    status_json_path="/tmp/terminal-monitor/status.json",
 )
 
 # 2. Instantiate monitor
 monitor = TerminalMonitor(config)
 
-# 3. Attach event callbacks (Optional)
-monitor.on_state_change = lambda old_st, new_st: print(f"🔄 State change: {old_st} -> {new_st}")
-monitor.on_send = lambda reason, payload, ok: print(f"🚀 Sent ({reason}): {payload}")
-monitor.on_attention = lambda reason, snapshot: print(f"⚠️ Attention required: {reason}")
-monitor.on_tick = lambda state, pids: print(f"⏳ Waiting in state '{state}' (Active PIDs: {pids})")
+# 3. Register lifecycle hooks
+monitor.on_state_change = lambda old_state, new_state: print(f"State: {old_state} -> {new_state}")
+monitor.on_mode_change = lambda old_mode, new_mode: print(f"TUI Mode: {old_mode} -> {new_mode}")
+monitor.on_send = lambda reason, payload, ok: print(f"Sent [{reason}]: {payload}")
+monitor.on_complete = lambda snapshot: print("Task execution finished successfully!")
+monitor.on_attention = lambda reason, snapshot: print(f"⚠️ Human attention needed ({reason})")
 
-# 4. Run loop or perform step-by-step control
-monitor.run()
-```
-
-### Inspect Terminal State On-Demand:
-```python
-status = monitor.inspect()
-print("Process Running:", status["ok"])
-print("Detected State:", status["state"])
-print("PID Count:", len(status["pids"]))
+# 4. Run loop (or call monitor.step() for single iteration)
+exit_code = monitor.run()
 ```
 
 ---
 
-## 🛡️ Safety & Decision Engine
+## 📊 Live Status JSON Structure
 
-1. **Automated Safe Option Selection**:
-   - When a numbered or bulleted prompt appears, recommended safe choices are automatically prioritized.
-   - Safe preferred keywords (`continue`, `proceed`, `validate`, `allow`, `yes`) are matched.
-   - If an option contains an unsafe phrase (`rm -rf`, `delete`, `drop database`, etc.) or is ambiguous, the monitor stops safely with **Exit Code 3** and dumps the terminal history to `attention.txt`.
-2. **Interactive Answer Queue**:
-   - Write your answer into `/tmp/terminal-monitor/answer.txt` at any time. The monitor consumes the answer, forwards it to the terminal tab, and deletes the file.
-3. **Permission Grants**:
-   - By default, permission prompts are **not** auto-approved. Pass `--auto-allow-permissions` only when running trusted workflows.
+When `--status-json` or `config.status_json_path` is specified, `TerminalMonitor` continuously maintains a live status export:
 
----
-
-## ⚙️ CLI Reference
-
-| Flag | Default | Description |
-|---|---|---|
-| `--profile` | `opencode` / config | AI agent profile (`claude`, `opencode`, `aider`, `goose`, `generic`) |
-| `--process` | Profile process | Exact process name to monitor |
-| `--title` | `None` | Filter by tab title or window name substring |
-| `--backend` | `auto` | Terminal backend (`auto`, `terminal`, `iterm2`, `tmux`) |
-| `--continue-text` | `""` | Text payload sent when the CLI becomes idle |
-| `--continue-file` | `None` | UTF-8 file containing continuation instructions |
-| `--config` | Auto-discovered | Path to custom `.json` or `.toml` config file |
-| `--project-dir` | `.` | Directory to scan for `.terminal-monitor.*` configs |
-| `--poll-seconds` | `3.0` | Polling interval in seconds |
-| `--idle-seconds` | `15.0` | Seconds of inactivity before declaring idle state |
-| `--cooldown-seconds` | `20.0` | Minimum cooldown between consecutive nudges |
-| `--gone-seconds` | `25.0` | Seconds before exiting if process disappears |
-| `--max-sends` | `100` | Maximum number of continuation nudges before exiting |
-| `--auto-allow-permissions` | `false` | Automatically approve permission prompts |
-| `--once` | `false` | Inspect tab once and exit with status code |
-| `--dry-run` | `false` | Log monitor decisions without typing to terminal |
-| `--state-dir` | `/tmp/terminal-monitor` | Directory for logs, `attention.txt`, and `answer.txt` |
-| `--add-unsafe-phrase` | `[]` | Append additional unsafe phrase to blacklist |
-| `--list-profiles` | `false` | Print all built-in and configured profiles |
-| `--init-config` | `None` | Generate starter config file (`json` or `toml`) |
+```json
+{
+  "running": true,
+  "pids": [21353],
+  "process": "opencode",
+  "profile": "opencode",
+  "state": "thinking",
+  "mode": "build",
+  "sends": 14,
+  "stable_seconds": 12.4,
+  "git": {
+    "branch": "feat/rc6-closing-fixes",
+    "dirty": false,
+    "modified": 0,
+    "untracked": 0,
+    "open_prs": 1,
+    "last_commit": "d78ae3d fix(types): commit ambient declarations"
+  },
+  "timestamp": "2026-08-23T19:45:00Z"
+}
+```
 
 ---
 
-## 🧪 Testing
+## 🧪 Running Tests
 
-Run the full automated test suite (24 unit tests):
+Run the complete built-in unit test suite (zero external test dependencies):
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m py_compile terminal_monitor.py
 ```
 
 ---
 
 ## 📄 License
 
-MIT License. Open source and free for personal and commercial use.
+MIT License. See [LICENSE](LICENSE) for details.

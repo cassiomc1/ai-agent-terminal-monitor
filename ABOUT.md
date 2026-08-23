@@ -7,7 +7,9 @@ Modern AI coding agents (such as **Claude Code**, **OpenCode**, **Aider**, **Goo
 1. **Unattended Stalls**: The agent pauses when it finishes a subtask or turns idle, waiting for the human to type "continue" or "proceed".
 2. **Permission Prompts**: Routine tool approvals or non-destructive confirmations pause execution until manually acknowledged.
 3. **Choice Menus**: Simple multiple-choice questions with obvious or recommended defaults wait endlessly for user keyboard input.
-4. **Destructive Risks**: Unconstrained automation can accidentally run hazardous commands (`rm -rf`, `reset --hard`, `drop table`, `delete`, etc.).
+4. **TUI Mode Barriers**: Agents often operate across distinct TUI modes (e.g. `Plan` vs `Build` modes), requiring specific control keys (such as `Tab`) to approve specs and transition into code generation.
+5. **Destructive Risks**: Unconstrained automation can accidentally run hazardous commands (`rm -rf`, `reset --hard`, `drop table`, `delete`, etc.).
+6. **Task Completion Blindness**: Without completion detection, monitors can continue nudging agents after all tasks and pull requests are already completed and merged.
 
 **AI Agent Terminal Monitor** was designed to solve these exact challenges: acting as an autonomous, fail-closed supervisor and companion driver that keeps your AI coding agents moving forward safely and efficiently.
 
@@ -22,22 +24,38 @@ Modern AI coding agents (such as **Claude Code**, **OpenCode**, **Aider**, **Goo
 ### 2. Multi-Agent Specialization (`AgentProfile`)
 Different AI agents use distinct visual conventions in the terminal:
 - **Claude Code**: Shows dynamic status spinners, `thinking...`, `Allow this tool? [y/n]`, and arrow-key/numbered prompts.
+- **OpenCode**: Utilizes custom write confirmations, `esc interrupt` markers, option bullets (`●`, `○`), and distinct `Plan` / `Build` TUI modes.
 - **Aider**: Uses pair-programming prompts, confirmation questions `(Y)es/(N)o`, and file-diff approval dialogues.
-- **OpenCode**: Utilizes custom write confirmations, `esc interrupt` markers, and option bullets (`●`, `○`).
 - **Generic / Custom**: Supports any CLI tool via configurable pattern dictionaries or regexes.
 
-### 3. Pluggable Terminal Backends
+### 3. Native Control Keys & Special Sequences
+- Dispatches special keystrokes (`Tab`, `Esc`, `Enter`, `Ctrl+C`, `Ctrl+P`, arrow keys) directly via native AppleScript character codes in macOS Terminal.app and iTerm2, and via key symbols in tmux.
+- Eliminates macOS Accessibility permission requirements and prevents AppleScript error `1002` (System Events sandbox restrictions).
+
+### 4. TUI Mode Awareness & Lifecycle Management
+- Identifies active agent modes (e.g. `Plan` vs `Build`).
+- Detects when planning is complete and automatically sends mode-switch keystrokes and start authorizations to trigger code implementation.
+
+### 5. Git Context-Aware Smart Nudges
+- Analyzes repository status dynamically (modified files, untracked changes, unpushed branches, open GitHub pull requests via `gh`).
+- Emits intelligent, contextually relevant continuation prompts tailored to the agent's current progress.
+
+### 6. Completion Engine & Stop Conditions
+- Detects final plan completion indicators (`"100% concluído"`, `"all tasks completed"`, clean working tree).
+- Gracefully stops the supervisor daemon and triggers completion events (`on_complete`).
+
+### 7. Pluggable Terminal Backends
 - **macOS Terminal.app**: Native AppleScript tab scanning and non-intrusive script dispatch.
 - **macOS iTerm2**: Native AppleScript session text extraction and command writing.
 - **tmux**: Cross-platform pane capture (`tmux capture-pane`) and keystroke dispatch (`tmux send-keys`), enabling execution across **Linux, macOS, WSL, devcontainers, and remote headless servers**.
 
-### 4. Fail-Closed Safety Model
+### 8. Fail-Closed Safety Model
 - **Blacklist of Destructive Phrases**: Blocks dangerous actions by default.
 - **Unambiguous Resolution**: Automatically chooses an option only when an explicit safe recommendation or preferred keyword exists.
 - **Human-in-the-Loop Attention**: If a choice is ambiguous or potentially unsafe, the monitor halts with exit code `3` and exports the full terminal snapshot to `attention.txt`.
 - **Live Answer Ingestion**: Allows developers to guide the running agent by dropping a message into `answer.txt` without touching the target terminal.
 
-### 5. Multi-Project & Config Cascading
+### 9. Multi-Project & Config Cascading
 - Scans for `.terminal-monitor.json` or `.terminal-monitor.toml` in project directories.
 - Falls back to user-global configuration in `~/.config/terminal-monitor/config.json`.
 - Overridable via CLI arguments or Python SDK constructor options.
