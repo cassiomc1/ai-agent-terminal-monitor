@@ -1,0 +1,53 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "profile": "claude",
+  "process": "claude",
+  "title": null,
+  "backend": "auto",
+  "continue_text": "Proceed from the next incomplete step. Stop if you need human guidance.",
+  "poll_seconds": 3.0,
+  "idle_seconds": 15.0,
+  "cooldown_seconds": 20.0,
+  "gone_seconds": 25.0,
+  "max_sends": 100,
+  "auto_allow_permissions": false,
+  "state_dir": "/tmp/terminal-monitor",
+  "unsafe_phrases": [
+    "bypass",
+    "delete",
+    "discard",
+    "drop database",
+    "force",
+    "hard reset",
+    "overwrite",
+    "purge",
+    "remove protection",
+    "reset --hard",
+    "rm -rf",
+    "skip validation"
+  ],
+  "custom_profiles": {
+    "my-custom-agent": {
+      "process": "myagent",
+      "description": "Custom profile for an in-house AI CLI agent",
+      "thinking_patterns": [
+        "thinking...",
+        "processing task",
+        "running tool"
+      ],
+      "permission_patterns": [
+        "authorize this action?",
+        "do you want to continue? [y/n]"
+      ],
+      "question_indicators": [
+        "(recommended)",
+        "choose an option"
+      ],
+      "option_patterns": [
+        "^\\s*[●○◉]\\s+\\S",
+        "^\\s*\\d+[.)\\]]\\s+\\S"
+      ],
+      "auto_permission_payload": "y"
+    }
+  }
+}
