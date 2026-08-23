@@ -20,7 +20,7 @@ def main() -> int:
     if len(sys.argv) > 1:
         args = sys.argv[1:]
         if args[0] != "supervise":
-            args = ["supervise"] + args
+            args = ["supervise", *args]
 
     parser = terminal_monitor.build_parser()
     parsed_args = parser.parse_args(args)

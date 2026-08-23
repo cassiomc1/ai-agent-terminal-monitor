@@ -2,6 +2,29 @@
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+py-modules = ["terminal_monitor"]
+
+[tool.ruff]
+line-length = 160
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+    # Blind excepts and try-except-pass are intentional in a long-running
+    # monitor: it must never crash because of a transient subprocess error.
+    "BLE001",
+    "S110",
+    # Embedded AppleScript templates and TUI bullet characters (●○◉❯) are
+    # intentionally long/unicode; they must not be rewritten.
+    "E501",
+    "RUF001",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["terminal_monitor"]
+
 [project]
 name = "ai-agent-terminal-monitor"
 version = "1.0.0"

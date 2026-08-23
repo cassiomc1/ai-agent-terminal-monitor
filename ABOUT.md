@@ -59,6 +59,17 @@ Different AI agents use distinct visual conventions in the terminal:
 - Scans for `.terminal-monitor.json` or `.terminal-monitor.toml` in project directories.
 - Falls back to user-global configuration in `~/.config/terminal-monitor/config.json`.
 - Overridable via CLI arguments or Python SDK constructor options.
+- Custom unsafe phrases passed via CLI flags are merged with (never replace) the ones from config files, and de-duplicated.
+
+### 10. Resilience & Resource Safety
+- **Hard subprocess timeouts**: every `osascript`, `git`, `gh`, and `tmux` invocation runs with a hard timeout, so a modal dialog in the terminal or a hung network call can never freeze the monitor loop.
+- **Cached Git context**: repository snapshots (`git status`, `gh pr list`) are cached with a 30-second TTL per project directory, keeping high-frequency polling and live status JSON export cheap even on large repositories or slow networks.
+- **Input validation**: process names must match `[A-Za-z0-9_.-]+` and window-title filters reject control characters before being embedded into AppleScript literals or shell commands (defense-in-depth against injection).
+- **Clean interruption**: `Ctrl+C` during the monitor loop logs the exit, writes `"running": false` to the status JSON, and returns exit code `130`.
+
+### 11. State Classification Precedence
+- Actionable states (`permission`, `question`, `completed`) are classified before `thinking`.
+- Rationale: agents keep spinner hints like `esc to cancel` visible while permission prompts or menus are on screen; checking "busy" markers first would deadlock the monitor on actionable prompts.
 
 ---
 

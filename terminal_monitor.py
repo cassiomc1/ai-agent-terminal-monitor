@@ -8,24 +8,20 @@ and any project via configuration files, profiles, and customizable rules.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
+import contextlib
 import hashlib
 import json
-import logging
 import os
-from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
 import time
-import types
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any, Callable, NamedTuple
-
-# Ensure module is registered in sys.modules for Python 3.14+ dataclasses when loaded via importlib
-if __name__ not in sys.modules:
-    sys.modules[__name__] = sys.modules.get("__main__", types.ModuleType(__name__))
+from pathlib import Path
+from typing import Any
 
 # Optional TOML support (standard in Python 3.11+)
 try:
@@ -120,9 +116,7 @@ def is_table_or_box_line(line: str) -> bool:
         return True
     if stripped.count("│") >= 2 or stripped.count("|") >= 2:
         return True
-    if re.match(r"^[\s|+_=-]+$", stripped):
-        return True
-    return False
+    return bool(re.match(r"^[\s|+_=-]+$", stripped))
 
 
 # ---------------------------------------------------------------------------
@@ -316,43 +310,7 @@ BUILTIN_PROFILES: dict[str, AgentProfile] = {
     "claude-code": AgentProfile(
         name="claude-code",
         process="claude",
-        description="Alias for Anthropic Claude Code CLI",
-        thinking_patterns=[
-            "thinking...",
-            "thinking",
-            "esc interrupt",
-            "esc to cancel",
-            "running tool",
-            "reading file",
-            "writing file",
-            "running command",
-            "waiting for response",
-        ],
-        permission_patterns=[
-            "allow once",
-            "allow this tool",
-            "allow always",
-            "do you want to run",
-            "[y/n]",
-            "yes / no",
-            "approve tool",
-        ],
-        question_indicators=[
-            "(recommended)",
-            r"\b(select|choose|which option|pick)\b",
-            r"\[yes\]:",
-            r"\(y\)es/\(n\)o",
-            r"\bquestion\b",
-        ],
-        option_patterns=[
-            r"^\s*[●○◉❯>]\s+\S",
-            r"^\s*\d+[.)\]]\s+\S",
-        ],
-        auto_permission_payload="y",
-        completion_patterns=[
-            "all tasks complete",
-            "task completed successfully",
-        ],
+        description="Alias for Anthropic Claude Code CLI (derived from the claude profile)",
     ),
     "aider": AgentProfile(
         name="aider",
@@ -448,6 +406,14 @@ BUILTIN_PROFILES: dict[str, AgentProfile] = {
 }
 
 
+# claude-code is a full alias of the claude profile, derived to avoid duplication.
+BUILTIN_PROFILES["claude-code"] = replace(
+    BUILTIN_PROFILES["claude"],
+    name="claude-code",
+    description="Alias for Anthropic Claude Code CLI",
+)
+
+
 def get_profile(name_or_process: str | None = None, custom_profiles: dict[str, Any] | None = None) -> AgentProfile:
     """Resolve an AgentProfile by name, process, or dictionary config."""
     custom = custom_profiles or {}
@@ -522,22 +488,6 @@ def list_profiles(custom_profiles: dict[str, Any] | None = None) -> dict[str, st
 # Configuration Class
 # ---------------------------------------------------------------------------
 
-class Config(NamedTuple):
-    """Configuration tuple for backward compatibility."""
-    process: str
-    title: str | None
-    continue_text: str
-    poll_seconds: float
-    idle_seconds: float
-    cooldown_seconds: float
-    gone_seconds: float
-    max_sends: int
-    auto_allow_permissions: bool
-    once: bool
-    dry_run: bool
-    state_dir: str = "/tmp/terminal-monitor"
-
-
 @dataclass
 class MonitorConfig:
     """Comprehensive and modular monitor configuration."""
@@ -567,22 +517,6 @@ class MonitorConfig:
     completion_check: bool = True
     status_json_path: str | None = None
 
-    def to_legacy_config(self) -> Config:
-        return Config(
-            process=self.process,
-            title=self.title,
-            continue_text=self.continue_text,
-            poll_seconds=self.poll_seconds,
-            idle_seconds=self.idle_seconds,
-            cooldown_seconds=self.cooldown_seconds,
-            gone_seconds=self.gone_seconds,
-            max_sends=self.max_sends,
-            auto_allow_permissions=self.auto_allow_permissions,
-            once=self.once,
-            dry_run=self.dry_run,
-            state_dir=self.state_dir,
-        )
-
 
 # ---------------------------------------------------------------------------
 # Terminal Backends
@@ -596,29 +530,59 @@ def validate_process_name(process: str) -> str:
     return clean
 
 
+def validate_title_filter(title: str | None) -> str | None:
+    """Normalize and sanity-check a window title substring filter.
+
+    Rejects newlines/control characters and caps length so the value stays a
+    safe single-line AppleScript string literal (escaping still applied later).
+    """
+    if title is None:
+        return None
+    clean = title.strip()
+    if not clean:
+        return None
+    if len(clean) > 200:
+        raise ValueError("Title filter too long (max 200 characters)")
+    if re.search(r"[\x00-\x1f\x7f]", clean):
+        raise ValueError(f"Title filter contains control characters: {title!r}")
+    return clean
+
+
 def applescript_escape(value: str) -> str:
     """Escape backslashes and double quotes for AppleScript literal strings."""
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
+OSASCRIPT_TIMEOUT_SECONDS = 15.0
+COMMAND_TIMEOUT_SECONDS = 30.0
+
+
+def run_osascript_timeout_message() -> str:
+    """Return the standardized error message emitted when osascript times out."""
+    return f"osascript timed out after {int(OSASCRIPT_TIMEOUT_SECONDS)}s"
+
+
 def run_osascript(script: str) -> tuple[int, str]:
-    """Execute AppleScript via osascript subprocess safely."""
+    """Execute AppleScript via osascript subprocess safely with a hard timeout."""
     try:
         proc = subprocess.run(
             ["/usr/bin/osascript", "-e", script],
             capture_output=True,
             text=True,
             check=False,
+            timeout=OSASCRIPT_TIMEOUT_SECONDS,
         )
         out = (proc.stdout or "").strip()
         err = (proc.stderr or "").strip()
         return proc.returncode, out or err
+    except subprocess.TimeoutExpired:
+        return 1, run_osascript_timeout_message()
     except Exception as exc:
         return 1, str(exc)
 
 
 def run_command(cmd: list[str], cwd: str | None = None) -> tuple[int, str, str]:
-    """Run a local command and return returncode, stdout, stderr."""
+    """Run a local command and return returncode, stdout, stderr with a hard timeout."""
     try:
         proc = subprocess.run(
             cmd,
@@ -626,8 +590,11 @@ def run_command(cmd: list[str], cwd: str | None = None) -> tuple[int, str, str]:
             text=True,
             cwd=cwd,
             check=False,
+            timeout=COMMAND_TIMEOUT_SECONDS,
         )
         return proc.returncode, (proc.stdout or "").strip(), (proc.stderr or "").strip()
+    except subprocess.TimeoutExpired:
+        return 1, "", f"command timed out after {int(COMMAND_TIMEOUT_SECONDS)}s"
     except Exception as exc:
         return 1, "", str(exc)
 
@@ -708,9 +675,10 @@ class TerminalAppBackend(BaseTerminalBackend):
     def get_tab(self, process: str, title: str | None = None) -> dict[str, str | bool]:
         process = validate_process_name(process)
         process_literal = applescript_escape(process)
+        checked_title = validate_title_filter(title)
         title_check = "set titleOK to true"
-        if title:
-            wanted = applescript_escape(title)
+        if checked_title:
+            wanted = applescript_escape(checked_title)
             title_check = f'set titleOK to ((ttitle contains "{wanted}") or (wname contains "{wanted}"))'
         script = f'''
 tell application "Terminal"
@@ -739,9 +707,10 @@ end tell
 
     def send(self, process: str, title: str | None, payload: str) -> tuple[bool, str]:
         process_literal = applescript_escape(validate_process_name(process))
+        checked_title = validate_title_filter(title)
         title_check = "set titleOK to true"
-        if title:
-            wanted = applescript_escape(title)
+        if checked_title:
+            wanted = applescript_escape(checked_title)
             title_check = f'set titleOK to ((ttitle contains "{wanted}") or (wname contains "{wanted}"))'
         escaped_payload = applescript_escape(re.sub(r"\s+", " ", payload).strip())
         script = f'''
@@ -779,9 +748,10 @@ end tell
             else:
                 return self.send(process, title, key)
 
+        checked_title = validate_title_filter(title)
         title_check = "set titleOK to true"
-        if title:
-            wanted = applescript_escape(title)
+        if checked_title:
+            wanted = applescript_escape(checked_title)
             title_check = f'set titleOK to ((ttitle contains "{wanted}") or (wname contains "{wanted}"))'
         script = f'''
 tell application "Terminal"
@@ -816,9 +786,10 @@ class ITerm2Backend(BaseTerminalBackend):
 
     def get_tab(self, process: str, title: str | None = None) -> dict[str, str | bool]:
         process_literal = applescript_escape(validate_process_name(process))
+        checked_title = validate_title_filter(title)
         title_check = "set titleOK to true"
-        if title:
-            wanted = applescript_escape(title)
+        if checked_title:
+            wanted = applescript_escape(checked_title)
             title_check = f'set titleOK to (sname contains "{wanted}")'
         script = f'''
 tell application "iTerm2"
@@ -845,9 +816,10 @@ end tell
 
     def send(self, process: str, title: str | None, payload: str) -> tuple[bool, str]:
         process_literal = applescript_escape(validate_process_name(process))
+        checked_title = validate_title_filter(title)
         title_check = "set titleOK to true"
-        if title:
-            wanted = applescript_escape(title)
+        if checked_title:
+            wanted = applescript_escape(checked_title)
             title_check = f'set titleOK to (sname contains "{wanted}")'
         escaped_payload = applescript_escape(re.sub(r"\s+", " ", payload).strip())
         script = f'''
@@ -883,9 +855,10 @@ end tell
             else:
                 return self.send(process, title, key)
 
+        checked_title = validate_title_filter(title)
         title_check = "set titleOK to true"
-        if title:
-            wanted = applescript_escape(title)
+        if checked_title:
+            wanted = applescript_escape(checked_title)
             title_check = f'set titleOK to (sname contains "{wanted}")'
         script = f'''
 tell application "iTerm2"
@@ -919,6 +892,7 @@ class TmuxBackend(BaseTerminalBackend):
     def _find_target(self, process: str, title: str | None = None) -> str | None:
         if not shutil.which("tmux"):
             return None
+        title = validate_title_filter(title)
         code, out, _ = run_command(["tmux", "list-panes", "-a", "-F", "#{session_name}:#{window_index}.#{pane_index} #{pane_current_command} #{pane_title}"])
         if code != 0 or not out:
             return None
@@ -929,9 +903,10 @@ class TmuxBackend(BaseTerminalBackend):
             target = parts[0]
             cmd = parts[1] if len(parts) > 1 else ""
             pane_title = parts[2] if len(parts) > 2 else ""
-            if process.lower() in cmd.lower() or process.lower() in pane_title.lower():
-                if not title or title.lower() in pane_title.lower():
-                    return target
+            if (process.lower() in cmd.lower() or process.lower() in pane_title.lower()) and (
+                not title or title.lower() in pane_title.lower()
+            ):
+                return target
         return None
 
     def get_tab(self, process: str, title: str | None = None) -> dict[str, str | bool]:
@@ -1049,7 +1024,26 @@ class GitStatus:
     summary: str = ""
 
 
-def get_git_status(repo_dir: str = ".") -> GitStatus:
+GIT_STATUS_TTL_SECONDS = 30.0
+_GIT_STATUS_CACHE: dict[str, tuple[float, GitStatus]] = {}
+
+
+def get_git_status(repo_dir: str = ".", ttl_seconds: float = GIT_STATUS_TTL_SECONDS) -> GitStatus:
+    """Cached wrapper around :func:`_get_git_status_uncached` with a TTL per repository."""
+    try:
+        key = str(Path(repo_dir).resolve())
+    except OSError:
+        key = repo_dir
+    now = time.monotonic()
+    cached = _GIT_STATUS_CACHE.get(key)
+    if cached is not None and now - cached[0] < ttl_seconds:
+        return cached[1]
+    status = _get_git_status_uncached(repo_dir)
+    _GIT_STATUS_CACHE[key] = (now, status)
+    return status
+
+
+def _get_git_status_uncached(repo_dir: str = ".") -> GitStatus:
     """Inspect git repository status safely without mutating workspace."""
     try:
         code, out, _ = run_command(["git", "rev-parse", "--is-inside-work-tree"], cwd=repo_dir)
@@ -1059,10 +1053,10 @@ def get_git_status(repo_dir: str = ".") -> GitStatus:
         branch_code, branch_out, _ = run_command(["git", "branch", "--show-current"], cwd=repo_dir)
         branch = branch_out.strip() if branch_code == 0 else ""
 
-        status_code, status_out, _ = run_command(["git", "status", "--porcelain"], cwd=repo_dir)
-        status_lines = [l for l in status_out.splitlines() if l.strip() and not l.strip().endswith(".DS_Store")]
+        _status_code, status_out, _ = run_command(["git", "status", "--porcelain"], cwd=repo_dir)
+        status_lines = [line for line in status_out.splitlines() if line.strip() and not line.strip().endswith(".DS_Store")]
         dirty = len(status_lines) > 0
-        untracked = sum(1 for l in status_lines if l.startswith("??"))
+        untracked = sum(1 for line in status_lines if line.startswith("??"))
         modified = len(status_lines) - untracked
 
         log_code, log_out, _ = run_command(["git", "log", "-n", "1", "--oneline"], cwd=repo_dir)
@@ -1072,10 +1066,8 @@ def get_git_status(repo_dir: str = ".") -> GitStatus:
         if shutil.which("gh"):
             gh_code, gh_out, _ = run_command(["gh", "pr", "list", "--state", "open", "--json", "number"], cwd=repo_dir)
             if gh_code == 0:
-                try:
+                with contextlib.suppress(Exception):
                     open_prs = len(json.loads(gh_out))
-                except Exception:
-                    pass
 
         summary = f"branch={branch} dirty={dirty} mod={modified} untracked={untracked} prs={open_prs}"
         return GitStatus(
@@ -1133,18 +1125,23 @@ def normalize_snapshot(history: str) -> str:
 
 
 def classify_state(history: str, profile: AgentProfile | None = None) -> str:
-    """Classify the current terminal state (thinking, permission, question, completed, idle)."""
+    """Classify the current terminal state (permission, question, completed, thinking, idle).
+
+    Actionable states (permission/question/completed) take precedence over
+    "thinking" because agents often keep spinner hints like "esc to cancel"
+    visible while a permission prompt is on screen.
+    """
     prof = profile or BUILTIN_PROFILES["opencode"]
     tail = "\n".join(history.splitlines()[-50:])
 
-    if prof.matches_thinking(tail):
-        return "thinking"
     if prof.matches_permission(tail):
         return "permission"
     if prof.matches_question(tail):
         return "question"
     if prof.matches_completion(tail):
         return "completed"
+    if prof.matches_thinking(tail):
+        return "thinking"
     return "idle"
 
 
@@ -1265,13 +1262,13 @@ def load_config_file(path: str | Path) -> dict[str, Any]:
     # Try JSON first, then TOML
     try:
         return json.loads(text)
-    except Exception:
+    except Exception as json_err:
         if tomllib is not None:
             try:
                 return tomllib.loads(text)
             except Exception:
                 pass
-        raise ValueError(f"Could not parse configuration file as JSON or TOML: {file_path}")
+        raise ValueError(f"Could not parse configuration file as JSON or TOML: {file_path}") from json_err
 
 
 def generate_starter_config(format_type: str = "json") -> str:
@@ -1385,6 +1382,12 @@ class TerminalMonitor:
         self.on_attention: Callable[[str, str], None] | None = None
         self.on_complete: Callable[[str], None] | None = None
         self.on_tick: Callable[[str, int], None] | None = None
+
+    def _effective_threshold(self, state: str) -> float:
+        """Idle seconds to wait before acting; actionable prompts act faster."""
+        if self.config.idle_seconds == 0.0:
+            return 0.0
+        return 4.0 if state in ("permission", "question") else self.config.idle_seconds
 
     def log(self, message: str) -> None:
         append_log(self.log_path, message)
@@ -1505,9 +1508,7 @@ class TerminalMonitor:
             self.export_status_json(pids, "completed", {"done": True})
             return 0, "COMPLETED"
 
-        threshold = 4.0 if state in ("permission", "question") else self.config.idle_seconds
-        if self.config.idle_seconds == 0.0:
-            threshold = 0.0
+        threshold = self._effective_threshold(state)
 
         if state == "thinking" or stable_for < threshold:
             if self.on_tick:
@@ -1517,7 +1518,7 @@ class TerminalMonitor:
         if time.monotonic() - self.last_send < self.config.cooldown_seconds:
             return None, "COOLDOWN"
 
-        mode_threshold = 0.0 if self.config.idle_seconds == 0.0 else 4.0
+        mode_threshold = self._effective_threshold("permission")
         # Handle Plan Mode Auto-Transition
         if self.config.auto_switch_modes and mode == "plan" and self.profile.is_plan_ready(history) and stable_for >= mode_threshold:
             self.log("MODE: Plan completed. Auto-switching mode via switch key.")
@@ -1576,12 +1577,17 @@ class TerminalMonitor:
     def run(self) -> int:
         """Run monitor loop continuously until exit condition is met."""
         self.log(f"START process={self.config.process} profile={self.profile.name} backend={self.backend.name()}")
-        while True:
-            code, msg = self.step()
-            if code is not None:
-                self.log(f"EXIT code={code} msg={msg}")
-                return code
-            time.sleep(self.config.poll_seconds)
+        try:
+            while True:
+                code, msg = self.step()
+                if code is not None:
+                    self.log(f"EXIT code={code} msg={msg}")
+                    return code
+                time.sleep(self.config.poll_seconds)
+        except KeyboardInterrupt:
+            self.log("EXIT code=130 msg=INTERRUPTED")
+            self.export_status_json([], "interrupted", {"running": False})
+            return 130
 
 
 # ---------------------------------------------------------------------------
@@ -1656,6 +1662,10 @@ def config_from_args(args: argparse.Namespace) -> MonitorConfig:
         if discovered:
             file_cfg = load_config_file(discovered)
 
+    cli_unsafe = getattr(args, "unsafe_phrases", None) or []
+    file_unsafe = file_cfg.get("unsafe_phrases", list(UNSAFE_PHRASES))
+    merged_unsafe = list(dict.fromkeys(list(file_unsafe) + list(cli_unsafe)))
+
     continue_text = args.continue_text if getattr(args, "continue_text", None) is not None else file_cfg.get("continue_text", "")
     if getattr(args, "continue_file", None):
         continue_path = Path(args.continue_file).resolve()
@@ -1693,7 +1703,7 @@ def config_from_args(args: argparse.Namespace) -> MonitorConfig:
         state_dir=str(_val(getattr(args, "state_dir", None), "state_dir", "/tmp/terminal-monitor")),
         backend=str(_val(getattr(args, "backend", None), "backend", "auto")),
         project_dir=str(project_dir),
-        unsafe_phrases=getattr(args, "unsafe_phrases", None) or file_cfg.get("unsafe_phrases", list(UNSAFE_PHRASES)),
+        unsafe_phrases=merged_unsafe,
         custom_profiles=file_cfg.get("custom_profiles", {}),
         supervise=is_supervise,
         auto_switch_modes=auto_switch,
