@@ -557,6 +557,11 @@ OSASCRIPT_TIMEOUT_SECONDS = 15.0
 COMMAND_TIMEOUT_SECONDS = 30.0
 
 
+def run_osascript_timeout_message() -> str:
+    """Return the standardized error message emitted when osascript times out."""
+    return f"osascript timed out after {int(OSASCRIPT_TIMEOUT_SECONDS)}s"
+
+
 def run_osascript(script: str) -> tuple[int, str]:
     """Execute AppleScript via osascript subprocess safely with a hard timeout."""
     try:
@@ -571,7 +576,7 @@ def run_osascript(script: str) -> tuple[int, str]:
         err = (proc.stderr or "").strip()
         return proc.returncode, out or err
     except subprocess.TimeoutExpired:
-        return 1, f"osascript timed out after {int(OSASCRIPT_TIMEOUT_SECONDS)}s"
+        return 1, run_osascript_timeout_message()
     except Exception as exc:
         return 1, str(exc)
 
