@@ -26,7 +26,12 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Syntax check
-        run: python -m py_compile terminal_monitor.py
+        run: python -m py_compile terminal_monitor.py supervisor.py
+
+      - name: Run ruff lint
+        run: |
+          pip install ruff
+          ruff check terminal_monitor.py supervisor.py tests/
 
       - name: Run unit tests
         run: python -m unittest discover -s tests -v

@@ -1,13 +1,11 @@
 import importlib.util
 import json
-import os
 import pathlib
-import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
-
+from unittest import mock
 
 MODULE_PATH = pathlib.Path(__file__).parents[1] / "terminal_monitor.py"
 SPEC = importlib.util.spec_from_file_location("terminal_monitor", MODULE_PATH)
@@ -43,9 +41,9 @@ class MockBackend(terminal_monitor.BaseTerminalBackend):
 
 
 class MonitorBehaviorTests(unittest.TestCase):
-    def test_classifies_thinking_before_prompt_markers(self):
-        history = "Allow Deny\nPreparing write... esc interrupt"
-        self.assertEqual(terminal_monitor.classify_state(history), "thinking")
+    def test_classifies_permission_over_thinking_markers(self):
+        history = "Preparing write... esc to cancel\nAllow once / Deny"
+        self.assertEqual(terminal_monitor.classify_state(history), "permission")
 
     def test_classifies_permission_prompt(self):
         self.assertEqual(
@@ -402,6 +400,111 @@ class TerminalMonitorClassTests(unittest.TestCase):
             self.assertIn("ATTENTION_REQUIRED", msg)
             attention_file = pathlib.Path(directory) / "attention.txt"
             self.assertTrue(attention_file.exists())
+
+
+class TmuxBackendTests(unittest.TestCase):
+    def test_find_target_matches_command_and_title(self):
+        panes = (
+            "session:0.0 vim main window\n"
+            "session:0.1 opencode agent session\n"
+        )
+        backend = terminal_monitor.TmuxBackend()
+        with mock.patch("shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
+            terminal_monitor, "run_command", return_value=(0, panes, "")
+        ):
+            self.assertEqual(backend._find_target("opencode"), "session:0.1")
+            self.assertEqual(backend._find_target("vim", title="main"), "session:0.0")
+            self.assertIsNone(backend._find_target("vim", title="nope"))
+            self.assertIsNone(backend._find_target("missing-process"))
+
+    def test_find_target_requires_tmux_binary(self):
+        with mock.patch("shutil.which", return_value=None):
+            self.assertIsNone(terminal_monitor.TmuxBackend()._find_target("opencode"))
+
+
+class RobustnessTests(unittest.TestCase):
+    def test_run_osascript_timeout_returns_error(self):
+        def raise_timeout(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd="osascript", timeout=15)
+
+        with mock.patch.object(terminal_monitor.subprocess, "run", side_effect=raise_timeout):
+            code, detail = terminal_monitor.run_osascript('return "x"')
+        self.assertEqual(code, 1)
+        self.assertIn("timed out", detail)
+
+    def test_run_command_timeout_returns_error(self):
+        def raise_timeout(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd="git", timeout=30)
+
+        with mock.patch.object(terminal_monitor.subprocess, "run", side_effect=raise_timeout):
+            code, _out, err = terminal_monitor.run_command(["git", "status"])
+        self.assertEqual(code, 1)
+        self.assertIn("timed out", err)
+
+    def test_title_filter_validation(self):
+        with self.assertRaises(ValueError):
+            terminal_monitor.validate_title_filter("bad\ninjection")
+        with self.assertRaises(ValueError):
+            terminal_monitor.validate_title_filter("x" * 201)
+        self.assertIsNone(terminal_monitor.validate_title_filter(None))
+        self.assertIsNone(terminal_monitor.validate_title_filter("   "))
+        self.assertEqual(terminal_monitor.validate_title_filter(" worker "), "worker")
+
+    def test_git_status_cache_respects_ttl(self):
+        calls = []
+        fake_status = terminal_monitor.GitStatus(is_repo=True, branch="cached-branch")
+
+        def fake_uncached(repo_dir="."):
+            calls.append(repo_dir)
+            return fake_status
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            terminal_monitor, "_get_git_status_uncached", side_effect=fake_uncached
+        ):
+            first = terminal_monitor.get_git_status(directory, ttl_seconds=60.0)
+            second = terminal_monitor.get_git_status(directory, ttl_seconds=60.0)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(first.branch, second.branch)
+            refreshed = terminal_monitor.get_git_status(directory, ttl_seconds=0.0)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(refreshed.branch, "cached-branch")
+
+
+    def test_unsafe_phrases_merge_file_and_cli(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg_path = pathlib.Path(directory) / ".terminal-monitor.json"
+            cfg_path.write_text(
+                json.dumps({"process": "claude", "unsafe_phrases": ["custom-danger", "rm -rf"]}),
+                encoding="utf-8",
+            )
+            parser = terminal_monitor.build_parser()
+            args = parser.parse_args(["--project-dir", directory, "--unsafe-phrase", "cli-only-risk"])
+            config = terminal_monitor.config_from_args(args)
+
+            self.assertIn("custom-danger", config.unsafe_phrases)
+            self.assertIn("cli-only-risk", config.unsafe_phrases)
+            self.assertIn("rm -rf", config.unsafe_phrases)
+            self.assertEqual(len(config.unsafe_phrases), len(set(config.unsafe_phrases)))
+
+    def test_supervise_flags(self):
+        with tempfile.TemporaryDirectory() as empty_dir:
+            parser = terminal_monitor.build_parser()
+
+            args = parser.parse_args(["--supervise", "--project-dir", empty_dir])
+            config = terminal_monitor.config_from_args(args)
+            self.assertTrue(config.supervise)
+            self.assertTrue(config.auto_allow_permissions)
+            self.assertTrue(config.smart_nudges)
+
+            args = parser.parse_args([
+                "supervise", "--no-smart-nudges", "--no-mode-switch",
+                "--no-completion-check", "--project-dir", empty_dir,
+            ])
+            config = terminal_monitor.config_from_args(args)
+            self.assertTrue(config.supervise)
+            self.assertFalse(config.smart_nudges)
+            self.assertFalse(config.auto_switch_modes)
+            self.assertFalse(config.completion_check)
 
 
 if __name__ == "__main__":

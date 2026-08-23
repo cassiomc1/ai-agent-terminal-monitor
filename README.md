@@ -20,6 +20,8 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
 
 **AI Agent Terminal Monitor** is a generic, modular, and extensible supervisor that watches your terminal, intelligently classifies agent lifecycle states (`thinking`, `permission`, `question`, `completed`, `idle`), auto-resolves safe prompts, manages TUI modes (`Plan` vs `Build`), blocks unsafe/destructive operations, generates context-aware Git nudges, exports real-time status JSON, and keeps the agent progressing autonomously to goal completion.
 
+> **State precedence:** actionable states (`permission`, `question`, `completed`) are always detected before `thinking`. Agents frequently keep spinner hints like `esc to cancel` visible while a permission prompt is on screen, so the monitor never mistakes an actionable prompt for a busy state.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                           AI Agent Terminal Monitor                         │
@@ -66,7 +68,10 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
   - `tmux`: Native cross-platform tmux support (`capture-pane` & `send-keys`), enabling execution on **Linux, macOS, WSL, devcontainers, and remote SSH sessions**.
   - `auto`: Auto-detects active environment.
 - 🛡️ **Fail-Closed Safety Engine**: Blocks dangerous actions (`rm -rf`, `delete`, `drop database`, `reset --hard`, `bypass`, etc.). Ambiguous or risky prompts halt the monitor with exit code `3` and export a snapshot to `attention.txt`.
-- 📁 **Hierarchical Project Configuration**: Reads project settings from `.terminal-monitor.json` or `.terminal-monitor.toml` in your repository root, or globally from `~/.config/terminal-monitor/`.
+- ⏱️ **Hard Timeouts & Resilience**: All subprocess calls (`osascript`, `git`, `gh`, `tmux`) run with hard timeouts, so a stuck terminal dialog or hung network call can never freeze the monitor. `Ctrl+C` exits cleanly (exit code `130`) and marks the status JSON as not running.
+- 🔐 **Input Validation**: Process names and window-title filters are validated/sanitized before being embedded into AppleScript or shell commands.
+- 📁 **Hierarchical Project Configuration**: Reads project settings from `.terminal-monitor.json` or `.terminal-monitor.toml` in your repository root, or globally from `~/.config/terminal-monitor/`. Unsafe phrases from CLI flags (`--unsafe-phrase`) are merged with the ones from the config file instead of replacing them.
+- 🗂️ **Cached Git Context**: Repository status is cached with a 30-second TTL, keeping the polling loop cheap even with live status JSON export enabled.
 - ✍️ **Live Human-in-the-Loop Override**: Write a message into `/tmp/terminal-monitor/answer.txt` — it is consumed, dispatched, and cleaned up automatically.
 - 🐍 **Python SDK & OOP API**: Clean object-oriented library API (`TerminalMonitor`, `MonitorConfig`, `AgentProfile`) with lifecycle hooks (`on_state_change`, `on_mode_change`, `on_send`, `on_attention`, `on_complete`, `on_tick`).
 - ⚡ **Zero External Dependencies**: Pure Python standard library. No pip installation required.
@@ -256,12 +261,19 @@ When `--status-json` or `config.status_json_path` is specified, `TerminalMonitor
 
 ---
 
-## 🧪 Running Tests
+## 🧪 Running Tests & Lint
 
 Run the complete built-in unit test suite (zero external test dependencies):
 
 ```bash
 python3 -m unittest discover -s tests -v
+```
+
+Lint checks (used by CI) run via [ruff](https://docs.astral.sh/ruff/):
+
+```bash
+pip install ruff
+ruff check terminal_monitor.py supervisor.py tests/
 ```
 
 ---
