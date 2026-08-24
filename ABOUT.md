@@ -66,8 +66,16 @@ Different AI agents use distinct visual conventions in the terminal:
 - **Cached Git context**: repository snapshots (`git status`, `gh pr list`) are cached with a 30-second TTL per project directory, keeping high-frequency polling and live status JSON export cheap even on large repositories or slow networks.
 - **Input validation**: process names must match `[A-Za-z0-9_.-]+` and window-title filters reject control characters before being embedded into AppleScript literals or shell commands (defense-in-depth against injection).
 - **Clean interruption**: `Ctrl+C` during the monitor loop logs the exit, writes `"running": false` to the status JSON, and returns exit code `130`.
+- **Attempt and restart journal**: every automated continuation is persisted with an ID and lifecycle status, while restart events retain the saved session and last prompt context.
+- **External-check distinction**: rate limits (`429`), timeouts, and network failures are recorded as retryable external evidence rather than being confused with code regressions.
 
-### 11. State Classification Precedence
+### 11. Merge and Repository Safety
+- **Exact-head merge gate**: the `merge-pr` command re-reads the PR head and check rollup immediately before merging and supplies `--match-head-commit` to GitHub CLI.
+- **Protected branch guard**: supervised work pauses on dirty `main`/`master` or a configured unexpected branch, preserving the snapshot in `attention.txt`.
+- **Auditable reports**: `final-report.json` records verification evidence, attempts, CI events, policy decisions, the explicit npm prohibition, and the npm-publication invariant.
+- **Dry-run isolation**: dry-run mode prints decisions without sending terminal input, approving permissions, starting agents, or merging PRs.
+
+### 12. State Classification Precedence
 - Actionable states (`permission`, `question`, `completed`) are classified before `thinking`.
 - Rationale: agents keep spinner hints like `esc to cancel` visible while permission prompts or menus are on screen; checking "busy" markers first would deadlock the monitor on actionable prompts.
 

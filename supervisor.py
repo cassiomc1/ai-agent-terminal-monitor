@@ -15,12 +15,15 @@ def main() -> int:
         "--process", "opencode",
         "--profile", "opencode",
         "--auto-allow-permissions",
+        "--prohibition", "Do not publish to npm.",
         "--status-json", "/tmp/terminal-monitor/status.json",
     ]
     if len(sys.argv) > 1:
         args = sys.argv[1:]
         if args[0] != "supervise":
             args = ["supervise", *args]
+        if "--prohibition" not in args:
+            args.extend(["--prohibition", "Do not publish to npm."])
 
     parser = terminal_monitor.build_parser()
     parsed_args = parser.parse_args(args)

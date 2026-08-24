@@ -122,6 +122,13 @@ class TaskState:
     session_generation: int = 0
     session_id: str = ""
     interaction_marker: str = ""
+    expected_branch: str = ""
+    attempts: tuple[dict[str, Any], ...] = ()
+    ci_events: tuple[dict[str, Any], ...] = ()
+    policy_decisions: tuple[dict[str, Any], ...] = ()
+    last_prompt: str = ""
+    last_attempt_id: str = ""
+    report_path: str = ""
 
     def save(self, path: str | Path) -> None:
         data = {
@@ -137,6 +144,13 @@ class TaskState:
             "sessionGeneration": self.session_generation,
             "sessionId": self.session_id,
             "interactionMarker": self.interaction_marker,
+            "expectedBranch": self.expected_branch,
+            "attempts": list(self.attempts),
+            "ciEvents": list(self.ci_events),
+            "policyDecisions": list(self.policy_decisions),
+            "lastPrompt": self.last_prompt,
+            "lastAttemptId": self.last_attempt_id,
+            "reportPath": self.report_path,
         }
         _atomic_json_write(path, data)
 
@@ -162,9 +176,63 @@ class TaskState:
                 session_generation=int(data.get("sessionGeneration", 0)),
                 session_id=str(data.get("sessionId", "")),
                 interaction_marker=str(data.get("interactionMarker", "")),
+                expected_branch=str(data.get("expectedBranch", "")),
+                attempts=tuple(dict(item) for item in data.get("attempts", []) if isinstance(item, dict)),
+                ci_events=tuple(dict(item) for item in data.get("ciEvents", []) if isinstance(item, dict)),
+                policy_decisions=tuple(dict(item) for item in data.get("policyDecisions", []) if isinstance(item, dict)),
+                last_prompt=str(data.get("lastPrompt", "")),
+                last_attempt_id=str(data.get("lastAttemptId", "")),
+                report_path=str(data.get("reportPath", "")),
             )
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             raise StateFileError(f"Untrusted task state at {target}: {exc}") from exc
+
+
+ATTEMPT_STATUSES = {"queued", "sent", "accepted", "completed", "ignored"}
+
+
+@dataclass
+class AttemptLedger:
+    """Bounded event ledger for idempotent, observable continuation attempts."""
+
+    records: list[dict[str, Any]] = field(default_factory=list)
+    max_records: int = 100
+    _sequence: int = field(default=0, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        sequence_values = []
+        for record in self.records:
+            attempt_id = str(record.get("attempt_id", ""))
+            with contextlib.suppress(ValueError, IndexError):
+                sequence_values.append(int(attempt_id.rsplit("-", 1)[1]))
+        self._sequence = max(sequence_values, default=0)
+
+    def _append(self, attempt_id: str, status: str, **details: Any) -> None:
+        if status not in ATTEMPT_STATUSES:
+            raise ValueError(f"Unknown attempt status: {status}")
+        record: dict[str, Any] = {
+            "attempt_id": attempt_id,
+            "status": status,
+            "timestamp": now_iso(),
+        }
+        record.update({key: value for key, value in details.items() if value is not None})
+        self.records.append(record)
+        self.records[:] = self.records[-max(1, int(self.max_records)) :]
+
+    def queue(self, reason: str, payload: str, *, observed_state: str = "") -> str:
+        self._sequence += 1
+        attempt_id = f"attempt-{int(time.time() * 1000)}-{self._sequence}"
+        self._append(attempt_id, "queued", reason=reason, payload=payload, observed_state=observed_state)
+        return attempt_id
+
+    def transition(self, attempt_id: str, status: str, *, detail: str = "", observed_state: str = "") -> None:
+        if not any(record.get("attempt_id") == attempt_id for record in self.records):
+            raise KeyError(f"Unknown attempt: {attempt_id}")
+        self._append(attempt_id, status, detail=detail, observed_state=observed_state)
+
+    def latest(self, attempt_id: str | None = None) -> dict[str, Any] | None:
+        records = self.records if attempt_id is None else [item for item in self.records if item.get("attempt_id") == attempt_id]
+        return dict(records[-1]) if records else None
 
 
 @dataclass(frozen=True)
@@ -211,11 +279,32 @@ class PolicyEnvelope:
     objective: str = ""
     prohibitions: tuple[str, ...] = ()
 
+    def authorize_action(
+        self,
+        action: str,
+        *,
+        unsafe_phrases: list[str] | tuple[str, ...] = UNSAFE_PHRASES,
+        npm_publish_allowed: bool = False,
+    ) -> tuple[bool, str]:
+        """Apply a durable, independent risk policy to an outbound action."""
+        risk = classify_action_risk(action, npm_publish_allowed=npm_publish_allowed)
+        if risk == "blocked":
+            if _contains_positive_npm_publication(action) and not npm_publish_allowed:
+                return False, "npm publication is prohibited by permanent policy"
+            return False, "action blocked by permanent safety policy"
+        if any(phrase.lower() in action.lower() for phrase in unsafe_phrases):
+            return False, "action matches an unsafe phrase"
+        if risk == "attention":
+            return False, "high-risk action requires human attention"
+        return True, "safe"
+
     def compose(self, dynamic: str, stage: str = "") -> str:
         low = dynamic.lower()
         npm_blocked = any("npm" in item.lower() and ("not" in item.lower() or "não" in item.lower()) for item in self.prohibitions)
         if npm_blocked and re.search(r"\b(publish|publique|publicar|publique)\b.{0,30}\bnpm\b|\bnpm\s+publish\b", low):
             raise ValueError("dynamic instruction conflicts with permanent npm prohibition")
+        if classify_action_risk(dynamic) == "blocked":
+            raise ValueError("dynamic instruction conflicts with permanent safety policy")
         parts = []
         if self.objective:
             parts.append(f"Objective: {self.objective}")
@@ -329,6 +418,94 @@ def collect_process_activity(root_pids: list[int]) -> ProcessActivity:
 
 RETRYABLE_CHECK_CONCLUSIONS = {"cancelled", "timed_out", "stale", "startup_failure", "action_required", "network_failure", "infrastructure_failure"}
 CODE_FAILURE_CONCLUSIONS = {"failure"}
+PASSED_CHECK_CONCLUSIONS = {"success", "neutral", "skipped"}
+EXTERNAL_FAILURE_MARKERS = (
+    "429",
+    "408",
+    "425",
+    "502",
+    "503",
+    "504",
+    "too many requests",
+    "rate limit",
+    "timed out",
+    "timeout",
+    "network",
+    "connection reset",
+    "temporary failure",
+    "service unavailable",
+)
+HIGH_RISK_ACTION_MARKERS = (
+    "npm publish",
+    "npm unpublish",
+    "npm version",
+    "gh release create",
+    "gh release delete",
+    "git tag",
+    "create release",
+    "publish release",
+)
+NPM_PUBLICATION_PATTERNS = (
+    re.compile(r"\bnpm\s+(?:publish|unpublish|version)\b", re.IGNORECASE),
+    re.compile(r"\b(?:publish|unpublish|version)\s+(?:the\s+)?(?:package\s+)?to\s+npm\b", re.IGNORECASE),
+)
+NPM_NEGATION_PATTERN = re.compile(
+    r"\b(?:do\s+not|don't|never|not|no|não|nao|prohibit(?:ed)?|proibido|sem)(?:\s+\w+){0,2}\s*$",
+    re.IGNORECASE,
+)
+
+
+def _contains_positive_npm_publication(action: str) -> bool:
+    """Detect an npm publication command while allowing policy prohibitions themselves."""
+    for pattern in NPM_PUBLICATION_PATTERNS:
+        for match in pattern.finditer(action):
+            prefix = action[max(0, match.start() - 48) : match.start()]
+            if not NPM_NEGATION_PATTERN.search(prefix):
+                return True
+    return False
+
+
+def classify_check_result(check: dict[str, Any]) -> dict[str, Any]:
+    """Classify one GitHub check without conflating code and network failures."""
+    raw = str(check.get("conclusion") or check.get("state") or check.get("status") or "").lower().strip()
+    evidence = " ".join(
+        str(check.get(key, ""))
+        for key in ("name", "title", "summary", "output", "details", "message", "text")
+    ).lower()
+    if raw in PASSED_CHECK_CONCLUSIONS:
+        category = "passed"
+    elif raw in RETRYABLE_CHECK_CONCLUSIONS:
+        category = "cancelled-infra"
+    elif raw in CODE_FAILURE_CONCLUSIONS and any(marker in evidence for marker in EXTERNAL_FAILURE_MARKERS):
+        category = "failed-external"
+    elif raw in CODE_FAILURE_CONCLUSIONS:
+        category = "failed"
+    elif raw in {"queued", "in_progress", "pending", "requested", "waiting", ""}:
+        category = "pending"
+    else:
+        category = "unknown"
+    return {
+        "category": category,
+        "retryable": category in {"cancelled-infra", "failed-external"},
+        "conclusion": raw,
+        "evidence": evidence,
+        "name": str(check.get("name") or check.get("context") or ""),
+    }
+
+
+def classify_action_risk(action: str, *, npm_publish_allowed: bool = False) -> str:
+    """Return safe, attention, or blocked for a proposed external action."""
+    low = action.lower()
+    if not npm_publish_allowed and _contains_positive_npm_publication(action):
+        return "blocked"
+    for marker in HIGH_RISK_ACTION_MARKERS:
+        if marker in low:
+            if marker.startswith("npm ") and not _contains_positive_npm_publication(action):
+                continue
+            return "attention"
+    if any(phrase in low for phrase in UNSAFE_PHRASES):
+        return "blocked"
+    return "safe"
 
 
 class PullRequestStateMachine:
@@ -348,14 +525,15 @@ class PullRequestStateMachine:
             return self.stage
         self.seen_pr_number = number
         checks = list(pr.get("checks") or [])
-        conclusions = {str(check.get("conclusion") or check.get("state") or "").lower() for check in checks}
+        classifications = [classify_check_result(check) for check in checks]
+        conclusions = {item["category"] for item in classifications}
         if str(pr.get("state", "")).upper() == "MERGED":
             self.stage = "POST_MERGE_VERIFY"
-        elif conclusions & CODE_FAILURE_CONCLUSIONS:
+        elif "failed" in conclusions:
             self.stage = "FIX_REQUIRED"
-        elif conclusions & RETRYABLE_CHECK_CONCLUSIONS:
+        elif conclusions & {"cancelled-infra", "failed-external"}:
             self.stage = "CI_RETRY_REQUIRED"
-        elif checks and conclusions <= {"success", "neutral", "skipped"}:
+        elif checks and conclusions <= {"passed"}:
             self.stage = "CI_GREEN"
         else:
             self.stage = "CI_PENDING"
@@ -510,12 +688,148 @@ def get_current_pr_snapshot(project_dir: str, reference: str = "") -> dict[str, 
         return None
 
 
+def evaluate_repository_safety(
+    status: GitStatus,
+    *,
+    expected_branch: str = "",
+    protected_branches: tuple[str, ...] = ("main", "master"),
+) -> dict[str, Any]:
+    """Fail closed when supervision observes an unexpected or dirty branch."""
+    if not status.is_repo:
+        return {
+            "safe": False,
+            "reason": "not_a_repository",
+            "branch": status.branch,
+            "head": status.head,
+            "dirty": status.dirty,
+            "modified_files": list(status.modified_files),
+        }
+    if status.branch in protected_branches and status.dirty:
+        return {
+            "safe": False,
+            "reason": "protected_branch_dirty",
+            "branch": status.branch,
+            "head": status.head,
+            "dirty": True,
+            "modified_files": list(status.modified_files),
+        }
+    if expected_branch and status.branch != expected_branch:
+        return {
+            "safe": False,
+            "reason": "branch_mismatch",
+            "branch": status.branch,
+            "head": status.head,
+            "expected_branch": expected_branch,
+            "dirty": status.dirty,
+            "modified_files": list(status.modified_files),
+        }
+    return {
+        "safe": True,
+        "reason": "ok",
+        "branch": status.branch,
+        "head": status.head,
+        "expected_branch": expected_branch,
+        "dirty": status.dirty,
+        "modified_files": list(status.modified_files),
+    }
+
+
+def verify_merge_gate(project_dir: str, pr_number: int, expected_head: str) -> dict[str, Any]:
+    """Re-query the PR and require green checks for the exact expected head."""
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_head or "", flags=re.IGNORECASE):
+        return {
+            "ok": False,
+            "reason": "invalid_expected_head",
+            "expected_head": expected_head,
+        }
+    code, output, error = run_command(
+        ["gh", "pr", "view", str(pr_number), "--json", "number,state,headRefOid,statusCheckRollup"],
+        cwd=project_dir,
+    )
+    if code != 0:
+        return {"ok": False, "reason": "github_query_failed", "detail": error or output}
+    try:
+        pr = json.loads(output)
+    except (json.JSONDecodeError, TypeError) as exc:
+        return {"ok": False, "reason": "invalid_github_response", "detail": str(exc)}
+    state = str(pr.get("state", "")).upper()
+    if state == "MERGED":
+        return {"ok": True, "reason": "already_merged", "pr": pr, "head": pr.get("headRefOid", ""), "checks": []}
+    if state != "OPEN":
+        return {"ok": False, "reason": "pr_not_open", "state": state, "pr": pr}
+    actual_head = str(pr.get("headRefOid", ""))
+    if not expected_head or actual_head != expected_head:
+        return {"ok": False, "reason": "head_mismatch", "expected_head": expected_head, "actual_head": actual_head, "pr": pr}
+    checks = [classify_check_result(check) for check in pr.get("statusCheckRollup") or []]
+    if not checks:
+        return {"ok": False, "reason": "checks_missing", "head": actual_head, "checks": checks, "pr": pr}
+    bad = [item for item in checks if item["category"] != "passed"]
+    if bad:
+        reason = "checks_retryable" if any(item["retryable"] for item in bad) else "checks_not_green"
+        return {"ok": False, "reason": reason, "head": actual_head, "checks": checks, "pr": pr}
+    return {"ok": True, "reason": "green_exact_head", "head": actual_head, "checks": checks, "pr": pr}
+
+
+def merge_pull_request(project_dir: str, pr_number: int, expected_head: str, *, dry_run: bool = False) -> dict[str, Any]:
+    """Merge only after the exact-head gate; dry-run never contacts GitHub."""
+    if dry_run:
+        return {"ok": True, "dry_run": True, "reason": "would_merge", "pr": pr_number, "head": expected_head}
+    gate = verify_merge_gate(project_dir, pr_number, expected_head)
+    if not gate.get("ok"):
+        return {**gate, "merged": False}
+    if gate.get("reason") == "already_merged":
+        return {**gate, "merged": True}
+    code, output, error = run_command(
+        ["gh", "pr", "merge", str(pr_number), "--merge", "--match-head-commit", expected_head],
+        cwd=project_dir,
+    )
+    if code != 0:
+        return {"ok": False, "merged": False, "reason": "merge_failed", "detail": error or output, "gate": gate}
+    return {"ok": True, "merged": True, "reason": "merged", "detail": output, "gate": gate}
+
+
+def persist_restart_event(state_path: str | Path, state: TaskState, command: list[str]) -> TaskState:
+    """Persist enough restart context to resume without replaying an old prompt."""
+    metadata = dict(state.pr)
+    metadata["lastRestart"] = {
+        "timestamp": now_iso(),
+        "sessionId": state.session_id,
+        "command": list(command),
+    }
+    updated = replace(state, pr=metadata)
+    updated.save(state_path)
+    return updated
+
+
+def write_final_report(
+    path: str | Path,
+    state: TaskState,
+    evidence: dict[str, Any],
+    report: FinalVerificationReport,
+) -> None:
+    """Write an auditable final report with policy and continuation history."""
+    payload = {
+        "generated_at": now_iso(),
+        "ok": report.ok,
+        "checks": report.checks,
+        "failures": list(report.failures),
+        "evidence": evidence,
+        "attempts": list(state.attempts),
+        "ci_events": list(state.ci_events),
+        "policy_decisions": list(state.policy_decisions),
+        "prohibitions": list(state.prohibitions),
+        "npm_publish_allowed": state.npm_publish_allowed,
+        "npm_publication_prohibited": not state.npm_publish_allowed,
+    }
+    _atomic_json_write(path, payload)
+
+
 def retry_infrastructure_checks(project_dir: str, pr: dict[str, Any]) -> list[int]:
     """Retry only workflow runs whose check outcome is infrastructure-like."""
     retried: list[int] = []
     for check in pr.get("statusCheckRollup") or pr.get("checks") or []:
-        conclusion = str(check.get("conclusion") or check.get("state") or "").lower()
-        if conclusion not in RETRYABLE_CHECK_CONCLUSIONS:
+        classification = classify_check_result(check)
+        if not classification["retryable"]:
             continue
         url = str(check.get("detailsUrl") or check.get("link") or "")
         match = re.search(r"/actions/runs/(\d+)", url)
@@ -992,6 +1306,10 @@ class MonitorConfig:
     required_outcome: str = "merged"
     npm_publish_allowed: bool = False
     session_id: str = ""
+    expected_branch: str = ""
+    protected_branches: tuple[str, ...] = ("main", "master")
+    report_path: str | None = None
+    attempt_history_limit: int = 100
 
 
 # ---------------------------------------------------------------------------
@@ -1517,6 +1835,8 @@ class GitStatus:
     open_prs_count: int = 0
     last_commit: str = ""
     summary: str = ""
+    head: str = ""
+    modified_files: tuple[str, ...] = ()
 
 
 GIT_STATUS_TTL_SECONDS = 30.0
@@ -1548,11 +1868,15 @@ def _get_git_status_uncached(repo_dir: str = ".") -> GitStatus:
         branch_code, branch_out, _ = run_command(["git", "branch", "--show-current"], cwd=repo_dir)
         branch = branch_out.strip() if branch_code == 0 else ""
 
+        head_code, head_out, _ = run_command(["git", "rev-parse", "HEAD"], cwd=repo_dir)
+        head = head_out.strip() if head_code == 0 else ""
+
         _status_code, status_out, _ = run_command(["git", "status", "--porcelain"], cwd=repo_dir)
         status_lines = [line for line in status_out.splitlines() if line.strip() and not line.strip().endswith(".DS_Store")]
         dirty = len(status_lines) > 0
         untracked = sum(1 for line in status_lines if line.startswith("??"))
         modified = len(status_lines) - untracked
+        modified_files = tuple(line[3:].strip() if len(line) > 3 else line.strip() for line in status_lines)
 
         log_code, log_out, _ = run_command(["git", "log", "-n", "1", "--oneline"], cwd=repo_dir)
         last_commit = log_out.strip() if log_code == 0 else ""
@@ -1568,9 +1892,11 @@ def _get_git_status_uncached(repo_dir: str = ".") -> GitStatus:
         return GitStatus(
             is_repo=True,
             branch=branch,
+            head=head,
             dirty=dirty,
             modified_count=modified,
             untracked_count=untracked,
+            modified_files=modified_files,
             commits_ahead=0,
             open_prs_count=open_prs,
             last_commit=last_commit,
@@ -1801,6 +2127,10 @@ def generate_starter_config(format_type: str = "json") -> str:
                 "required_outcome": "merged",
                 "npm_publish_allowed": False,
                 "session_id": "",
+                "expected_branch": "",
+                "protected_branches": ["main", "master"],
+                "report_path": "",
+                "attempt_history_limit": 100,
                 "unsafe_phrases": list(UNSAFE_PHRASES),
                 "custom_profiles": {
                     "my-agent": {
@@ -1835,6 +2165,10 @@ task_id = "example-task"
 required_outcome = "merged"
 npm_publish_allowed = false
 session_id = ""
+expected_branch = ""
+protected_branches = ["main", "master"]
+report_path = ""
+attempt_history_limit = 100
 
 unsafe_phrases = ["bypass", "delete", "rm -rf", "reset --hard"]
 
@@ -1884,8 +2218,13 @@ class TerminalMonitor:
         self.stop_path = os.path.join(self.state_dir, "stop")
         self.status_json_path = config.status_json_path or os.path.join(self.state_dir, "status.json")
         self.task_state_path = os.path.join(self.state_dir, "task-state.json")
+        self.report_path = config.report_path or os.path.join(self.state_dir, "final-report.json")
         stored_state = TaskState.load(self.task_state_path)
-        detected_branch = stored_state.branch or get_git_status(config.project_dir).branch
+        current_git_status = get_git_status(config.project_dir, ttl_seconds=0.0)
+        detected_branch = current_git_status.branch or stored_state.branch
+        expected_branch = config.expected_branch or stored_state.expected_branch
+        if config.supervise and not expected_branch:
+            expected_branch = detected_branch
         self.task_state = replace(
             stored_state,
             objective=config.objective or stored_state.objective,
@@ -1895,6 +2234,8 @@ class TerminalMonitor:
             npm_publish_allowed=config.npm_publish_allowed,
             session_id=config.session_id or stored_state.session_id,
             branch=detected_branch,
+            expected_branch=expected_branch,
+            report_path=self.report_path,
         )
         if config.supervise and not self.task_state.pr.get("safetyBaselineCaptured"):
             baseline = dict(self.task_state.pr)
@@ -1908,6 +2249,7 @@ class TerminalMonitor:
         self.policy = PolicyEnvelope(self.task_state.objective, self.task_state.prohibitions)
         self.pr_machine = PullRequestStateMachine()
         self.pr_machine.stage = self.task_state.last_known_stage
+        self.attempt_ledger = AttemptLedger(list(self.task_state.attempts), max_records=config.attempt_history_limit)
 
         # Internal state tracking
         self.last_digest = ""
@@ -1927,6 +2269,54 @@ class TerminalMonitor:
         self.on_complete: Callable[[str], None] | None = None
         self.on_tick: Callable[[str, int], None] | None = None
 
+    def _persist_attempt_state(self, *, attempt_id: str = "", prompt: str = "") -> None:
+        self.task_state = replace(
+            self.task_state,
+            attempts=tuple(self.attempt_ledger.records),
+            last_attempt_id=attempt_id or self.task_state.last_attempt_id,
+            last_prompt=prompt or self.task_state.last_prompt,
+        )
+        self.task_state.save(self.task_state_path)
+
+    def _queue_attempt(self, reason: str, payload: str, observed_state: str) -> str:
+        attempt_id = self.attempt_ledger.queue(reason, payload, observed_state=observed_state)
+        self._persist_attempt_state(attempt_id=attempt_id, prompt=payload)
+        return attempt_id
+
+    def _transition_attempt(self, attempt_id: str, status: str, *, detail: str = "", observed_state: str = "") -> None:
+        self.attempt_ledger.transition(attempt_id, status, detail=detail, observed_state=observed_state)
+        self._persist_attempt_state(attempt_id=attempt_id)
+
+    def _record_policy_decision(self, action: str, decision: str, reason: str) -> None:
+        decisions = [*self.task_state.policy_decisions, {"timestamp": now_iso(), "action": action, "decision": decision, "reason": reason}]
+        self.task_state = replace(self.task_state, policy_decisions=tuple(decisions[-self.config.attempt_history_limit :]))
+        self.task_state.save(self.task_state_path)
+
+    def _record_ci_events(self, classifications: list[dict[str, Any]]) -> None:
+        if not classifications:
+            return
+        events = [*self.task_state.ci_events]
+        for item in classifications:
+            fingerprint = f"{item.get('name')}:{item.get('category')}:{item.get('conclusion')}"
+            if not any(event.get("fingerprint") == fingerprint for event in events[-len(classifications) :]):
+                events.append({"timestamp": now_iso(), "fingerprint": fingerprint, **item})
+        self.task_state = replace(self.task_state, ci_events=tuple(events[-self.config.attempt_history_limit :]))
+        self.task_state.save(self.task_state_path)
+
+    def _complete_observed_attempt(self, history: str, observed_state: str) -> None:
+        """Close the latest accepted attempt only after new terminal output appears."""
+        attempt_id = self.task_state.last_attempt_id
+        if not attempt_id or self.attempt_ledger.latest(attempt_id or None) is None:
+            return
+        latest = self.attempt_ledger.latest(attempt_id)
+        if latest and latest.get("status") == "accepted" and self.session_tracker.current_segment(history).strip():
+            self._transition_attempt(
+                attempt_id,
+                "completed",
+                detail="post-send terminal output observed",
+                observed_state=observed_state,
+            )
+
     def _effective_threshold(self, state: str) -> float:
         """Idle seconds to wait before acting; actionable prompts act faster."""
         if self.config.idle_seconds == 0.0:
@@ -1940,7 +2330,7 @@ class TerminalMonitor:
         """Export live structured status for IDEs, dashboards, or subagents."""
         if not self.status_json_path:
             return
-        git_status = get_git_status(self.config.project_dir)
+        git_status = get_git_status(self.config.project_dir, ttl_seconds=0.0)
         data: dict[str, Any] = {
             "running": True,
             "pids": pids,
@@ -1952,9 +2342,11 @@ class TerminalMonitor:
             "stable_seconds": round(time.monotonic() - self.last_change, 1),
             "git": {
                 "branch": git_status.branch,
+                "head": git_status.head,
                 "dirty": git_status.dirty,
                 "modified": git_status.modified_count,
                 "untracked": git_status.untracked_count,
+                "modified_files": list(git_status.modified_files),
                 "open_prs": git_status.open_prs_count,
                 "last_commit": git_status.last_commit,
             },
@@ -1962,6 +2354,12 @@ class TerminalMonitor:
         }
         if extra:
             data.update(extra)
+        data["attempts"] = list(self.task_state.attempts[-self.config.attempt_history_limit :])
+        data["ci_events"] = list(self.task_state.ci_events[-self.config.attempt_history_limit :])
+        data["policy_decisions"] = list(self.task_state.policy_decisions[-self.config.attempt_history_limit :])
+        data["report_path"] = self.report_path
+        data["prohibitions"] = list(self.task_state.prohibitions)
+        data["npm_publish_allowed"] = self.task_state.npm_publish_allowed
         with contextlib.suppress(Exception):
             _atomic_json_write(self.status_json_path, data)
 
@@ -1981,6 +2379,7 @@ class TerminalMonitor:
         snapshot = normalize_snapshot(history)
         activity = self._process_activity(pids, bool(tab.get("busy")))
         state = classify_state(history, self.profile, activity=activity, session_tracker=self.session_tracker)
+        self._complete_observed_attempt(history, state)
         mode = self.profile.detect_mode(history)
         return {
             "ok": True,
@@ -2020,6 +2419,7 @@ class TerminalMonitor:
         digest = hashlib.sha256(snapshot.encode("utf-8", "replace")).hexdigest()[:16]
         activity = self._process_activity(pids, bool(tab.get("busy")))
         state = classify_state(history, self.profile, activity=activity, session_tracker=self.session_tracker)
+        self._complete_observed_attempt(history, state)
         mode = self.profile.detect_mode(history)
 
         if mode != self.current_mode:
@@ -2036,13 +2436,19 @@ class TerminalMonitor:
             reference = str(self.task_state.pr.get("number") or self.task_state.branch or "")
             pr_snapshot = get_current_pr_snapshot(self.config.project_dir, reference)
             if pr_snapshot:
+                classifications = [classify_check_result(check) for check in pr_snapshot.get("statusCheckRollup") or []]
+                self._record_ci_events(classifications)
                 stage = self.pr_machine.advance({
                     "number": pr_snapshot.get("number"),
                     "state": pr_snapshot.get("state"),
                     "checks": pr_snapshot.get("statusCheckRollup") or [],
                 })
                 metadata = dict(self.task_state.pr)
-                metadata.update({"number": pr_snapshot.get("number"), "head": pr_snapshot.get("headRefOid")})
+                metadata.update({
+                    "number": pr_snapshot.get("number"),
+                    "head": pr_snapshot.get("headRefOid"),
+                    "checkClassifications": classifications,
+                })
                 if stage == "CI_RETRY_REQUIRED":
                     retried = retry_infrastructure_checks(self.config.project_dir, pr_snapshot)
                     if retried:
@@ -2051,6 +2457,25 @@ class TerminalMonitor:
                 self.task_state = replace(self.task_state, last_known_stage=stage, pr=metadata)
                 self.task_state.save(self.task_state_path)
 
+        git_status = get_git_status(self.config.project_dir)
+        repository_safety = evaluate_repository_safety(
+            git_status,
+            expected_branch=self.task_state.expected_branch,
+            protected_branches=self.config.protected_branches,
+        )
+        if self.config.supervise and not repository_safety["safe"]:
+            reason = str(repository_safety["reason"])
+            self._record_policy_decision(
+                f"branch={repository_safety.get('branch', '')}",
+                "attention",
+                reason,
+            )
+            with open(self.attention_path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(repository_safety, indent=2) + "\n" + snapshot + "\n")
+            self.log(f"PAUSE kind=repository_safety reason={reason}")
+            self.export_status_json(pids, "branch_safety", {"repository_safety": repository_safety})
+            return 3, f"ATTENTION_REQUIRED kind=repository_safety reason={reason} file={self.attention_path}"
+
         self.export_status_json(pids, state, {
             "activity": {
                 "active": activity.active,
@@ -2058,13 +2483,16 @@ class TerminalMonitor:
                 "commands": list(activity.commands),
                 "cpu_percent": activity.cpu_percent,
                 "oldest_seconds": activity.oldest_seconds,
+                "git_changed": activity.git_changed,
             },
             "task": {
                 "task_id": self.task_state.task_id,
                 "stage": self.task_state.last_known_stage,
                 "session_generation": self.session_tracker.generation,
+                "pr": self.task_state.pr,
                 "npm_publish_allowed": self.task_state.npm_publish_allowed,
             },
+            "repository_safety": repository_safety,
         })
 
         if self.config.once:
@@ -2080,9 +2508,25 @@ class TerminalMonitor:
         # outranks inferred UI state, spinner text, thresholds, and cooldowns.
         manual_answer = consume_manual_answer(self.answer_path)
         if manual_answer:
+            allowed, policy_reason = self.policy.authorize_action(
+                manual_answer,
+                unsafe_phrases=tuple(dict.fromkeys([*UNSAFE_PHRASES, *self.config.unsafe_phrases])),
+                npm_publish_allowed=self.task_state.npm_publish_allowed,
+            )
+            if not allowed:
+                self._record_policy_decision(manual_answer, "blocked", policy_reason)
+                with open(self.attention_path, "w", encoding="utf-8") as handle:
+                    handle.write(snapshot + "\n")
+                self.log(f"PAUSE kind=policy_conflict reason={policy_reason}")
+                return 3, f"ATTENTION_REQUIRED kind=policy_conflict file={self.attention_path}"
+            attempt_id = self._queue_attempt("manual", manual_answer, state)
             if self.config.dry_run:
+                self._transition_attempt(attempt_id, "ignored", detail="dry_run", observed_state=state)
                 return 0, f"DRY_RUN kind=manual payload={manual_answer}"
             ok, detail = self.backend.send(self.config.process, self.config.title, manual_answer)
+            self._transition_attempt(attempt_id, "sent", detail=detail, observed_state=state)
+            self._transition_attempt(attempt_id, "accepted" if ok else "ignored", detail=detail, observed_state=state)
+            self.export_status_json(pids, state, {"last_attempt_id": attempt_id})
             self.sends += 1
             self.last_send = time.monotonic()
             self.last_change = time.monotonic()
@@ -2111,12 +2555,21 @@ class TerminalMonitor:
                         return None, "WAITING_FINAL_VERIFICATION"
                     instruction = "Resolve the remaining final-verification checks: " + ", ".join(report.failures)
                     payload = self.policy.compose(instruction, "POST_MERGE_VERIFY")
+                    attempt_id = self._queue_attempt("final_verification", payload, state)
+                    if self.config.dry_run:
+                        self._transition_attempt(attempt_id, "ignored", detail="dry_run", observed_state=state)
+                        return 0, "DRY_RUN kind=final_verification"
                     ok, detail = self.backend.send(self.config.process, self.config.title, payload)
+                    self._transition_attempt(attempt_id, "sent", detail=detail, observed_state=state)
+                    self._transition_attempt(attempt_id, "accepted" if ok else "ignored", detail=detail, observed_state=state)
                     self.last_send = time.monotonic()
                     self.sends += 1
                     self.log(f"SEND kind=final_verification n={self.sends} ok={ok} detail={detail}")
                     return (None, "SENT kind=final_verification") if ok else (1, "SEND_FAILED kind=final_verification")
             self.log("SUCCESS: Completion indicators detected. Work complete.")
+            if self.config.supervise:
+                evidence = collect_final_evidence(self.config.project_dir, self.task_state)
+                write_final_report(self.report_path, self.task_state, evidence, FinalVerificationReport(True, {"completion_detected": True}, ()))
             if self.on_complete:
                 self.on_complete(snapshot)
             self.export_status_json(pids, "completed", {"done": True})
@@ -2136,7 +2589,14 @@ class TerminalMonitor:
         # Handle Plan Mode Auto-Transition
         if self.config.auto_switch_modes and mode == "plan" and self.profile.is_plan_ready(history) and stable_for >= mode_threshold:
             self.log("MODE: Plan completed. Auto-switching mode via switch key.")
+            attempt_id = self._queue_attempt("mode_switch", self.profile.mode_switch_key, state)
+            if self.config.dry_run:
+                self._transition_attempt(attempt_id, "ignored", detail="dry_run", observed_state=state)
+                self._record_policy_decision("mode_switch", "ignored", "dry_run")
+                return 0, "DRY_RUN kind=mode_switch"
             ok, detail = self.backend.send_key(self.config.process, self.config.title, self.profile.mode_switch_key)
+            self._transition_attempt(attempt_id, "sent", detail=detail, observed_state=state)
+            self._transition_attempt(attempt_id, "accepted" if ok else "ignored", detail=detail, observed_state=state)
             self.last_send = time.monotonic()
             self.last_change = time.monotonic()
             if self.config.continue_text:
@@ -2161,7 +2621,8 @@ class TerminalMonitor:
         if payload and (self.policy.objective or self.policy.prohibitions):
             try:
                 payload = self.policy.compose(payload, self.task_state.last_known_stage)
-            except ValueError:
+            except ValueError as exc:
+                self._record_policy_decision(payload, "blocked", str(exc))
                 payload = None
                 reason = "policy_conflict"
 
@@ -2173,10 +2634,28 @@ class TerminalMonitor:
             self.log(f"PAUSE kind={reason} hash={digest}")
             return 3, f"ATTENTION_REQUIRED kind={reason} file={self.attention_path}"
 
+        allowed, policy_reason = self.policy.authorize_action(
+            payload,
+            unsafe_phrases=tuple(dict.fromkeys([*UNSAFE_PHRASES, *self.config.unsafe_phrases])),
+            npm_publish_allowed=self.task_state.npm_publish_allowed,
+        )
+        if not allowed:
+            self._record_policy_decision(payload, "blocked", policy_reason)
+            with open(self.attention_path, "w", encoding="utf-8") as handle:
+                handle.write(snapshot + "\n")
+            self.log(f"PAUSE kind=policy_conflict reason={policy_reason}")
+            return 3, f"ATTENTION_REQUIRED kind=policy_conflict file={self.attention_path}"
+
+        attempt_id = self._queue_attempt(reason, payload, state)
+
         if self.config.dry_run:
+            self._transition_attempt(attempt_id, "ignored", detail="dry_run", observed_state=state)
             return 0, f"DRY_RUN kind={reason} payload={payload or '<enter>'}"
 
         ok, detail = self.backend.send(self.config.process, self.config.title, payload)
+        self._transition_attempt(attempt_id, "sent", detail=detail, observed_state=state)
+        self._transition_attempt(attempt_id, "accepted" if ok else "ignored", detail=detail, observed_state=state)
+        self.export_status_json(pids, state, {"last_attempt_id": attempt_id})
         self.sends += 1
         self.last_send = time.monotonic()
         self.log(f"SEND kind={reason} n={self.sends} ok={ok} detail={detail}")
@@ -2264,6 +2743,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="terminal_monitor",
         description="Monitor and safely nudge AI CLI coding agents running in Terminal.app, iTerm2, or tmux.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
     )
 
     # Subcommands
@@ -2293,6 +2773,11 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser = subparsers.add_parser("verify-final-state", help="Verify PR, branch, CI, release, and npm safety invariants")
     verify_parser.add_argument("--pr", type=int, help="Pull Request number (defaults to saved state/current branch)")
     _add_monitor_args(verify_parser)
+
+    merge_parser = subparsers.add_parser("merge-pr", help="Merge a PR only after the exact-head green-check gate")
+    merge_parser.add_argument("--pr", type=int, required=True, help="Pull Request number")
+    merge_parser.add_argument("--head", required=False, help="Expected full 40-character PR head SHA (defaults to saved state)")
+    _add_monitor_args(merge_parser)
 
     # supervise subcommand
     supervise_parser = subparsers.add_parser("supervise", help="Run autonomous supervision daemon")
@@ -2334,6 +2819,10 @@ def _add_monitor_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--required-outcome", default=None, help="Required final outcome (default: merged)")
     parser.add_argument("--allow-npm-publish", action="store_true", default=None, help="Explicitly allow npm publication (default: prohibited)")
     parser.add_argument("--session-id", default=None, help="Agent session identifier for robust selection/restart")
+    parser.add_argument("--expected-branch", default=None, help="Pause supervision if the repository branch differs")
+    parser.add_argument("--protected-branch", action="append", dest="protected_branches", help="Branch that must never be dirty during supervision")
+    parser.add_argument("--report-path", default=None, help="Path for the structured final report JSON")
+    parser.add_argument("--attempt-history-limit", type=int, default=None, help="Maximum persisted attempt/decision records")
     parser.add_argument("--once", action="store_true", default=False, help="Inspect status once and exit")
     parser.add_argument("--dry-run", action="store_true", default=False, help="Simulate actions without sending keystrokes")
 
@@ -2348,10 +2837,6 @@ def config_from_args(args: argparse.Namespace) -> MonitorConfig:
         discovered = discover_config_file(project_dir)
         if discovered:
             file_cfg = load_config_file(discovered)
-
-    cli_unsafe = getattr(args, "unsafe_phrases", None) or []
-    file_unsafe = file_cfg.get("unsafe_phrases", list(UNSAFE_PHRASES))
-    merged_unsafe = list(dict.fromkeys(list(file_unsafe) + list(cli_unsafe)))
 
     continue_text = args.continue_text if getattr(args, "continue_text", None) is not None else file_cfg.get("continue_text", "")
     if getattr(args, "continue_file", None):
@@ -2372,6 +2857,22 @@ def config_from_args(args: argparse.Namespace) -> MonitorConfig:
         if arg_val is not None:
             return arg_val
         return file_cfg.get(cfg_key, default_val)
+
+    def _string_values(value: Any, default: list[str] | tuple[str, ...] = ()) -> list[str]:
+        if value is None:
+            return list(default)
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, (list, tuple, set)):
+            return [str(item) for item in value]
+        return list(default)
+
+    cli_unsafe = getattr(args, "unsafe_phrases", None) or []
+    file_unsafe = _string_values(file_cfg.get("unsafe_phrases", list(UNSAFE_PHRASES)), UNSAFE_PHRASES)
+    merged_unsafe = list(dict.fromkeys([*file_unsafe, *cli_unsafe]))
+    cli_prohibitions = getattr(args, "prohibitions", None) or []
+    file_prohibitions = _string_values(file_cfg.get("prohibitions", []))
+    merged_prohibitions = list(dict.fromkeys([*file_prohibitions, *cli_prohibitions]))
 
     return MonitorConfig(
         process=process,
@@ -2398,11 +2899,15 @@ def config_from_args(args: argparse.Namespace) -> MonitorConfig:
         completion_check=completion_check,
         status_json_path=getattr(args, "status_json_path", None) or file_cfg.get("status_json_path"),
         objective=str(_val(getattr(args, "objective", None), "objective", "")),
-        prohibitions=list(_val(getattr(args, "prohibitions", None), "prohibitions", [])),
+        prohibitions=merged_prohibitions,
         task_id=str(_val(getattr(args, "task_id", None), "task_id", "")),
         required_outcome=str(_val(getattr(args, "required_outcome", None), "required_outcome", "merged")),
         npm_publish_allowed=bool(_val(getattr(args, "allow_npm_publish", None), "npm_publish_allowed", False)),
         session_id=str(_val(getattr(args, "session_id", None), "session_id", "")),
+        expected_branch=str(_val(getattr(args, "expected_branch", None), "expected_branch", "")),
+        protected_branches=tuple(_string_values(_val(getattr(args, "protected_branches", None), "protected_branches", ["main", "master"]))),
+        report_path=str(_val(getattr(args, "report_path", None), "report_path", "")) or None,
+        attempt_history_limit=max(1, int(_val(getattr(args, "attempt_history_limit", None), "attempt_history_limit", 100))),
     )
 
 
@@ -2430,6 +2935,18 @@ def main() -> int:
     config = config_from_args(args)
 
     if args.command == "send":
+        policy = PolicyEnvelope(config.objective, tuple(config.prohibitions))
+        allowed, reason = policy.authorize_action(
+            args.text,
+            unsafe_phrases=config.unsafe_phrases,
+            npm_publish_allowed=config.npm_publish_allowed,
+        )
+        if not allowed:
+            print(f"POLICY_BLOCKED: {reason}", file=sys.stderr)
+            return 3
+        if config.dry_run:
+            print(json.dumps({"dry_run": True, "action": "send", "payload": args.text, "policy": reason}, indent=2))
+            return 0
         backend = get_backend(config.backend)
         ok, detail = backend.send(config.process, config.title, args.text)
         print(detail)
@@ -2449,15 +2966,31 @@ def main() -> int:
         except StateFileError as exc:
             print(str(exc), file=sys.stderr)
             return 2
+        if config.dry_run:
+            print(json.dumps({"dry_run": True, "action": "restart-agent", "command": command}, indent=2))
+            return 0
+        state = persist_restart_event(Path(config.state_dir, "task-state.json"), state, command)
         process = subprocess.Popen(command, cwd=config.project_dir, start_new_session=True)
         print(f"RESTARTED pid={process.pid}")
         return 0
+
+    if args.command == "merge-pr":
+        state = TaskState.load(Path(config.state_dir, "task-state.json"))
+        expected_head = args.head or str(state.pr.get("head", ""))
+        if not expected_head:
+            print("An expected full PR head SHA is required (--head or saved state).", file=sys.stderr)
+            return 2
+        result = merge_pull_request(config.project_dir, args.pr, expected_head, dry_run=config.dry_run)
+        print(json.dumps(result, indent=2))
+        return 0 if result.get("ok") else 4
 
     if args.command == "verify-final-state":
         state = TaskState.load(Path(config.state_dir, "task-state.json"))
         evidence = collect_final_evidence(config.project_dir, state, args.pr)
         report = evaluate_final_state(evidence)
-        print(json.dumps({"ok": report.ok, "checks": report.checks, "failures": report.failures, "evidence": evidence}, indent=2))
+        report_path = config.report_path or str(Path(config.state_dir, "final-report.json"))
+        write_final_report(report_path, state, evidence, report)
+        print(json.dumps({"ok": report.ok, "checks": report.checks, "failures": report.failures, "evidence": evidence, "report_path": report_path}, indent=2))
         return 0 if report.ok else 4
 
     monitor = TerminalMonitor(config)

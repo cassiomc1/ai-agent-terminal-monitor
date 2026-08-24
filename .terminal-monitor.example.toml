@@ -19,6 +19,10 @@ task_id = "example-task"
 required_outcome = "merged"
 npm_publish_allowed = false
 session_id = ""
+expected_branch = ""
+protected_branches = ["main", "master"]
+report_path = "/tmp/terminal-monitor/final-report.json"
+attempt_history_limit = 100
 
 unsafe_phrases = [
   "bypass",
