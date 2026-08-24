@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -93,6 +94,474 @@ SPECIAL_KEY_CODES: dict[str, int] = {
 }
 
 
+class StateFileError(RuntimeError):
+    """Raised when persistent supervisor state cannot be trusted."""
+
+
+def _atomic_json_write(path: str | Path, data: dict[str, Any]) -> None:
+    target = Path(path).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, target)
+
+
+@dataclass(frozen=True)
+class TaskState:
+    """Durable task identity, policy, stage, and PR metadata."""
+
+    objective: str = ""
+    prohibitions: tuple[str, ...] = ()
+    plan: tuple[str, ...] = ()
+    branch: str = ""
+    task_id: str = ""
+    required_outcome: str = "merged"
+    npm_publish_allowed: bool = False
+    last_known_stage: str = "TASK_RECEIVED"
+    pr: dict[str, Any] = field(default_factory=dict)
+    session_generation: int = 0
+    session_id: str = ""
+    interaction_marker: str = ""
+
+    def save(self, path: str | Path) -> None:
+        data = {
+            "objective": self.objective,
+            "prohibitions": list(self.prohibitions),
+            "plan": list(self.plan),
+            "branch": self.branch,
+            "taskId": self.task_id,
+            "requiredOutcome": self.required_outcome,
+            "npmPublishAllowed": self.npm_publish_allowed,
+            "lastKnownStage": self.last_known_stage,
+            "pr": self.pr,
+            "sessionGeneration": self.session_generation,
+            "sessionId": self.session_id,
+            "interactionMarker": self.interaction_marker,
+        }
+        _atomic_json_write(path, data)
+
+    @classmethod
+    def load(cls, path: str | Path) -> TaskState:
+        target = Path(path)
+        if not target.exists():
+            return cls()
+        try:
+            data = json.loads(target.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise TypeError("state root must be an object")
+            return cls(
+                objective=str(data.get("objective", "")),
+                prohibitions=tuple(str(item) for item in data.get("prohibitions", [])),
+                plan=tuple(str(item) for item in data.get("plan", [])),
+                branch=str(data.get("branch", "")),
+                task_id=str(data.get("taskId", "")),
+                required_outcome=str(data.get("requiredOutcome", "merged")),
+                npm_publish_allowed=bool(data.get("npmPublishAllowed", False)),
+                last_known_stage=str(data.get("lastKnownStage", "TASK_RECEIVED")),
+                pr=dict(data.get("pr", {})),
+                session_generation=int(data.get("sessionGeneration", 0)),
+                session_id=str(data.get("sessionId", "")),
+                interaction_marker=str(data.get("interactionMarker", "")),
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise StateFileError(f"Untrusted task state at {target}: {exc}") from exc
+
+
+@dataclass(frozen=True)
+class ProcessActivity:
+    """Observed work below the root agent process."""
+
+    active: bool = False
+    descendants: tuple[int, ...] = ()
+    commands: tuple[str, ...] = ()
+    cpu_percent: float = 0.0
+    oldest_seconds: float = 0.0
+    git_changed: bool = False
+
+
+@dataclass
+class SessionTracker:
+    """Separates stale terminal history from output after the latest instruction."""
+
+    interaction_history: str = ""
+    generation: int = 0
+
+    def mark_interaction(self, history: str) -> None:
+        self.interaction_history = normalize_snapshot(history)
+        self.generation += 1
+
+    def current_segment(self, history: str) -> str:
+        if not self.interaction_history:
+            return history
+        normalized = normalize_snapshot(history)
+        if normalized == self.interaction_history:
+            return ""
+        position = normalized.rfind(self.interaction_history) if self.interaction_history else -1
+        return normalized[position + len(self.interaction_history):].lstrip("\r\n") if position >= 0 else normalized
+
+    def matches_current_completion(self, history: str, patterns: list[str] | tuple[str, ...]) -> bool:
+        segment = self.current_segment(history)
+        return bool(segment) and any(match_pattern(pattern, segment) for pattern in patterns)
+
+
+@dataclass(frozen=True)
+class PolicyEnvelope:
+    """Permanent task policy wrapped around every dynamic instruction."""
+
+    objective: str = ""
+    prohibitions: tuple[str, ...] = ()
+
+    def compose(self, dynamic: str, stage: str = "") -> str:
+        low = dynamic.lower()
+        npm_blocked = any("npm" in item.lower() and ("not" in item.lower() or "não" in item.lower()) for item in self.prohibitions)
+        if npm_blocked and re.search(r"\b(publish|publique|publicar|publique)\b.{0,30}\bnpm\b|\bnpm\s+publish\b", low):
+            raise ValueError("dynamic instruction conflicts with permanent npm prohibition")
+        parts = []
+        if self.objective:
+            parts.append(f"Objective: {self.objective}")
+        if self.prohibitions:
+            parts.append("Permanent prohibitions: " + " ".join(self.prohibitions))
+        if stage:
+            parts.append(f"Current stage: {stage}")
+        if dynamic:
+            parts.append(f"Next action: {dynamic}")
+        return "\n".join(parts)
+
+
+@dataclass(frozen=True)
+class TerminalIdentity:
+    """Hints used to choose the correct terminal among similar agent tabs."""
+
+    project_path: str = ""
+    branch: str = ""
+    session_id: str = ""
+    title: str = ""
+    root_pid: int | None = None
+
+    def score(self, candidate: dict[str, Any]) -> int:
+        text = " ".join(str(candidate.get(key, "")) for key in ("history", "hist", "title", "wname"))
+        score = 0
+        if self.project_path and self.project_path in text:
+            score += 8
+        if self.session_id and self.session_id in text:
+            score += 7
+        if self.branch and self.branch in text:
+            score += 5
+        if self.title and self.title.lower() in str(candidate.get("title", "")).lower():
+            score += 3
+        if self.root_pid is not None and int(candidate.get("root_pid", -1)) == self.root_pid:
+            score += 10
+        return score
+
+
+def interrupt_child(
+    root_pids: set[int],
+    child_pid: int,
+    *,
+    parent_of: Callable[[int], int | None],
+    signaler: Callable[[int, int], Any] = os.kill,
+) -> bool:
+    """Interrupt a verified descendant while protecting every root agent PID."""
+    if child_pid in root_pids or child_pid <= 1:
+        return False
+    seen: set[int] = set()
+    current = child_pid
+    while current not in seen and current > 1:
+        seen.add(current)
+        parent = parent_of(current)
+        if parent is None:
+            return False
+        if parent in root_pids:
+            signaler(child_pid, signal.SIGINT)
+            return True
+        current = parent
+    return False
+
+
+def _elapsed_seconds(value: str) -> float:
+    """Convert ps elapsed form ([[dd-]hh:]mm:)ss into seconds."""
+    try:
+        day_split = value.strip().split("-", 1)
+        days = int(day_split[0]) if len(day_split) == 2 else 0
+        clock = day_split[-1].split(":")
+        numbers = [int(part) for part in clock]
+        while len(numbers) < 3:
+            numbers.insert(0, 0)
+        hours, minutes, seconds = numbers[-3:]
+        return float(days * 86400 + hours * 3600 + minutes * 60 + seconds)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def collect_process_activity(root_pids: list[int]) -> ProcessActivity:
+    """Inspect descendants so long-running commands count as useful activity."""
+    if not root_pids:
+        return ProcessActivity()
+    code, output, _ = run_command(["ps", "-axo", "pid=,ppid=,etime=,%cpu=,command="])
+    if code != 0:
+        return ProcessActivity()
+    rows: dict[int, tuple[int, str, float, str]] = {}
+    for line in output.splitlines():
+        parts = line.strip().split(None, 4)
+        if len(parts) != 5 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        with contextlib.suppress(ValueError):
+            rows[int(parts[0])] = (int(parts[1]), parts[2], float(parts[3]), parts[4])
+    roots = set(root_pids)
+    descendants: list[int] = []
+    pending = set(roots)
+    while pending:
+        parent = pending.pop()
+        children = [pid for pid, row in rows.items() if row[0] == parent and pid not in descendants]
+        descendants.extend(children)
+        pending.update(children)
+    commands = tuple(rows[pid][3] for pid in descendants if pid in rows)
+    cpu = sum(rows[pid][2] for pid in descendants if pid in rows)
+    oldest = max((_elapsed_seconds(rows[pid][1]) for pid in descendants if pid in rows), default=0.0)
+    meaningful = any(
+        re.search(r"\b(pytest|unittest|npm\s+(?:test|run)|pnpm|yarn|cargo|go\s+test|git|gh|make|cmake|docker)\b", command, re.IGNORECASE)
+        for command in commands
+    )
+    recently_started = any(_elapsed_seconds(rows[pid][1]) <= 5.0 for pid in descendants if pid in rows)
+    active = bool(descendants) and (cpu >= 0.1 or meaningful or recently_started)
+    return ProcessActivity(active=active, descendants=tuple(descendants), commands=commands, cpu_percent=cpu, oldest_seconds=oldest)
+
+
+RETRYABLE_CHECK_CONCLUSIONS = {"cancelled", "timed_out", "stale", "startup_failure", "action_required", "network_failure", "infrastructure_failure"}
+CODE_FAILURE_CONCLUSIONS = {"failure"}
+
+
+class PullRequestStateMachine:
+    """Map GitHub PR/check snapshots to an actionable supervision stage."""
+
+    stage = "TASK_RECEIVED"
+    seen_pr_number: int | None = None
+
+    def advance(self, pr: dict[str, Any] | None) -> str:
+        if not pr or not pr.get("number"):
+            self.stage = "TASK_RECEIVED"
+            return self.stage
+        number = int(pr["number"])
+        if self.seen_pr_number != number and self.stage == "TASK_RECEIVED":
+            self.seen_pr_number = number
+            self.stage = "PR_CREATED"
+            return self.stage
+        self.seen_pr_number = number
+        checks = list(pr.get("checks") or [])
+        conclusions = {str(check.get("conclusion") or check.get("state") or "").lower() for check in checks}
+        if str(pr.get("state", "")).upper() == "MERGED":
+            self.stage = "POST_MERGE_VERIFY"
+        elif conclusions & CODE_FAILURE_CONCLUSIONS:
+            self.stage = "FIX_REQUIRED"
+        elif conclusions & RETRYABLE_CHECK_CONCLUSIONS:
+            self.stage = "CI_RETRY_REQUIRED"
+        elif checks and conclusions <= {"success", "neutral", "skipped"}:
+            self.stage = "CI_GREEN"
+        else:
+            self.stage = "CI_PENDING"
+        return self.stage
+
+
+@dataclass(frozen=True)
+class FinalVerificationReport:
+    ok: bool
+    checks: dict[str, bool]
+    failures: tuple[str, ...]
+
+
+def evaluate_final_state(evidence: dict[str, Any]) -> FinalVerificationReport:
+    """Evaluate post-merge evidence without weakening any required invariant."""
+    checks = {
+        "pr_merged": bool(evidence.get("pr_merged")),
+        "checks_exact_head": bool(evidence.get("checks_green")) and bool(evidence.get("pr_head")) and evidence.get("pr_head") == evidence.get("checked_head"),
+        "heads_synchronized": bool(evidence.get("local_head")) and evidence.get("local_head") == evidence.get("main_head") == evidence.get("origin_main_head"),
+        "worktree_clean": bool(evidence.get("worktree_clean")),
+        "npm_registry_unchanged": bool(evidence.get("npm_registry_unchanged")),
+        "no_new_tag_or_release": bool(evidence.get("no_new_tag_or_release")),
+        "no_publish_process": bool(evidence.get("no_publish_process")),
+    }
+    failures = tuple(name for name, passed in checks.items() if not passed)
+    return FinalVerificationReport(ok=not failures, checks=checks, failures=failures)
+
+
+def _command_value(command: list[str], cwd: str) -> str:
+    code, output, _ = run_command(command, cwd=cwd)
+    return output.strip() if code == 0 else ""
+
+
+def git_activity_fingerprint(project_dir: str) -> str:
+    """Cheap local-only fingerprint; deliberately avoids GitHub/network calls."""
+    head = _command_value(["git", "rev-parse", "HEAD"], project_dir)
+    status = _command_value(["git", "status", "--porcelain"], project_dir)
+    return hashlib.sha256(f"{head}\n{status}".encode("utf-8", "replace")).hexdigest()
+
+
+def collect_final_evidence(project_dir: str, state: TaskState, pr_number: int | None = None) -> dict[str, Any]:
+    """Collect live evidence used by `verify-final-state`."""
+    local_head = _command_value(["git", "rev-parse", "HEAD"], project_dir)
+    main_head = _command_value(["git", "rev-parse", "main"], project_dir)
+    origin_main_head = _command_value(["git", "rev-parse", "origin/main"], project_dir)
+    status = _command_value(["git", "status", "--porcelain"], project_dir)
+    pr_ref = str(pr_number or state.pr.get("number") or state.branch or "")
+    pr_data: dict[str, Any] = {}
+    if pr_ref and shutil.which("gh"):
+        code, output, _ = run_command(
+            ["gh", "pr", "view", pr_ref, "--json", "state,headRefOid,statusCheckRollup"],
+            cwd=project_dir,
+        )
+        if code == 0:
+            with contextlib.suppress(json.JSONDecodeError, TypeError):
+                pr_data = json.loads(output)
+    rollup = list(pr_data.get("statusCheckRollup") or [])
+    conclusions = [str(item.get("conclusion") or item.get("state") or "").lower() for item in rollup]
+    checks_green = bool(rollup) and all(item in {"success", "neutral", "skipped"} for item in conclusions)
+    head = str(pr_data.get("headRefOid") or state.pr.get("head") or "")
+    tags_before = set(state.pr.get("tagsBefore") or [])
+    releases_before = set(state.pr.get("releasesBefore") or [])
+    tags_now = set(filter(None, _command_value(["git", "tag", "--list"], project_dir).splitlines()))
+    releases_now: set[str] = set()
+    if shutil.which("gh"):
+        code, output, _ = run_command(["gh", "release", "list", "--limit", "100", "--json", "tagName"], cwd=project_dir)
+        if code == 0:
+            with contextlib.suppress(json.JSONDecodeError, TypeError):
+                releases_now = {str(item["tagName"]) for item in json.loads(output)}
+    publish_code, publish_output, _ = run_command(["pgrep", "-af", "(?:npm|pnpm|yarn).*publish"])
+    package_json = Path(project_dir, "package.json")
+    npm_unchanged = True
+    expected_npm = state.pr.get("npmVersionBefore")
+    if package_json.is_file() and expected_npm is not None:
+        with contextlib.suppress(OSError, json.JSONDecodeError, KeyError):
+            package_name = json.loads(package_json.read_text(encoding="utf-8"))["name"]
+            current_npm = _command_value(["npm", "view", str(package_name), "version"], project_dir)
+            npm_unchanged = current_npm == str(expected_npm)
+    baseline_known = bool(state.pr.get("safetyBaselineCaptured"))
+    return {
+        "pr_merged": str(pr_data.get("state", "")).upper() == "MERGED",
+        "pr_head": head,
+        "checked_head": head if rollup else "",
+        "checks_green": checks_green,
+        "local_head": local_head,
+        "main_head": main_head,
+        "origin_main_head": origin_main_head,
+        "worktree_clean": not status,
+        "npm_registry_unchanged": npm_unchanged,
+        "no_new_tag_or_release": baseline_known and tags_now == tags_before and releases_now == releases_before,
+        "no_publish_process": publish_code != 0 or not publish_output,
+    }
+
+
+def capture_safety_baseline(project_dir: str) -> dict[str, Any]:
+    """Capture tag, release, and npm state before autonomous work advances."""
+    tags = list(filter(None, _command_value(["git", "tag", "--list"], project_dir).splitlines()))
+    releases: list[str] = []
+    if shutil.which("gh"):
+        code, output, _ = run_command(["gh", "release", "list", "--limit", "100", "--json", "tagName"], cwd=project_dir)
+        if code == 0:
+            with contextlib.suppress(json.JSONDecodeError, TypeError):
+                releases = [str(item["tagName"]) for item in json.loads(output)]
+    baseline: dict[str, Any] = {
+        "safetyBaselineCaptured": True,
+        "tagsBefore": tags,
+        "releasesBefore": releases,
+    }
+    package_json = Path(project_dir, "package.json")
+    if package_json.is_file() and shutil.which("npm"):
+        with contextlib.suppress(OSError, json.JSONDecodeError, KeyError):
+            package = json.loads(package_json.read_text(encoding="utf-8"))
+            if not package.get("private"):
+                version = _command_value(["npm", "view", str(package["name"]), "version"], project_dir)
+                baseline["npmVersionBefore"] = version
+    return baseline
+
+
+def _parent_pid(pid: int) -> int | None:
+    value = _command_value(["ps", "-o", "ppid=", "-p", str(pid)], ".")
+    return int(value) if value.isdigit() else None
+
+
+def build_restart_command(config: MonitorConfig, state: TaskState, explicit: list[str] | None, continue_session: bool) -> list[str]:
+    """Build a restart command without invoking a shell."""
+    command = list(explicit or [config.process])
+    if continue_session:
+        if not state.session_id:
+            raise StateFileError("No saved sessionId is available for continuation")
+        if config.profile == "opencode" or config.process == "opencode":
+            command.extend(["--session", state.session_id])
+        else:
+            command.extend(["--continue", state.session_id])
+    return command
+
+
+def get_current_pr_snapshot(project_dir: str, reference: str = "") -> dict[str, Any] | None:
+    """Return normalized PR/check data for the saved PR or current branch."""
+    if not shutil.which("gh"):
+        return None
+    command = ["gh", "pr", "view"]
+    if reference:
+        command.append(reference)
+    command.extend(["--json", "number,state,headRefOid,statusCheckRollup"])
+    code, output, _ = run_command(command, cwd=project_dir)
+    if code != 0:
+        return None
+    try:
+        data = json.loads(output)
+        return data if isinstance(data, dict) else None
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def retry_infrastructure_checks(project_dir: str, pr: dict[str, Any]) -> list[int]:
+    """Retry only workflow runs whose check outcome is infrastructure-like."""
+    retried: list[int] = []
+    for check in pr.get("statusCheckRollup") or pr.get("checks") or []:
+        conclusion = str(check.get("conclusion") or check.get("state") or "").lower()
+        if conclusion not in RETRYABLE_CHECK_CONCLUSIONS:
+            continue
+        url = str(check.get("detailsUrl") or check.get("link") or "")
+        match = re.search(r"/actions/runs/(\d+)", url)
+        if not match:
+            continue
+        run_id = int(match.group(1))
+        code, _, _ = run_command(["gh", "run", "rerun", str(run_id), "--failed"], cwd=project_dir)
+        if code == 0:
+            retried.append(run_id)
+    return retried
+
+
+def wait_for_change(
+    fingerprint: Callable[[], str],
+    initial: str,
+    *,
+    timeout_seconds: float,
+    interval_seconds: float = 1.0,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Wait until observable state changes, bounded by a portability timeout."""
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while time.monotonic() < deadline:
+        if fingerprint() != initial:
+            return True
+        sleeper(min(interval_seconds, max(0.0, deadline - time.monotonic())))
+    return False
+
+
+def wait_for_ci_event(project_dir: str, pr_number: int, *, timeout_seconds: float = 30.0) -> bool:
+    """Use GitHub's watch stream for CI changes instead of status polling."""
+    command = ["gh", "pr", "checks", str(pr_number), "--watch", "--interval", "5"]
+    try:
+        subprocess.run(
+            command,
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=max(1.0, timeout_seconds),
+        )
+        return True
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
 def match_pattern(pattern: str, text: str) -> bool:
     """Match a pattern against text safely, supporting regex or substring."""
     low_text = text.lower()
@@ -150,17 +619,18 @@ class AgentProfile:
         return any(match_pattern(pat, history_tail) for pat in self.permission_patterns)
 
     def matches_question(self, history_tail: str) -> bool:
-        if any(match_pattern(pat, history_tail) for pat in self.question_indicators):
-            return True
         options = self.extract_options(history_tail)
-        if len(options) >= 2:
-            prompt_cue = any(
-                re.search(pat, history_tail, re.IGNORECASE)
-                for pat in (r"\?", r"question", r"select", r"choose", r"option", r"recommended", r"⇆", r"\(1-", r"\[y/n\]", r"enter confirm")
+        if len(options) < 2:
+            return False
+        strong_prompt = any(match_pattern(pat, history_tail) for pat in self.question_indicators)
+        strong_prompt = strong_prompt or bool(
+            re.search(
+                r"(?:\?|\b(?:which|choose|select|pick|qual|escolha|selecione)\b|\[y/n\]|⇆\s*select)",
+                history_tail,
+                re.IGNORECASE,
             )
-            if prompt_cue:
-                return True
-        return False
+        )
+        return strong_prompt
 
     def matches_completion(self, history_tail: str) -> bool:
         if not self.completion_patterns:
@@ -516,6 +986,12 @@ class MonitorConfig:
     smart_nudges: bool = True
     completion_check: bool = True
     status_json_path: str | None = None
+    objective: str = ""
+    prohibitions: list[str] = field(default_factory=list)
+    task_id: str = ""
+    required_outcome: str = "merged"
+    npm_publish_allowed: bool = False
+    session_id: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +1118,25 @@ class BaseTerminalBackend:
 
     def get_tab(self, process: str, title: str | None = None) -> dict[str, str | bool]:
         raise NotImplementedError
+
+    def get_tab_for_identity(self, process: str, identity: TerminalIdentity) -> dict[str, str | bool]:
+        """Resolve a tab using progressively broader stable identity hints."""
+        hints = [
+            identity.title,
+            identity.session_id,
+            identity.branch,
+            Path(identity.project_path).name if identity.project_path else "",
+        ]
+        seen: set[str | None] = set()
+        for hint in [*hints, None]:
+            normalized = hint or None
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            tab = self.get_tab(process, normalized)
+            if tab.get("ok"):
+                return tab
+        return {"ok": False, "error": "matching terminal identity not found"}
 
     def send(self, process: str, title: str | None, payload: str) -> tuple[bool, str]:
         raise NotImplementedError
@@ -1124,7 +1619,13 @@ def normalize_snapshot(history: str) -> str:
     return "\n".join(lines[-30:])
 
 
-def classify_state(history: str, profile: AgentProfile | None = None) -> str:
+def classify_state(
+    history: str,
+    profile: AgentProfile | None = None,
+    *,
+    activity: ProcessActivity | None = None,
+    session_tracker: SessionTracker | None = None,
+) -> str:
     """Classify the current terminal state (permission, question, completed, thinking, idle).
 
     Actionable states (permission/question/completed) take precedence over
@@ -1136,9 +1637,14 @@ def classify_state(history: str, profile: AgentProfile | None = None) -> str:
 
     if prof.matches_permission(tail):
         return "permission"
+    if activity and activity.active:
+        return "thinking"
     if prof.matches_question(tail):
         return "question"
-    if prof.matches_completion(tail):
+    if session_tracker:
+        if session_tracker.matches_current_completion(history, prof.completion_patterns):
+            return "completed"
+    elif prof.matches_completion(tail):
         return "completed"
     if prof.matches_thinking(tail):
         return "thinking"
@@ -1289,6 +1795,12 @@ def generate_starter_config(format_type: str = "json") -> str:
                 "smart_nudges": True,
                 "auto_switch_modes": True,
                 "completion_check": True,
+                "objective": "Finish every task, create and merge the PR, then verify main.",
+                "prohibitions": ["Do not publish to npm."],
+                "task_id": "example-task",
+                "required_outcome": "merged",
+                "npm_publish_allowed": False,
+                "session_id": "",
                 "unsafe_phrases": list(UNSAFE_PHRASES),
                 "custom_profiles": {
                     "my-agent": {
@@ -1317,6 +1829,12 @@ supervise = true
 smart_nudges = true
 auto_switch_modes = true
 completion_check = true
+objective = "Finish every task, create and merge the PR, then verify main."
+prohibitions = ["Do not publish to npm."]
+task_id = "example-task"
+required_outcome = "merged"
+npm_publish_allowed = false
+session_id = ""
 
 unsafe_phrases = ["bypass", "delete", "rm -rf", "reset --hard"]
 
@@ -1364,7 +1882,32 @@ class TerminalMonitor:
         self.attention_path = os.path.join(self.state_dir, "attention.txt")
         self.answer_path = os.path.join(self.state_dir, "answer.txt")
         self.stop_path = os.path.join(self.state_dir, "stop")
-        self.status_json_path = config.status_json_path
+        self.status_json_path = config.status_json_path or os.path.join(self.state_dir, "status.json")
+        self.task_state_path = os.path.join(self.state_dir, "task-state.json")
+        stored_state = TaskState.load(self.task_state_path)
+        detected_branch = stored_state.branch or get_git_status(config.project_dir).branch
+        self.task_state = replace(
+            stored_state,
+            objective=config.objective or stored_state.objective,
+            prohibitions=tuple(config.prohibitions) or stored_state.prohibitions,
+            task_id=config.task_id or stored_state.task_id,
+            required_outcome=config.required_outcome or stored_state.required_outcome,
+            npm_publish_allowed=config.npm_publish_allowed,
+            session_id=config.session_id or stored_state.session_id,
+            branch=detected_branch,
+        )
+        if config.supervise and not self.task_state.pr.get("safetyBaselineCaptured"):
+            baseline = dict(self.task_state.pr)
+            baseline.update(capture_safety_baseline(config.project_dir))
+            self.task_state = replace(self.task_state, pr=baseline)
+        self.task_state.save(self.task_state_path)
+        self.session_tracker = SessionTracker(
+            interaction_history=self.task_state.interaction_marker,
+            generation=self.task_state.session_generation,
+        )
+        self.policy = PolicyEnvelope(self.task_state.objective, self.task_state.prohibitions)
+        self.pr_machine = PullRequestStateMachine()
+        self.pr_machine.stage = self.task_state.last_known_stage
 
         # Internal state tracking
         self.last_digest = ""
@@ -1374,6 +1917,7 @@ class TerminalMonitor:
         self.sends = 0
         self.current_state = "unknown"
         self.current_mode: str | None = None
+        self.last_git_fingerprint = ""
 
         # Callbacks
         self.on_state_change: Callable[[str, str], None] | None = None
@@ -1418,17 +1962,13 @@ class TerminalMonitor:
         }
         if extra:
             data.update(extra)
-        try:
-            target_path = Path(self.status_json_path).resolve()
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            target_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        with contextlib.suppress(Exception):
+            _atomic_json_write(self.status_json_path, data)
 
     def inspect(self) -> dict[str, Any]:
         """Query current tab state and return structured status snapshot."""
         pids = self.backend.get_pids(self.config.process)
-        tab = self.backend.get_tab(self.config.process, self.config.title)
+        tab = self._get_tab(pids)
         if not tab.get("ok"):
             return {
                 "ok": False,
@@ -1439,7 +1979,8 @@ class TerminalMonitor:
 
         history = str(tab.get("hist", ""))
         snapshot = normalize_snapshot(history)
-        state = classify_state(history, self.profile)
+        activity = self._process_activity(pids, bool(tab.get("busy")))
+        state = classify_state(history, self.profile, activity=activity, session_tracker=self.session_tracker)
         mode = self.profile.detect_mode(history)
         return {
             "ok": True,
@@ -1447,6 +1988,7 @@ class TerminalMonitor:
             "state": state,
             "mode": mode,
             "snapshot": snapshot,
+            "activity": activity,
             "tab": tab,
         }
 
@@ -1467,7 +2009,7 @@ class TerminalMonitor:
             self.export_status_json([], "process_gone", {"running": False})
             return 0, "PROCESS_GONE"
 
-        tab = self.backend.get_tab(self.config.process, self.config.title)
+        tab = self._get_tab(pids)
         if not tab.get("ok"):
             if self.config.once:
                 return 2, f"MISSING: {tab.get('error')}"
@@ -1476,7 +2018,8 @@ class TerminalMonitor:
         history = str(tab.get("hist", ""))
         snapshot = normalize_snapshot(history)
         digest = hashlib.sha256(snapshot.encode("utf-8", "replace")).hexdigest()[:16]
-        state = classify_state(history, self.profile)
+        activity = self._process_activity(pids, bool(tab.get("busy")))
+        state = classify_state(history, self.profile, activity=activity, session_tracker=self.session_tracker)
         mode = self.profile.detect_mode(history)
 
         if mode != self.current_mode:
@@ -1489,7 +2032,40 @@ class TerminalMonitor:
                 self.on_state_change(self.current_state, state)
             self.current_state = state
 
-        self.export_status_json(pids, state)
+        if self.config.supervise:
+            reference = str(self.task_state.pr.get("number") or self.task_state.branch or "")
+            pr_snapshot = get_current_pr_snapshot(self.config.project_dir, reference)
+            if pr_snapshot:
+                stage = self.pr_machine.advance({
+                    "number": pr_snapshot.get("number"),
+                    "state": pr_snapshot.get("state"),
+                    "checks": pr_snapshot.get("statusCheckRollup") or [],
+                })
+                metadata = dict(self.task_state.pr)
+                metadata.update({"number": pr_snapshot.get("number"), "head": pr_snapshot.get("headRefOid")})
+                if stage == "CI_RETRY_REQUIRED":
+                    retried = retry_infrastructure_checks(self.config.project_dir, pr_snapshot)
+                    if retried:
+                        metadata["retriedRuns"] = retried
+                        stage = "CI_PENDING"
+                self.task_state = replace(self.task_state, last_known_stage=stage, pr=metadata)
+                self.task_state.save(self.task_state_path)
+
+        self.export_status_json(pids, state, {
+            "activity": {
+                "active": activity.active,
+                "descendants": list(activity.descendants),
+                "commands": list(activity.commands),
+                "cpu_percent": activity.cpu_percent,
+                "oldest_seconds": activity.oldest_seconds,
+            },
+            "task": {
+                "task_id": self.task_state.task_id,
+                "stage": self.task_state.last_known_stage,
+                "session_generation": self.session_tracker.generation,
+                "npm_publish_allowed": self.task_state.npm_publish_allowed,
+            },
+        })
 
         if self.config.once:
             return 0, f"STATE={state} MODE={mode} PID_COUNT={len(pids)}"
@@ -1500,8 +2076,46 @@ class TerminalMonitor:
 
         stable_for = time.monotonic() - self.last_change
 
+        # A human/operator answer is an explicit instruction and therefore
+        # outranks inferred UI state, spinner text, thresholds, and cooldowns.
+        manual_answer = consume_manual_answer(self.answer_path)
+        if manual_answer:
+            if self.config.dry_run:
+                return 0, f"DRY_RUN kind=manual payload={manual_answer}"
+            ok, detail = self.backend.send(self.config.process, self.config.title, manual_answer)
+            self.sends += 1
+            self.last_send = time.monotonic()
+            self.last_change = time.monotonic()
+            self.session_tracker.mark_interaction(history)
+            self.task_state = replace(
+                self.task_state,
+                session_generation=self.session_tracker.generation,
+                interaction_marker=self.session_tracker.interaction_history,
+            )
+            self.task_state.save(self.task_state_path)
+            self.log(f"SEND kind=manual n={self.sends} ok={ok} detail={detail}")
+            if self.on_send:
+                self.on_send("manual", manual_answer, ok)
+            return (None, f"SENT kind=manual n={self.sends}") if ok else (1, f"SEND_FAILED kind=manual n={self.sends}")
+
         # Handle Completion State
         if state == "completed" and self.config.completion_check:
+            merge_required = self.config.supervise and self.task_state.required_outcome.lower() == "merged"
+            if merge_required and self.task_state.last_known_stage != "POST_MERGE_VERIFY":
+                self.log(f"WAIT completion_text_before_required_stage stage={self.task_state.last_known_stage}")
+                return None, f"WAITING_FOR_REQUIRED_OUTCOME stage={self.task_state.last_known_stage}"
+            if merge_required:
+                report = evaluate_final_state(collect_final_evidence(self.config.project_dir, self.task_state))
+                if not report.ok:
+                    if time.monotonic() - self.last_send < self.config.cooldown_seconds:
+                        return None, "WAITING_FINAL_VERIFICATION"
+                    instruction = "Resolve the remaining final-verification checks: " + ", ".join(report.failures)
+                    payload = self.policy.compose(instruction, "POST_MERGE_VERIFY")
+                    ok, detail = self.backend.send(self.config.process, self.config.title, payload)
+                    self.last_send = time.monotonic()
+                    self.sends += 1
+                    self.log(f"SEND kind=final_verification n={self.sends} ok={ok} detail={detail}")
+                    return (None, "SENT kind=final_verification") if ok else (1, "SEND_FAILED kind=final_verification")
             self.log("SUCCESS: Completion indicators detected. Work complete.")
             if self.on_complete:
                 self.on_complete(snapshot)
@@ -1530,13 +2144,10 @@ class TerminalMonitor:
                 self.backend.send(self.config.process, self.config.title, self.config.continue_text)
             return None, "MODE_SWITCH_SENT"
 
-        manual_answer = consume_manual_answer(self.answer_path)
-        payload: str | None = manual_answer or self.config.continue_text
+        payload: str | None = self.config.continue_text
         reason = "idle"
 
-        if manual_answer:
-            reason = "manual"
-        elif state == "permission":
+        if state == "permission":
             payload = self.profile.auto_permission_payload if self.config.auto_allow_permissions else None
             reason = "permission"
         elif state == "question":
@@ -1546,6 +2157,13 @@ class TerminalMonitor:
             git_info = get_git_status(self.config.project_dir)
             payload = generate_smart_nudge(git_info, self.config.continue_text)
             reason = "smart_nudge"
+
+        if payload and (self.policy.objective or self.policy.prohibitions):
+            try:
+                payload = self.policy.compose(payload, self.task_state.last_known_stage)
+            except ValueError:
+                payload = None
+                reason = "policy_conflict"
 
         if payload is None:
             with open(self.attention_path, "w", encoding="utf-8") as handle:
@@ -1562,6 +2180,14 @@ class TerminalMonitor:
         self.sends += 1
         self.last_send = time.monotonic()
         self.log(f"SEND kind={reason} n={self.sends} ok={ok} detail={detail}")
+        if ok:
+            self.session_tracker.mark_interaction(history)
+            self.task_state = replace(
+                self.task_state,
+                session_generation=self.session_tracker.generation,
+                interaction_marker=self.session_tracker.interaction_history,
+            )
+            self.task_state.save(self.task_state_path)
 
         if self.on_send:
             self.on_send(reason, payload, ok)
@@ -1583,11 +2209,49 @@ class TerminalMonitor:
                 if code is not None:
                     self.log(f"EXIT code={code} msg={msg}")
                     return code
-                time.sleep(self.config.poll_seconds)
+                pr_number = self.task_state.pr.get("number")
+                if self.task_state.last_known_stage == "CI_PENDING" and pr_number and shutil.which("gh"):
+                    wait_for_ci_event(self.config.project_dir, int(pr_number), timeout_seconds=max(5.0, self.config.poll_seconds))
+                    continue
+                initial = self._change_fingerprint()
+                wait_for_change(
+                    self._change_fingerprint,
+                    initial,
+                    timeout_seconds=self.config.poll_seconds,
+                    interval_seconds=min(0.5, self.config.poll_seconds),
+                )
         except KeyboardInterrupt:
             self.log("EXIT code=130 msg=INTERRUPTED")
             self.export_status_json([], "interrupted", {"running": False})
             return 130
+
+    def _change_fingerprint(self) -> str:
+        """Cheap file, process, and repository signals used for early wakeup."""
+        files = []
+        for path in (self.answer_path, self.stop_path):
+            with contextlib.suppress(OSError):
+                stat = os.stat(path)
+                files.append(f"{path}:{stat.st_mtime_ns}:{stat.st_size}")
+        pids = ",".join(str(pid) for pid in self.backend.get_pids(self.config.process))
+        value = "|".join(files) + pids + git_activity_fingerprint(self.config.project_dir)
+        return hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()
+
+    def _get_tab(self, pids: list[int]) -> dict[str, str | bool]:
+        identity = TerminalIdentity(
+            project_path=str(Path(self.config.project_dir).resolve()),
+            branch=self.task_state.branch or get_git_status(self.config.project_dir).branch,
+            session_id=self.task_state.session_id,
+            title=self.config.title or "",
+            root_pid=pids[0] if pids else None,
+        )
+        return self.backend.get_tab_for_identity(self.config.process, identity)
+
+    def _process_activity(self, pids: list[int], terminal_busy: bool = False) -> ProcessActivity:
+        activity = collect_process_activity(pids)
+        fingerprint = git_activity_fingerprint(self.config.project_dir)
+        changed = bool(self.last_git_fingerprint and fingerprint != self.last_git_fingerprint)
+        self.last_git_fingerprint = fingerprint
+        return replace(activity, active=activity.active or terminal_busy or changed, git_changed=changed)
 
 
 # ---------------------------------------------------------------------------
@@ -1612,6 +2276,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     # list profiles subcommand
     subparsers.add_parser("profiles", help="List built-in and discovered agent profiles")
+
+    send_parser = subparsers.add_parser("send", help="Send an explicit instruction to the selected agent terminal")
+    send_parser.add_argument("text", help="Instruction text to send")
+    _add_monitor_args(send_parser)
+
+    interrupt_parser = subparsers.add_parser("interrupt-child", help="Interrupt only a verified child command")
+    interrupt_parser.add_argument("--pid", type=int, required=True, help="Child process ID to interrupt")
+    _add_monitor_args(interrupt_parser)
+
+    restart_parser = subparsers.add_parser("restart-agent", help="Restart an agent using saved task state")
+    restart_parser.add_argument("--continue-session", action="store_true", help="Pass the saved session identifier")
+    restart_parser.add_argument("--agent-command", nargs=argparse.REMAINDER, help="Explicit agent command and arguments")
+    _add_monitor_args(restart_parser)
+
+    verify_parser = subparsers.add_parser("verify-final-state", help="Verify PR, branch, CI, release, and npm safety invariants")
+    verify_parser.add_argument("--pr", type=int, help="Pull Request number (defaults to saved state/current branch)")
+    _add_monitor_args(verify_parser)
 
     # supervise subcommand
     supervise_parser = subparsers.add_parser("supervise", help="Run autonomous supervision daemon")
@@ -1647,6 +2328,12 @@ def _add_monitor_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", default=None, help="Explicit configuration file path")
     parser.add_argument("--state-dir", default=None, help="Directory for state/logs (default: /tmp/terminal-monitor)")
     parser.add_argument("--unsafe-phrase", action="append", dest="unsafe_phrases", help="Add custom unsafe phrases")
+    parser.add_argument("--objective", default=None, help="Permanent task objective included with every nudge")
+    parser.add_argument("--prohibition", action="append", dest="prohibitions", help="Permanent instruction that dynamic nudges cannot override")
+    parser.add_argument("--task-id", default=None, help="Durable external task identifier")
+    parser.add_argument("--required-outcome", default=None, help="Required final outcome (default: merged)")
+    parser.add_argument("--allow-npm-publish", action="store_true", default=None, help="Explicitly allow npm publication (default: prohibited)")
+    parser.add_argument("--session-id", default=None, help="Agent session identifier for robust selection/restart")
     parser.add_argument("--once", action="store_true", default=False, help="Inspect status once and exit")
     parser.add_argument("--dry-run", action="store_true", default=False, help="Simulate actions without sending keystrokes")
 
@@ -1710,6 +2397,12 @@ def config_from_args(args: argparse.Namespace) -> MonitorConfig:
         smart_nudges=smart_nudges,
         completion_check=completion_check,
         status_json_path=getattr(args, "status_json_path", None) or file_cfg.get("status_json_path"),
+        objective=str(_val(getattr(args, "objective", None), "objective", "")),
+        prohibitions=list(_val(getattr(args, "prohibitions", None), "prohibitions", [])),
+        task_id=str(_val(getattr(args, "task_id", None), "task_id", "")),
+        required_outcome=str(_val(getattr(args, "required_outcome", None), "required_outcome", "merged")),
+        npm_publish_allowed=bool(_val(getattr(args, "allow_npm_publish", None), "npm_publish_allowed", False)),
+        session_id=str(_val(getattr(args, "session_id", None), "session_id", "")),
     )
 
 
@@ -1735,6 +2428,38 @@ def main() -> int:
         return 0
 
     config = config_from_args(args)
+
+    if args.command == "send":
+        backend = get_backend(config.backend)
+        ok, detail = backend.send(config.process, config.title, args.text)
+        print(detail)
+        return 0 if ok else 1
+
+    if args.command == "interrupt-child":
+        backend = get_backend(config.backend)
+        roots = set(backend.get_pids(config.process))
+        ok = interrupt_child(roots, args.pid, parent_of=_parent_pid)
+        print("INTERRUPTED_CHILD" if ok else "REFUSED_NOT_VERIFIED_DESCENDANT")
+        return 0 if ok else 2
+
+    if args.command == "restart-agent":
+        state = TaskState.load(Path(config.state_dir, "task-state.json"))
+        try:
+            command = build_restart_command(config, state, args.agent_command, args.continue_session)
+        except StateFileError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        process = subprocess.Popen(command, cwd=config.project_dir, start_new_session=True)
+        print(f"RESTARTED pid={process.pid}")
+        return 0
+
+    if args.command == "verify-final-state":
+        state = TaskState.load(Path(config.state_dir, "task-state.json"))
+        evidence = collect_final_evidence(config.project_dir, state, args.pr)
+        report = evaluate_final_state(evidence)
+        print(json.dumps({"ok": report.ok, "checks": report.checks, "failures": report.failures, "evidence": evidence}, indent=2))
+        return 0 if report.ok else 4
+
     monitor = TerminalMonitor(config)
 
     if config.once:

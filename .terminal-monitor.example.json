@@ -12,6 +12,14 @@
   "max_sends": 100,
   "auto_allow_permissions": false,
   "state_dir": "/tmp/terminal-monitor",
+  "objective": "Finish every assigned task, create the Pull Request, wait for green checks, merge it, and verify main.",
+  "prohibitions": [
+    "Do not publish to npm."
+  ],
+  "task_id": "example-task",
+  "required_outcome": "merged",
+  "npm_publish_allowed": false,
+  "session_id": "",
   "unsafe_phrases": [
     "bypass",
     "delete",
