@@ -2743,6 +2743,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="terminal_monitor",
         description="Monitor and safely nudge AI CLI coding agents running in Terminal.app, iTerm2, or tmux.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
     )
 
     # Subcommands
