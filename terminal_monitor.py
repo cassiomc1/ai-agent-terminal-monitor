@@ -603,7 +603,14 @@ def collect_final_evidence(project_dir: str, state: TaskState, pr_number: int | 
         if code == 0:
             with contextlib.suppress(json.JSONDecodeError, TypeError):
                 releases_now = {str(item["tagName"]) for item in json.loads(output)}
-    publish_code, publish_output, _ = run_command(["pgrep", "-af", "(?:npm|pnpm|yarn).*publish"])
+    publish_code, publish_output, _ = run_command(["pgrep", "-af", r"(?:^|/)(?:npm|pnpm|yarn)(?:\s|$)"])
+    publish_processes = []
+    for line in publish_output.splitlines():
+        parts = line.split(None, 1)
+        command = parts[1] if len(parts) == 2 else line
+        executable = command.split(None, 1)[0] if command else ""
+        if Path(executable).name in {"npm", "pnpm", "yarn"} and re.search(r"\bpublish\b", command):
+            publish_processes.append(line)
     package_json = Path(project_dir, "package.json")
     npm_unchanged = True
     expected_npm = state.pr.get("npmVersionBefore")
@@ -624,7 +631,7 @@ def collect_final_evidence(project_dir: str, state: TaskState, pr_number: int | 
         "worktree_clean": not status,
         "npm_registry_unchanged": npm_unchanged,
         "no_new_tag_or_release": baseline_known and tags_now == tags_before and releases_now == releases_before,
-        "no_publish_process": publish_code != 0 or not publish_output,
+        "no_publish_process": publish_code != 0 or not publish_processes,
     }
 
 
