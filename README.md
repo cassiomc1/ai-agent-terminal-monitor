@@ -20,7 +20,7 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
 
 **AI Agent Terminal Monitor** is a generic, modular, and extensible supervisor that watches your terminal, intelligently classifies agent lifecycle states (`thinking`, `permission`, `question`, `completed`, `idle`), auto-resolves safe prompts, manages TUI modes (`Plan` vs `Build`), blocks unsafe/destructive operations, generates context-aware Git nudges, exports real-time status JSON, and keeps the agent progressing autonomously to goal completion.
 
-> **State precedence:** actionable states (`permission`, `question`, `completed`) are always detected before `thinking`. Agents frequently keep spinner hints like `esc to cancel` visible while a permission prompt is on screen, so the monitor never mistakes an actionable prompt for a busy state.
+> **State precedence:** explicit manual answers and safe permission prompts take priority. A question requires both a strong prompt and real selectable options, while an active child command counts as `thinking`. Completion is accepted only from output produced after the latest instruction, so an old “done” message cannot finish a newly assigned task.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -60,6 +60,11 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
   - *Clean feature branch:* Prompts agent to run full verification, push branch and create PR.
   - *Open PRs:* Prompts agent to verify CI checks and merge into `main`.
 - 🏁 **Completion Engine & Stop Conditions**: Detects when all plan tasks are 100% completed and merged, gracefully stopping the supervisor and firing completion events.
+- 🧭 **Session Generations**: Separates terminal scrollback from the current interaction and rejects stale completion evidence after new work is assigned.
+- ⚙️ **Real Process Activity**: Observes descendant commands, command age and CPU data, preventing a quiet terminal from being treated as stalled while tests or builds are still running.
+- 📜 **Durable Policy Envelope**: Stores the objective, prohibitions, task ID, required outcome, current stage, PR metadata, and session ID in `task-state.json`. Smart nudges are wrapped in permanent policy and cannot override an npm-publication prohibition.
+- 🔁 **Native PR/CI Lifecycle**: Tracks `PR_CREATED → CI_PENDING → FIX_REQUIRED` or `CI_RETRY_REQUIRED → CI_GREEN → POST_MERGE_VERIFY`; infrastructure-like cancellations/timeouts are retried without being mislabeled as code failures.
+- ✅ **Final-State Verifier**: Verifies merged PR, checks for the exact PR head, synchronized clean `main`, unchanged npm registry state, no new tag/release, and no active publish process.
 - 🔍 **Refined Question vs Table Disambiguation**: Excludes Markdown/Unicode summary tables and code blocks from option parsing, eliminating false-positive dialog loops.
 - 📊 **Real-time Status JSON Export**: Continuously exports live structured JSON (`status.json`) with PIDs, state, mode, git details, uptime, and send counts for IDE or dashboard integrations.
 - 🖥️ **Universal Terminal Backends**:
@@ -86,7 +91,8 @@ Run full autonomous supervision with automatic mode switching, safe permission a
 ```bash
 python3 terminal_monitor.py supervise \
   --profile opencode \
-  --status-json /tmp/terminal-monitor/status.json
+  --objective "Finish every task, create and merge the PR, then verify main." \
+  --prohibition "Do not publish to npm."
 ```
 
 ### 2. Monitor Anthropic Claude Code
@@ -127,6 +133,24 @@ To gracefully stop a running supervisor or monitor daemon:
 touch /tmp/terminal-monitor/stop
 ```
 
+### 7. Operational control commands
+
+```bash
+# Explicit operator message; this also outranks a visible "thinking" spinner
+python3 terminal_monitor.py send "Resume the remaining work" --profile opencode
+
+# Interrupt only PID 43210 when it is verified as a descendant of the agent
+python3 terminal_monitor.py interrupt-child --pid 43210 --profile opencode
+
+# Restart and continue the session saved in task-state.json
+python3 terminal_monitor.py restart-agent --continue-session --profile opencode
+
+# Verify repository, PR, CI, release and npm invariants
+python3 terminal_monitor.py verify-final-state --project-dir . --state-dir /tmp/terminal-monitor
+```
+
+`interrupt-child` refuses the root agent PID and any PID outside its descendant tree. `restart-agent` executes an argument vector directly without a shell. For a non-OpenCode CLI, use `--agent-command` when its continuation syntax differs.
+
 ---
 
 ## 📦 Project Configuration
@@ -160,7 +184,12 @@ python3 terminal_monitor.py init --format toml -o .terminal-monitor.toml
   "auto_switch_modes": true,
   "completion_check": true,
   "state_dir": "/tmp/terminal-monitor",
-  "status_json_path": "/tmp/terminal-monitor/status.json",
+  "objective": "Finish every task, create and merge the PR, then verify main.",
+  "prohibitions": ["Do not publish to npm."],
+  "task_id": "work-42",
+  "required_outcome": "merged",
+  "npm_publish_allowed": false,
+  "session_id": "ses_123",
   "unsafe_phrases": [
     "bypass",
     "delete",
@@ -214,7 +243,10 @@ config = MonitorConfig(
     smart_nudges=True,
     auto_switch_modes=True,
     completion_check=True,
-    status_json_path="/tmp/terminal-monitor/status.json",
+    objective="Finish every task, merge the PR, and verify main.",
+    prohibitions=["Do not publish to npm."],
+    task_id="work-42",
+    session_id="ses_123",
 )
 
 # 2. Instantiate monitor
@@ -235,7 +267,7 @@ exit_code = monitor.run()
 
 ## 📊 Live Status JSON Structure
 
-When `--status-json` or `config.status_json_path` is specified, `TerminalMonitor` continuously maintains a live status export:
+Whenever a state directory exists, `TerminalMonitor` atomically maintains `<state-dir>/status.json`; `--status-json` can redirect it. It also maintains `<state-dir>/task-state.json` with durable task and PR state.
 
 ```json
 {
@@ -247,6 +279,19 @@ When `--status-json` or `config.status_json_path` is specified, `TerminalMonitor
   "mode": "build",
   "sends": 14,
   "stable_seconds": 12.4,
+  "activity": {
+    "active": true,
+    "descendants": [21401],
+    "commands": ["python3 -m unittest discover -s tests"],
+    "cpu_percent": 74.2,
+    "oldest_seconds": 18.0
+  },
+  "task": {
+    "task_id": "work-42",
+    "stage": "CI_PENDING",
+    "session_generation": 3,
+    "npm_publish_allowed": false
+  },
   "git": {
     "branch": "feat/rc6-closing-fixes",
     "dirty": false,
@@ -258,6 +303,28 @@ When `--status-json` or `config.status_json_path` is specified, `TerminalMonitor
   "timestamp": "2026-08-23T19:45:00Z"
 }
 ```
+
+## PR/CI and final-verification stages
+
+The supervisor persists these stages instead of inferring progress only from terminal prose:
+
+| Stage | Meaning | Automatic action |
+|---|---|---|
+| `TASK_RECEIVED` | Work is active | Continue from the task plan |
+| `PR_CREATED` / `CI_PENDING` | PR exists and checks are incomplete | Wait for a state change |
+| `FIX_REQUIRED` | A code check failed | Return the agent to diagnosis and tests |
+| `CI_RETRY_REQUIRED` | Cancel, timeout, network or infrastructure failure | Retry only the affected workflow run |
+| `CI_GREEN` | Exact PR head is green | Proceed to merge |
+| `POST_MERGE_VERIFY` | PR is merged | Run `verify-final-state` invariants |
+
+`answer.txt`, `stop`, process-tree changes, git changes, and CI stage changes can wake supervision early; a bounded timer remains as a portable fallback.
+
+## Migration notes
+
+- Existing configurations remain valid.
+- `status.json` is now created by default inside `state_dir`; remove consumers that assumed it existed only with `--status-json`.
+- `npm_publish_allowed` defaults to `false`. Enabling publication requires the explicit `--allow-npm-publish` flag or configuration value.
+- A malformed `task-state.json` stops initialization with `StateFileError` instead of silently discarding safety policy.
 
 ---
 

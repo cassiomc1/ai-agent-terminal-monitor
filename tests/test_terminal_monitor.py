@@ -514,5 +514,217 @@ class RobustnessTests(unittest.TestCase):
             self.assertFalse(config.completion_check)
 
 
+class SupervisorV2Tests(unittest.TestCase):
+    def test_session_tracker_rejects_completion_from_before_latest_interaction(self):
+        tracker = terminal_monitor.SessionTracker()
+        old = "All tasks complete.\nReady for input."
+        tracker.mark_interaction(old)
+        self.assertEqual(tracker.current_segment(old), "")
+        self.assertFalse(tracker.matches_current_completion(old, ["all tasks complete"]))
+        current = old + "\nWorking on the new task.\nAll tasks complete."
+        self.assertTrue(tracker.matches_current_completion(current, ["all tasks complete"]))
+
+    def test_active_child_command_suppresses_question_classification(self):
+        history = "Which option should I use?\n1. Continue safely\n2. Stop"
+        activity = terminal_monitor.ProcessActivity(active=True, descendants=(4321,), commands=("pytest",))
+        self.assertEqual(terminal_monitor.classify_state(history, activity=activity), "thinking")
+
+    def test_persistent_idle_helper_is_not_mistaken_for_active_command(self):
+        ps_output = "200 100 02:00:00 0.0 typescript-language-server --stdio"
+        with mock.patch.object(terminal_monitor, "run_command", return_value=(0, ps_output, "")):
+            activity = terminal_monitor.collect_process_activity([100])
+        self.assertFalse(activity.active)
+        self.assertEqual(activity.descendants, (200,))
+
+    def test_long_running_test_command_counts_as_activity_even_when_cpu_is_quiet(self):
+        ps_output = "200 100 15:00 0.0 python3 -m unittest discover -s tests"
+        with mock.patch.object(terminal_monitor, "run_command", return_value=(0, ps_output, "")):
+            activity = terminal_monitor.collect_process_activity([100])
+        self.assertTrue(activity.active)
+
+    def test_weak_question_text_without_options_is_idle(self):
+        self.assertEqual(terminal_monitor.classify_state("Question coverage improved in tests."), "idle")
+
+    def test_manual_answer_has_priority_while_agent_looks_busy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pathlib.Path(directory, "answer.txt").write_text("Use option B\n", encoding="utf-8")
+            backend = MockBackend(tab_response={"ok": True, "error": "", "hist": "working...\nesc interrupt"})
+            monitor = terminal_monitor.TerminalMonitor(
+                terminal_monitor.MonitorConfig(
+                    process="opencode",
+                    state_dir=directory,
+                    cooldown_seconds=0,
+                ),
+                backend=backend,
+            )
+            _code, message = monitor.step()
+            self.assertEqual(backend.sent_payloads, ["Use option B"])
+            self.assertIn("kind=manual", message)
+
+    def test_supervisor_does_not_finish_before_required_pr_merge_stage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = MockBackend(tab_response={"ok": True, "error": "", "hist": "Todas as tarefas estão concluídas."})
+            config = terminal_monitor.MonitorConfig(
+                process="opencode",
+                profile="opencode",
+                supervise=True,
+                state_dir=directory,
+                idle_seconds=999,
+            )
+            clean_git = terminal_monitor.GitStatus(is_repo=True, branch="codex/work")
+            with mock.patch.object(terminal_monitor, "capture_safety_baseline", return_value={"safetyBaselineCaptured": True}), mock.patch.object(
+                terminal_monitor, "get_current_pr_snapshot", return_value=None
+            ), mock.patch.object(terminal_monitor, "get_git_status", return_value=clean_git), mock.patch.object(
+                terminal_monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()
+            ):
+                monitor = terminal_monitor.TerminalMonitor(config, backend=backend)
+                code, message = monitor.step()
+            self.assertIsNone(code)
+            self.assertIn("WAITING", message)
+
+    def test_policy_envelope_keeps_permanent_prohibitions_in_every_nudge(self):
+        policy = terminal_monitor.PolicyEnvelope(
+            objective="Finish every task and merge the PR.",
+            prohibitions=("Do not publish to npm.",),
+        )
+        message = policy.compose("Run the next tests.", stage="IMPLEMENTING")
+        self.assertIn("Finish every task", message)
+        self.assertIn("Do not publish to npm", message)
+        self.assertIn("Run the next tests", message)
+        with self.assertRaises(ValueError):
+            policy.compose("Publish the package to npm now.")
+
+    def test_task_state_round_trip_and_corrupt_state_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory, "task-state.json")
+            state = terminal_monitor.TaskState(
+                objective="Finish tasks",
+                prohibitions=("Do not publish npm",),
+                plan=("test", "merge"),
+                branch="codex/work",
+                task_id="task-7",
+                required_outcome="merged",
+                last_known_stage="CI_PENDING",
+                pr={"number": 42, "head": "abc"},
+                interaction_marker="latest prompt",
+            )
+            state.save(path)
+            loaded = terminal_monitor.TaskState.load(path)
+            self.assertEqual(loaded, state)
+            self.assertFalse(loaded.npm_publish_allowed)
+            path.write_text("{broken", encoding="utf-8")
+            with self.assertRaises(terminal_monitor.StateFileError):
+                terminal_monitor.TaskState.load(path)
+
+    def test_saved_interaction_marker_rejects_stale_completion_after_restart(self):
+        state = terminal_monitor.TaskState(interaction_marker="All tasks complete.\nReady for input.", session_generation=2)
+        tracker = terminal_monitor.SessionTracker(state.interaction_marker, state.session_generation)
+        self.assertFalse(tracker.matches_current_completion(state.interaction_marker, ["all tasks complete"]))
+
+    def test_state_dir_enables_status_json_by_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            monitor = terminal_monitor.TerminalMonitor(
+                terminal_monitor.MonitorConfig(process="opencode", state_dir=directory),
+                backend=MockBackend(),
+            )
+            self.assertEqual(monitor.status_json_path, str(pathlib.Path(directory, "status.json")))
+
+    def test_terminal_identity_scores_exact_project_session_branch_and_pid(self):
+        identity = terminal_monitor.TerminalIdentity(
+            project_path="/work/repo",
+            branch="codex/work",
+            session_id="ses-9",
+            title="OpenCode",
+            root_pid=123,
+        )
+        exact = {"history": "cd /work/repo ses-9 codex/work", "title": "OpenCode", "root_pid": 123}
+        other = {"history": "cd /work/other", "title": "OpenCode", "root_pid": 999}
+        self.assertGreater(identity.score(exact), identity.score(other))
+
+    def test_interrupt_child_never_signals_root_and_only_signals_descendant(self):
+        signalled = []
+        parents = {200: 100, 300: 999}
+        self.assertFalse(terminal_monitor.interrupt_child({100}, 100, parent_of=parents.get, signaler=lambda pid, sig: signalled.append(pid)))
+        self.assertFalse(terminal_monitor.interrupt_child({100}, 300, parent_of=parents.get, signaler=lambda pid, sig: signalled.append(pid)))
+        self.assertTrue(terminal_monitor.interrupt_child({100}, 200, parent_of=parents.get, signaler=lambda pid, sig: signalled.append(pid)))
+        self.assertEqual(signalled, [200])
+
+    def test_pr_state_machine_distinguishes_code_and_retryable_failures(self):
+        machine = terminal_monitor.PullRequestStateMachine()
+        self.assertEqual(machine.advance(None), "TASK_RECEIVED")
+        self.assertEqual(machine.advance({"number": 7, "state": "OPEN", "checks": []}), "PR_CREATED")
+        self.assertEqual(machine.advance({"number": 7, "state": "OPEN", "checks": []}), "CI_PENDING")
+        self.assertEqual(machine.advance({"number": 7, "state": "OPEN", "checks": [{"conclusion": "failure"}]}), "FIX_REQUIRED")
+        self.assertEqual(machine.advance({"number": 7, "state": "OPEN", "checks": [{"conclusion": "cancelled"}]}), "CI_RETRY_REQUIRED")
+        self.assertEqual(machine.advance({"number": 7, "state": "OPEN", "checks": [{"conclusion": "success"}]}), "CI_GREEN")
+        self.assertEqual(machine.advance({"number": 7, "state": "MERGED", "checks": [{"conclusion": "success"}]}), "POST_MERGE_VERIFY")
+
+    def test_final_verifier_requires_every_safety_invariant(self):
+        good = {
+            "pr_merged": True,
+            "pr_head": "abc",
+            "checked_head": "abc",
+            "checks_green": True,
+            "local_head": "def",
+            "main_head": "def",
+            "origin_main_head": "def",
+            "worktree_clean": True,
+            "npm_registry_unchanged": True,
+            "no_new_tag_or_release": True,
+            "no_publish_process": True,
+        }
+        report = terminal_monitor.evaluate_final_state(good)
+        self.assertTrue(report.ok)
+        broken = dict(good, checked_head="stale")
+        report = terminal_monitor.evaluate_final_state(broken)
+        self.assertFalse(report.ok)
+        self.assertIn("checks_exact_head", report.failures)
+
+    def test_final_evidence_fails_closed_without_release_baseline(self):
+        state = terminal_monitor.TaskState(pr={})
+        commands = {
+            ("git", "rev-parse", "HEAD"): (0, "def", ""),
+            ("git", "rev-parse", "main"): (0, "def", ""),
+            ("git", "rev-parse", "origin/main"): (0, "def", ""),
+            ("git", "status", "--porcelain"): (0, "", ""),
+            ("git", "tag", "--list"): (0, "", ""),
+            ("pgrep", "-af", "(?:npm|pnpm|yarn).*publish"): (1, "", ""),
+        }
+        with mock.patch.object(terminal_monitor, "run_command", side_effect=lambda cmd, cwd=None: commands.get(tuple(cmd), (1, "", ""))), mock.patch(
+            "shutil.which", return_value=None
+        ):
+            evidence = terminal_monitor.collect_final_evidence(".", state)
+        self.assertFalse(evidence["no_new_tag_or_release"])
+
+    def test_change_waiter_returns_when_fingerprint_changes(self):
+        values = iter(["same", "same", "changed"])
+        sleeps = []
+        changed = terminal_monitor.wait_for_change(
+            lambda: next(values),
+            "same",
+            timeout_seconds=10,
+            interval_seconds=0.1,
+            sleeper=lambda seconds: sleeps.append(seconds),
+        )
+        self.assertTrue(changed)
+        self.assertEqual(len(sleeps), 2)
+
+    def test_ci_wait_uses_github_watch_instead_of_sleep_polling(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="checks passed", stderr="")
+        with mock.patch.object(terminal_monitor.subprocess, "run", return_value=completed) as run:
+            self.assertTrue(terminal_monitor.wait_for_ci_event(".", 42, timeout_seconds=8))
+        command = run.call_args.args[0]
+        self.assertEqual(command[:4], ["gh", "pr", "checks", "42"])
+        self.assertIn("--watch", command)
+
+    def test_new_operational_commands_parse(self):
+        parser = terminal_monitor.build_parser()
+        self.assertEqual(parser.parse_args(["send", "resume work"]).command, "send")
+        self.assertEqual(parser.parse_args(["interrupt-child", "--pid", "321"]).pid, 321)
+        restart = parser.parse_args(["restart-agent", "--continue-session"])
+        self.assertTrue(restart.continue_session)
+        self.assertEqual(parser.parse_args(["verify-final-state"]).command, "verify-final-state")
+
+
 if __name__ == "__main__":
     unittest.main()
