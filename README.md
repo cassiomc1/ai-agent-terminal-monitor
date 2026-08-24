@@ -62,11 +62,15 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
 - 🏁 **Completion Engine & Stop Conditions**: Detects when all plan tasks are 100% completed and merged, gracefully stopping the supervisor and firing completion events.
 - 🧭 **Session Generations**: Separates terminal scrollback from the current interaction and rejects stale completion evidence after new work is assigned.
 - ⚙️ **Real Process Activity**: Observes descendant commands, command age and CPU data, preventing a quiet terminal from being treated as stalled while tests or builds are still running.
+- 🧾 **Idempotent Attempt Ledger**: Persists `queued → sent → accepted → completed` (or `ignored`) events with IDs, timestamps, prompts, and observed states so queued continuations survive restarts without being duplicated blindly.
 - 📜 **Durable Policy Envelope**: Stores the objective, prohibitions, task ID, required outcome, current stage, PR metadata, and session ID in `task-state.json`. Smart nudges are wrapped in permanent policy and cannot override an npm-publication prohibition.
-- 🔁 **Native PR/CI Lifecycle**: Tracks `PR_CREATED → CI_PENDING → FIX_REQUIRED` or `CI_RETRY_REQUIRED → CI_GREEN → POST_MERGE_VERIFY`; infrastructure-like cancellations/timeouts are retried without being mislabeled as code failures.
+- 🔁 **Native PR/CI Lifecycle**: Tracks `PR_CREATED → CI_PENDING → FIX_REQUIRED` or `CI_RETRY_REQUIRED → CI_GREEN → POST_MERGE_VERIFY`; checks are classified as `passed`, `failed`, `cancelled-infra`, or `failed-external` before retry decisions.
+- 🔒 **Exact-Head Merge Gate**: `merge-pr` re-queries the full PR head SHA and every check immediately before calling `gh pr merge --match-head-commit`; changed heads, pending checks, cancellations, and failures fail closed.
 - ✅ **Final-State Verifier**: Verifies merged PR, checks for the exact PR head, synchronized clean `main`, unchanged npm registry state, no new tag/release, and no active publish process.
 - 🔍 **Refined Question vs Table Disambiguation**: Excludes Markdown/Unicode summary tables and code blocks from option parsing, eliminating false-positive dialog loops.
 - 📊 **Real-time Status JSON Export**: Continuously exports live structured JSON (`status.json`) with PIDs, state, mode, git details, uptime, and send counts for IDE or dashboard integrations.
+- 🧭 **Branch and Worktree Safety**: Reports expected branch, protected-branch dirtiness, attempt history, CI evidence, policy decisions, and pauses supervised work when repository safety is violated.
+- 📝 **Structured Final Reports**: Writes `final-report.json` with verification evidence, CI classifications, continuation attempts, policy decisions, the explicit npm prohibition, and the npm-publication invariant.
 - 🖥️ **Universal Terminal Backends**:
   - `terminal`: Native macOS Terminal.app via AppleScript.
   - `iterm2`: Native macOS iTerm2 via AppleScript.
@@ -147,6 +151,13 @@ python3 terminal_monitor.py restart-agent --continue-session --profile opencode
 
 # Verify repository, PR, CI, release and npm invariants
 python3 terminal_monitor.py verify-final-state --project-dir . --state-dir /tmp/terminal-monitor
+
+# Merge only the exact SHA whose checks were just verified
+python3 terminal_monitor.py merge-pr --pr 42 --head <full-40-character-head-sha> \
+  --project-dir . --state-dir /tmp/terminal-monitor
+
+# Inspect the merge decision without querying GitHub or changing anything
+python3 terminal_monitor.py merge-pr --pr 42 --head <full-40-character-head-sha> --dry-run
 ```
 
 `interrupt-child` refuses the root agent PID and any PID outside its descendant tree. `restart-agent` executes an argument vector directly without a shell. For a non-OpenCode CLI, use `--agent-command` when its continuation syntax differs.
@@ -190,6 +201,10 @@ python3 terminal_monitor.py init --format toml -o .terminal-monitor.toml
   "required_outcome": "merged",
   "npm_publish_allowed": false,
   "session_id": "ses_123",
+  "expected_branch": "codex/work-42",
+  "protected_branches": ["main", "master"],
+  "report_path": "/tmp/terminal-monitor/final-report.json",
+  "attempt_history_limit": 100,
   "unsafe_phrases": [
     "bypass",
     "delete",
@@ -290,13 +305,35 @@ Whenever a state directory exists, `TerminalMonitor` atomically maintains `<stat
     "task_id": "work-42",
     "stage": "CI_PENDING",
     "session_generation": 3,
+    "pr": {"number": 42, "head": "d78ae3d..."},
     "npm_publish_allowed": false
   },
+  "attempts": [
+    {
+      "attempt_id": "attempt-1724440000000-1",
+      "status": "accepted",
+      "reason": "smart_nudge",
+      "timestamp": "2026-08-24T18:00:00Z"
+    }
+  ],
+  "ci_events": [],
+  "policy_decisions": [],
+  "prohibitions": ["Do not publish to npm."],
+  "npm_publish_allowed": false,
+  "repository_safety": {
+    "safe": true,
+    "reason": "ok",
+    "branch": "feat/rc6-closing-fixes",
+    "dirty": false
+  },
+  "report_path": "/tmp/terminal-monitor/final-report.json",
   "git": {
     "branch": "feat/rc6-closing-fixes",
+    "head": "d78ae3d...",
     "dirty": false,
     "modified": 0,
     "untracked": 0,
+    "modified_files": [],
     "open_prs": 1,
     "last_commit": "d78ae3d fix(types): commit ambient declarations"
   },
@@ -317,6 +354,11 @@ The supervisor persists these stages instead of inferring progress only from ter
 | `CI_GREEN` | Exact PR head is green | Proceed to merge |
 | `POST_MERGE_VERIFY` | PR is merged | Run `verify-final-state` invariants |
 
+Each check also carries a durable classification: `passed`, `failed`,
+`cancelled-infra`, or `failed-external`. A `429`, rate limit, timeout, or
+network response is retryable evidence, while a test assertion remains a code
+failure requiring a fix.
+
 `answer.txt`, `stop`, process-tree changes, git changes, and CI stage changes can wake supervision early; a bounded timer remains as a portable fallback.
 
 ## Migration notes
@@ -324,6 +366,14 @@ The supervisor persists these stages instead of inferring progress only from ter
 - Existing configurations remain valid.
 - `status.json` is now created by default inside `state_dir`; remove consumers that assumed it existed only with `--status-json`.
 - `npm_publish_allowed` defaults to `false`. Enabling publication requires the explicit `--allow-npm-publish` flag or configuration value.
+- `expected_branch` is optional. Supervision captures the current branch as its
+  baseline when it is omitted, and pauses with `ATTENTION_REQUIRED` if the
+  branch changes; dirty `main`/`master` is always treated as unsafe.
+- `final-report.json` is written beside `status.json` by default and contains
+  the final checks, evidence, attempts, CI classifications, policy decisions,
+  and the explicit npm prohibition.
+- `--dry-run` never sends terminal text or keys, starts an agent, or merges a
+  PR. `merge-pr --dry-run` only prints the planned exact-head action.
 - A malformed `task-state.json` stops initialization with `StateFileError` instead of silently discarding safety policy.
 
 ---

@@ -515,6 +515,334 @@ class RobustnessTests(unittest.TestCase):
 
 
 class SupervisorV2Tests(unittest.TestCase):
+    def test_attempt_ledger_records_idempotent_lifecycle(self):
+        ledger = terminal_monitor.AttemptLedger(max_records=10)
+        attempt_id = ledger.queue("idle", "Continue safely", observed_state="idle")
+        ledger.transition(attempt_id, "sent", detail="SENT")
+        ledger.transition(attempt_id, "accepted", detail="backend accepted")
+        ledger.transition(attempt_id, "completed", observed_state="thinking")
+
+        self.assertEqual(attempt_id, ledger.records[0]["attempt_id"])
+        self.assertEqual(
+            [event["status"] for event in ledger.records],
+            ["queued", "sent", "accepted", "completed"],
+        )
+
+    def test_ci_check_classification_distinguishes_code_and_external_failures(self):
+        self.assertEqual(
+            terminal_monitor.classify_check_result({"conclusion": "success"})["category"],
+            "passed",
+        )
+        self.assertEqual(
+            terminal_monitor.classify_check_result({"conclusion": "cancelled"})["category"],
+            "cancelled-infra",
+        )
+        external = terminal_monitor.classify_check_result(
+            {"conclusion": "failure", "output": "429 Too Many Requests while checking links"}
+        )
+        self.assertEqual(external["category"], "failed-external")
+        self.assertTrue(external["retryable"])
+        self.assertEqual(
+            terminal_monitor.classify_check_result(
+                {"conclusion": "failure", "output": "assertion failed in unit test"}
+            )["category"],
+            "failed",
+        )
+
+    def test_policy_blocks_publish_and_release_actions(self):
+        policy = terminal_monitor.PolicyEnvelope(
+            objective="Finish the task safely.",
+            prohibitions=("Do not publish to npm.",),
+        )
+        self.assertEqual(terminal_monitor.classify_action_risk("npm publish"), "blocked")
+        self.assertEqual(terminal_monitor.classify_action_risk("gh release create v1.0.0"), "attention")
+        allowed, reason = policy.authorize_action("npm publish")
+        self.assertFalse(allowed)
+        self.assertIn("npm", reason.lower())
+        safe_policy_text = policy.compose("Run the next tests.")
+        allowed, _reason = policy.authorize_action(safe_policy_text)
+        self.assertTrue(allowed)
+        self.assertEqual(terminal_monitor.classify_action_risk("Do not npm publish."), "safe")
+
+    def test_merge_gate_requires_fresh_exact_head_and_green_checks(self):
+        pr = {
+            "number": 7,
+            "state": "OPEN",
+            "headRefOid": "a" * 40,
+            "statusCheckRollup": [{"name": "tests", "conclusion": "success"}],
+        }
+        with mock.patch.object(
+            terminal_monitor,
+            "run_command",
+            return_value=(0, json.dumps(pr), ""),
+        ) as run:
+            result = terminal_monitor.verify_merge_gate(".", 7, "a" * 40)
+        self.assertTrue(result["ok"])
+        self.assertIn("--json", run.call_args.args[0])
+
+        pr["headRefOid"] = "b" * 40
+        with mock.patch.object(
+            terminal_monitor,
+            "run_command",
+            return_value=(0, json.dumps(pr), ""),
+        ):
+            result = terminal_monitor.verify_merge_gate(".", 7, "a" * 40)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "head_mismatch")
+
+    def test_merge_uses_exact_head_match_after_gate(self):
+        head = "c" * 40
+        pr = {
+            "number": 8,
+            "state": "OPEN",
+            "headRefOid": head,
+            "statusCheckRollup": [{"name": "tests", "conclusion": "success"}],
+        }
+        with mock.patch.object(
+            terminal_monitor,
+            "run_command",
+            side_effect=[(0, json.dumps(pr), ""), (0, "merged", "")],
+        ) as run:
+            result = terminal_monitor.merge_pull_request(".", 8, head)
+        self.assertTrue(result["merged"])
+        merge_command = run.call_args_list[1].args[0]
+        self.assertIn("--match-head-commit", merge_command)
+        self.assertIn(head, merge_command)
+
+    def test_merge_gate_treats_already_merged_pr_as_completed(self):
+        head = "d" * 40
+        pr = {"number": 9, "state": "MERGED", "headRefOid": head, "statusCheckRollup": []}
+        with mock.patch.object(terminal_monitor, "run_command", return_value=(0, json.dumps(pr), "")):
+            result = terminal_monitor.merge_pull_request(".", 9, head)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["merged"])
+        self.assertEqual(result["reason"], "already_merged")
+
+    def test_retry_only_targets_infrastructure_like_checks(self):
+        pr = {
+            "statusCheckRollup": [
+                {"name": "cancelled-job", "conclusion": "cancelled", "detailsUrl": "https://github.com/x/actions/runs/111"},
+                {"name": "code-job", "conclusion": "failure", "detailsUrl": "https://github.com/x/actions/runs/222"},
+            ]
+        }
+        with mock.patch.object(terminal_monitor, "run_command", return_value=(0, "", "")) as run:
+            retried = terminal_monitor.retry_infrastructure_checks(".", pr)
+        self.assertEqual(retried, [111])
+        self.assertEqual(run.call_args.args[0], ["gh", "run", "rerun", "111", "--failed"])
+
+    def test_dry_run_merge_never_calls_github(self):
+        with mock.patch.object(terminal_monitor, "run_command") as run:
+            result = terminal_monitor.merge_pull_request(".", 7, "a" * 40, dry_run=True)
+        self.assertTrue(result["dry_run"])
+        run.assert_not_called()
+
+    def test_merge_gate_rejects_non_full_head_sha(self):
+        with mock.patch.object(terminal_monitor, "run_command") as run:
+            result = terminal_monitor.verify_merge_gate(".", 7, "abc123")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "invalid_expected_head")
+        run.assert_not_called()
+
+    def test_repository_safety_detects_dirty_protected_branch(self):
+        status = terminal_monitor.GitStatus(
+            is_repo=True,
+            branch="main",
+            head="a" * 40,
+            dirty=True,
+            modified_count=1,
+            modified_files=("terminal_monitor.py",),
+        )
+        result = terminal_monitor.evaluate_repository_safety(status, expected_branch="codex/work")
+        self.assertFalse(result["safe"])
+        self.assertEqual(result["reason"], "protected_branch_dirty")
+        self.assertEqual(result["head"], "a" * 40)
+        self.assertEqual(result["modified_files"], ["terminal_monitor.py"])
+
+    def test_restart_event_and_final_report_are_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = pathlib.Path(directory) / "task-state.json"
+            report_path = pathlib.Path(directory) / "final-report.json"
+            state = terminal_monitor.TaskState(
+                session_id="ses-1",
+                attempts=({"attempt_id": "a1", "status": "accepted"},),
+                prohibitions=("Do not publish to npm.",),
+            )
+            state = terminal_monitor.persist_restart_event(state_path, state, ["opencode", "--session", "ses-1"])
+            self.assertEqual(state.pr["lastRestart"]["sessionId"], "ses-1")
+            state.save(state_path)
+            terminal_monitor.write_final_report(
+                report_path,
+                state,
+                {"pr_merged": True, "npm_registry_unchanged": True},
+                terminal_monitor.FinalVerificationReport(True, {"pr_merged": True}, ()),
+            )
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["attempts"][0]["attempt_id"], "a1")
+            self.assertFalse(report["npm_publish_allowed"])
+            self.assertTrue(report["npm_publication_prohibited"])
+            self.assertIn("Do not publish to npm.", report["prohibitions"])
+
+    def test_dry_run_mode_switch_does_not_send_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = MockBackend(tab_response={
+                "ok": True,
+                "error": "",
+                "hist": "Plan · Ox Alpha\nPlano pronto. Aprove para eu sair do modo plano.",
+            })
+            monitor = terminal_monitor.TerminalMonitor(
+                terminal_monitor.MonitorConfig(
+                    process="opencode",
+                    profile="opencode",
+                    continue_text="Prossiga",
+                    idle_seconds=0.0,
+                    cooldown_seconds=0.0,
+                    dry_run=True,
+                    state_dir=directory,
+                ),
+                backend=backend,
+            )
+            code, message = monitor.step()
+        self.assertEqual(code, 0)
+        self.assertIn("DRY_RUN", message)
+        self.assertEqual(backend.sent_keys, [])
+
+    def test_dry_run_permission_does_not_send_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = MockBackend(tab_response={
+                "ok": True,
+                "error": "",
+                "hist": "Permission required\nAllow once\nDeny",
+            })
+            monitor = terminal_monitor.TerminalMonitor(
+                terminal_monitor.MonitorConfig(
+                    process="opencode",
+                    profile="opencode",
+                    auto_allow_permissions=True,
+                    idle_seconds=0.0,
+                    cooldown_seconds=0.0,
+                    dry_run=True,
+                    state_dir=directory,
+                ),
+                backend=backend,
+            )
+            code, message = monitor.step()
+        self.assertEqual(code, 0)
+        self.assertIn("DRY_RUN", message)
+        self.assertEqual(backend.sent_payloads, [])
+
+    def test_merge_pr_command_is_available(self):
+        parser = terminal_monitor.build_parser()
+        args = parser.parse_args(["merge-pr", "--pr", "7", "--head", "a" * 40, "--dry-run"])
+        self.assertEqual(args.command, "merge-pr")
+        self.assertEqual(args.pr, 7)
+        self.assertTrue(args.dry_run)
+
+    def test_monitor_step_persists_attempts_in_task_and_status_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status_path = pathlib.Path(directory) / "status.json"
+            backend = MockBackend(tab_response={"ok": True, "error": "", "hist": "Ready for next task."})
+            monitor = terminal_monitor.TerminalMonitor(
+                terminal_monitor.MonitorConfig(
+                    process="opencode",
+                    profile="opencode",
+                    continue_text="Continue safely",
+                    idle_seconds=0.0,
+                    cooldown_seconds=0.0,
+                    smart_nudges=False,
+                    state_dir=directory,
+                    status_json_path=str(status_path),
+                ),
+                backend=backend,
+            )
+            code, message = monitor.step()
+            self.assertIsNone(code)
+            self.assertIn("SENT", message)
+            statuses = [item["status"] for item in monitor.task_state.attempts]
+            self.assertEqual(statuses, ["queued", "sent", "accepted"])
+            exported = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual(exported["attempts"][-1]["status"], "accepted")
+
+    def test_monitor_marks_accepted_attempt_completed_after_new_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = MockBackend(tab_response={"ok": True, "error": "", "hist": "Ready for next task."})
+            monitor = terminal_monitor.TerminalMonitor(
+                terminal_monitor.MonitorConfig(
+                    process="opencode",
+                    profile="opencode",
+                    continue_text="Continue safely",
+                    idle_seconds=0.0,
+                    cooldown_seconds=0.0,
+                    smart_nudges=False,
+                    state_dir=directory,
+                ),
+                backend=backend,
+            )
+            monitor.step()
+            backend.tab_response["hist"] = "Ready for next task.\nAgent started the next task."
+            monitor.step()
+            statuses = [item["status"] for item in monitor.task_state.attempts]
+        self.assertIn("completed", statuses)
+
+    def test_manual_npm_publication_answer_is_blocked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pathlib.Path(directory, "answer.txt").write_text("npm publish\n", encoding="utf-8")
+            backend = MockBackend(tab_response={"ok": True, "error": "", "hist": "Ready for input."})
+            monitor = terminal_monitor.TerminalMonitor(
+                terminal_monitor.MonitorConfig(
+                    process="opencode",
+                    profile="opencode",
+                    state_dir=directory,
+                    cooldown_seconds=0.0,
+                ),
+                backend=backend,
+            )
+            code, message = monitor.step()
+        self.assertEqual(code, 3)
+        self.assertIn("policy_conflict", message)
+        self.assertEqual(backend.sent_payloads, [])
+
+    def test_supervised_monitor_pauses_on_dirty_protected_branch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = MockBackend()
+            dirty_main = terminal_monitor.GitStatus(is_repo=True, branch="main", dirty=True, modified_count=1)
+            config = terminal_monitor.MonitorConfig(
+                process="opencode",
+                profile="opencode",
+                supervise=True,
+                expected_branch="codex/work",
+                state_dir=directory,
+            )
+            with mock.patch.object(terminal_monitor, "get_git_status", return_value=dirty_main), mock.patch.object(
+                terminal_monitor, "capture_safety_baseline", return_value={"safetyBaselineCaptured": True}
+            ), mock.patch.object(terminal_monitor, "get_current_pr_snapshot", return_value=None), mock.patch.object(
+                terminal_monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()
+            ):
+                monitor = terminal_monitor.TerminalMonitor(config, backend=backend)
+                code, message = monitor.step()
+            self.assertEqual(code, 3)
+            self.assertIn("repository_safety", message)
+
+    def test_supervision_baselines_current_branch_and_pauses_after_branch_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = MockBackend()
+            feature = terminal_monitor.GitStatus(is_repo=True, branch="codex/work")
+            switched = terminal_monitor.GitStatus(is_repo=True, branch="main")
+            config = terminal_monitor.MonitorConfig(
+                process="opencode",
+                profile="opencode",
+                supervise=True,
+                state_dir=directory,
+            )
+            with mock.patch.object(terminal_monitor, "get_git_status", side_effect=[feature, switched, switched]), mock.patch.object(
+                terminal_monitor, "capture_safety_baseline", return_value={"safetyBaselineCaptured": True}
+            ), mock.patch.object(terminal_monitor, "get_current_pr_snapshot", return_value=None), mock.patch.object(
+                terminal_monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()
+            ):
+                monitor = terminal_monitor.TerminalMonitor(config, backend=backend)
+                code, message = monitor.step()
+        self.assertEqual(code, 3)
+        self.assertIn("repository_safety", message)
+
     def test_session_tracker_rejects_completion_from_before_latest_interaction(self):
         tracker = terminal_monitor.SessionTracker()
         old = "All tasks complete.\nReady for input."
