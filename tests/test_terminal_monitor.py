@@ -1016,13 +1016,35 @@ class SupervisorV2Tests(unittest.TestCase):
             ("git", "rev-parse", "origin/main"): (0, "def", ""),
             ("git", "status", "--porcelain"): (0, "", ""),
             ("git", "tag", "--list"): (0, "", ""),
-            ("pgrep", "-af", "(?:npm|pnpm|yarn).*publish"): (1, "", ""),
+            ("pgrep", "-af", "(?:^|/)(?:npm|pnpm|yarn)(?:\\s|$)"): (1, "", ""),
         }
         with mock.patch.object(terminal_monitor, "run_command", side_effect=lambda cmd, cwd=None: commands.get(tuple(cmd), (1, "", ""))), mock.patch(
             "shutil.which", return_value=None
         ):
             evidence = terminal_monitor.collect_final_evidence(".", state)
         self.assertFalse(evidence["no_new_tag_or_release"])
+
+    def test_final_evidence_ignores_monitor_args_that_mention_npm_publish(self):
+        state = terminal_monitor.TaskState(pr={"safetyBaselineCaptured": True, "tagsBefore": [], "releasesBefore": []})
+        commands = {
+            ("git", "rev-parse", "HEAD"): (0, "def", ""),
+            ("git", "rev-parse", "main"): (0, "def", ""),
+            ("git", "rev-parse", "origin/main"): (0, "def", ""),
+            ("git", "status", "--porcelain"): (0, "", ""),
+            ("git", "tag", "--list"): (0, "", ""),
+            ("pgrep", "-af", "(?:^|/)(?:npm|pnpm|yarn)(?:\\s|$)"): (
+                0,
+                "70135 python terminal_monitor.py --prohibition Do not publish to npm",
+                "",
+            ),
+        }
+        with mock.patch.object(
+            terminal_monitor,
+            "run_command",
+            side_effect=lambda cmd, cwd=None: commands.get(tuple(cmd), (1, "", "")),
+        ), mock.patch("shutil.which", return_value=None):
+            evidence = terminal_monitor.collect_final_evidence(".", state)
+        self.assertTrue(evidence["no_publish_process"])
 
     def test_change_waiter_returns_when_fingerprint_changes(self):
         values = iter(["same", "same", "changed"])
