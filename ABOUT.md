@@ -102,6 +102,26 @@ Different AI agents use distinct visual conventions in the terminal:
   history, and masks common tokens, API keys, passwords, Bearer credentials, and
   GitHub tokens before writing inspection or attention artifacts.
 
+### 14. Web command center contract
+
+The continuous monitor owns a localhost-only web server. It serves the static
+dark console and three read-only JSON resources: a projected `/api/status`, a
+redacted `/api/events` tail, and a bounded redacted `/api/terminal` snapshot.
+The projection intentionally omits prompts, attempt payloads, configured
+prohibitions, policy actions, and child command text even though the supervisor
+keeps the full audit data in its permission-restricted state directory.
+
+Startup is lifecycle-safe: invalid ports are rejected before the loop begins,
+occupied ports fall back to an ephemeral localhost port, and a failed web
+startup releases its partial server and monitor lock instead of killing or
+blocking the monitored agent. The event log rotates once it reaches 2 MiB.
+
+Loop recovery is also lifecycle-safe. The supervisor verifies ancestry before
+signalling, protects every root PID, waits for descendants to exit after
+`SIGINT`, escalates each remaining tree to `SIGTERM`, and refuses to send a
+replacement prompt while a child is still running. A persisted queue timestamp
+uses UTC wall time when a monotonic clock value belongs to a previous boot.
+
 ---
 
 ## 👥 Authors & Community

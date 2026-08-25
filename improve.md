@@ -91,7 +91,8 @@ usar o supervisor em um projeto novo.
 
 ## Implementação desta rodada
 
-As cinco melhorias priorizadas a partir do uso real foram implementadas:
+As cinco melhorias priorizadas a partir do uso real e o hardening observado na
+revisão do command center foram implementados:
 
 - desligamento por sinal com heartbeat final, PID lock e detecção de estado
   obsoleto;
@@ -101,6 +102,9 @@ As cinco melhorias priorizadas a partir do uso real foram implementadas:
 - command center web escuro com snapshot de terminal redigido, status sem
   prompts/comandos e inicialização que libera o lock mesmo quando a porta
   escolhida não pode ser usada;
+- documentação operacional dos endpoints `/api/status`, `/api/events` e
+  `/api/terminal`, dos arquivos de estado redigidos/rotacionados e do ciclo
+  `SIGINT` → espera → `SIGTERM` da recuperação de loops;
 - comandos `stop`, `status` e `resume` que nunca sinalizam o processo do
   agente;
 - testes de regressão e documentação no README/ABOUT para o novo ciclo de vida.

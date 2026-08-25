@@ -184,6 +184,37 @@ python3 terminal_monitor.py merge-pr --pr 42 --head <full-40-character-head-sha>
 
 `interrupt-child` refuses the root agent PID and any PID outside its descendant tree. For a verified child it signals the complete subtree deepest-first, avoiding orphaned test runners and wrappers. `restart-agent` executes an argument vector directly without a shell. For a non-OpenCode CLI, use `--agent-command` when its continuation syntax differs.
 
+### 8. Local web command center
+
+Every continuous run (`supervise` or the regular monitor without `--once`) starts
+the dark command center on `127.0.0.1`. The chosen `web_port` is used when it is
+available; a busy port falls back to an ephemeral localhost port and the URL is
+recorded in `status.json`. Use `--no-web-ui` to disable the server or
+`--no-web-open` to keep the server running without opening a browser.
+
+The read-only HTTP surface is deliberately smaller than the local state files:
+
+| Endpoint | Contents |
+|---|---|
+| `/` | Dark, color-coded operations console with live cards and terminal panes |
+| `/api/status` | Safe projection of state, Git, task progress, CI stage and attempt status |
+| `/api/events` | Last 400 event lines with credentials and free-form payloads redacted |
+| `/api/terminal` | Last bounded terminal snapshot after credential masking |
+
+Prompts, attempt payloads, child commands, configured prohibitions and policy
+actions are not returned by the HTTP projection. The files remain local and are
+written with restrictive permissions; `monitor.log` rotates to `monitor.log.1`
+when it reaches the 2 MiB bound. The terminal snapshot is written to
+`terminal-snapshot.txt` and is limited to the same 6,000-character inspection
+bound.
+
+When the loop guard identifies a repeated test/build episode, it signals only
+verified descendants. It sends `SIGINT`, waits up to
+`loop_interrupt_wait_seconds` (default `2.0`), escalates each still-running
+descendant tree to `SIGTERM`, and waits again. If any child remains alive, the
+monitor stops with `ATTENTION_REQUIRED` and does not inject a prompt. The agent
+root PID and its terminal session are never recovery targets.
+
 ---
 
 ## 📦 Project Configuration
@@ -231,6 +262,7 @@ python3 terminal_monitor.py init --format toml -o .terminal-monitor.toml
   "loop_repeat_limit": 3,
   "queued_attempt_seconds": 45.0,
   "allow_history_rewrite": false,
+  "loop_interrupt_wait_seconds": 2.0,
   "web_ui": true,
   "web_port": 8765,
   "web_open_browser": true,
@@ -438,6 +470,13 @@ failure requiring a fix.
 - `SIGINT` and `SIGTERM` now write a final heartbeat with
   `lifecycle: "stopped"`; consumers should use `monitor_alive`/stale
   detection instead of trusting an old `running` value.
+- `web_ui`, `web_port`, `web_open_browser` and `loop_interrupt_wait_seconds`
+  control the command center and loop containment. The generated JSON/TOML
+  templates include these fields; `web_port` accepts only `0..65535`, where `0`
+  requests an ephemeral port.
+- `terminal-snapshot.txt` is the redacted dashboard feed and `monitor.log.1`
+  is the single rotated event-log archive. Consumers should use `/api/status`
+  rather than exposing `status.json` directly when serving a UI.
 - `--dry-run` never sends terminal text or keys, starts an agent, or merges a
   PR. `merge-pr --dry-run` only prints the planned exact-head action.
 - A malformed `task-state.json` stops initialization with `StateFileError` instead of silently discarding safety policy.

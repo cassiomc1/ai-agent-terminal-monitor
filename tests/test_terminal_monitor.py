@@ -1263,7 +1263,9 @@ class SupervisorV2Tests(unittest.TestCase):
             )
             monitor.loop_assessment = terminal_monitor.LoopAssessment(True, "repeated_expensive_command_without_progress", ("full-test-suite",), 3)
             activity = terminal_monitor.ProcessActivity(expensive_roots=(200,), direct_descendants=(200,), commands=("npm test",))
-            with mock.patch.object(terminal_monitor, "interrupt_process_tree", return_value=True) as interrupt:
+            with mock.patch.object(terminal_monitor, "interrupt_process_tree", return_value=True) as interrupt, mock.patch.object(
+                terminal_monitor, "process_is_running", return_value=False
+            ):
                 recovered, detail = monitor._recover_agent_loop([100], activity, "thinking")
             self.assertTrue(recovered)
             self.assertIn("interrupted=200", detail)
