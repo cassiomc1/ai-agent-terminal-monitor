@@ -39,6 +39,8 @@ except ImportError:  # pragma: no cover
     except ImportError:
         tomllib = None
 
+__version__ = "1.1.0"
+
 
 # ---------------------------------------------------------------------------
 # Default Safety and Decision Rules
@@ -725,8 +727,9 @@ def classify_action_risk(action: str, *, npm_publish_allowed: bool = False) -> s
 class PullRequestStateMachine:
     """Map GitHub PR/check snapshots to an actionable supervision stage."""
 
-    stage = "TASK_RECEIVED"
-    seen_pr_number: int | None = None
+    def __init__(self) -> None:
+        self.stage = "TASK_RECEIVED"
+        self.seen_pr_number: int | None = None
 
     def advance(self, pr: dict[str, Any] | None) -> str:
         if not pr or not pr.get("number"):
@@ -2899,6 +2902,9 @@ def _public_event_line(line: str) -> str:
     return re.sub(r"\b(?:payload|prompt)=.*$", lambda match: match.group(0).split("=", 1)[0] + "=<redacted>", redacted, flags=re.IGNORECASE)
 
 
+WEB_POST_BODY_LIMIT_BYTES = 64 * 1024
+
+
 DASHBOARD_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Agent Command Center — Architecture & Verification Pipeline</title><style>
@@ -3286,11 +3292,13 @@ class MonitorWebServer:
         snapshot_path: str = "",
         *,
         answer_path: str = "",
+        state_root: str = "/tmp/terminal-monitor",
     ) -> None:
         self.status_path = status_path
         self.log_path = log_path
         self.snapshot_path = snapshot_path
         self.answer_path = answer_path
+        self.state_root = str(state_root)
         self.port = validate_web_port(port)
         self.httpd: ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
@@ -3325,7 +3333,7 @@ class MonitorWebServer:
                     self._reply(200, "application/json", json.dumps({"snapshot": snapshot}).encode())
                 elif self.path == "/api/instances":
                     instances = []
-                    base_dir = Path("/tmp/terminal-monitor")
+                    base_dir = Path(owner.state_root)
                     if base_dir.exists():
                         for p in base_dir.iterdir():
                             if p.is_dir() and (p / "status.json").exists():
@@ -3386,6 +3394,9 @@ class MonitorWebServer:
                 if self.path in ("/api/send", "/api/answer"):
                     try:
                         length = int(self.headers.get("Content-Length", 0))
+                        if length > WEB_POST_BODY_LIMIT_BYTES:
+                            self._reply(413, "application/json", b'{"ok":false,"error":"payload too large"}')
+                            return
                         body = self.rfile.read(length).decode("utf-8")
                         data = json.loads(body) if body else {}
                         action = str(data.get("action", "answer")).strip()
@@ -3428,6 +3439,7 @@ class MonitorWebServer:
         self.thread = threading.Thread(target=self.httpd.serve_forever, name="terminal-monitor-web", daemon=True)
         self.thread.start()
         return f"http://127.0.0.1:{self.port}/"
+
     def stop(self) -> None:
         if self.httpd:
             self.httpd.shutdown()
@@ -4534,6 +4546,7 @@ class TerminalMonitor:
                         self.config.web_port,
                         self.terminal_snapshot_path,
                         answer_path=self.answer_path,
+                        state_root=str(Path(self.state_dir).parent),
                     )
                     self.web_url = self.web_server.start()
                     self.log(f"WEB_UI url={self.web_url}")
@@ -4623,6 +4636,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         allow_abbrev=False,
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     # Subcommands
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")

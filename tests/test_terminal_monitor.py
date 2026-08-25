@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 import urllib.request
 from unittest import mock
 
@@ -1607,9 +1608,17 @@ class SupervisorV2Tests(unittest.TestCase):
 
 
     def test_send_desktop_notification_and_webhook(self):
-        with mock.patch("subprocess.Popen") as mock_popen:
+        # Force the macOS branch so the assertion does not depend on
+        # notify-send being installed on Linux CI runners.
+        with mock.patch("subprocess.Popen") as mock_popen, mock.patch("sys.platform", "darwin"):
             ok = terminal_monitor.send_desktop_notification("Test Alert", "Sample message")
             self.assertTrue(ok)
+            mock_popen.assert_called()
+
+        with mock.patch("subprocess.Popen") as mock_popen, mock.patch(
+            "sys.platform", "linux"
+        ), mock.patch("shutil.which", return_value="/usr/bin/notify-send"):
+            self.assertTrue(terminal_monitor.send_desktop_notification("Test Alert", "Sample message"))
             mock_popen.assert_called()
 
         with mock.patch("urllib.request.urlopen"):
@@ -1685,6 +1694,77 @@ class SupervisorV2Tests(unittest.TestCase):
         args = parser.parse_args(["status", "--project-dir", "/tmp/my-test-proj"])
         cfg = terminal_monitor.config_from_args(args)
         self.assertIn("/tmp/terminal-monitor/my-test-proj-", cfg.state_dir)
+
+    def test_pr_state_machine_instances_are_isolated(self):
+        first = terminal_monitor.PullRequestStateMachine()
+        second = terminal_monitor.PullRequestStateMachine()
+        self.assertEqual(first.advance({"number": 7, "state": "OPEN", "checks": []}), "PR_CREATED")
+        self.assertEqual(second.stage, "TASK_RECEIVED")
+        self.assertIsNone(second.seen_pr_number)
+        self.assertEqual(first.stage, "PR_CREATED")
+        self.assertEqual(first.seen_pr_number, 7)
+
+    def test_pr_state_machine_stage_restored_from_persisted_state(self):
+        machine = terminal_monitor.PullRequestStateMachine()
+        machine.stage = "CI_GREEN"
+        machine.seen_pr_number = 9
+        self.assertEqual(machine.advance({"number": 9, "state": "OPEN", "checks": [{"conclusion": "success"}]}), "CI_GREEN")
+
+    def test_web_server_instances_api_uses_configured_state_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory, "custom-state-root")
+            instance_dir = root / "project-abc123"
+            instance_dir.mkdir(parents=True)
+            (instance_dir / "status.json").write_text(
+                json.dumps({"state": "thinking", "process": "opencode", "running": True}),
+                encoding="utf-8",
+            )
+            status_path = pathlib.Path(directory, "status.json")
+            log_path = pathlib.Path(directory, "monitor.log")
+            server = terminal_monitor.MonitorWebServer(str(status_path), str(log_path), port=0, state_root=str(root))
+            url = server.start()
+            try:
+                resp = json.loads(urllib.request.urlopen(url + "api/instances", timeout=2).read())
+            finally:
+                server.stop()
+            self.assertEqual(len(resp["instances"]), 1)
+            self.assertEqual(resp["instances"][0]["id"], "project-abc123")
+            self.assertEqual(resp["instances"][0]["state"], "thinking")
+
+    def test_web_server_rejects_oversized_post_body(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status_path = pathlib.Path(directory, "status.json")
+            log_path = pathlib.Path(directory, "monitor.log")
+            answer_path = pathlib.Path(directory, "answer.txt")
+            server = terminal_monitor.MonitorWebServer(
+                str(status_path), str(log_path), port=0, answer_path=str(answer_path)
+            )
+            url = server.start()
+            try:
+                req = urllib.request.Request(
+                    url + "api/send",
+                    data=json.dumps({"action": "answer", "payload": "x" * (terminal_monitor.WEB_POST_BODY_LIMIT_BYTES + 1)}).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                try:
+                    urllib.request.urlopen(req, timeout=2)
+                    self.fail("expected HTTPError")
+                except urllib.error.HTTPError as exc:
+                    self.assertEqual(exc.code, 413)
+                    exc.close()
+                self.assertFalse(answer_path.exists())
+            finally:
+                server.stop()
+
+    def test_version_flag_reports_package_version(self):
+        result = subprocess.run(
+            [sys.executable, str(MODULE_PATH), "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(terminal_monitor.__version__, result.stdout)
 
 
 if __name__ == "__main__":
