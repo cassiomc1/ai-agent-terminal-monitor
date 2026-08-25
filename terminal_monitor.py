@@ -2188,7 +2188,8 @@ def _monitor_process_matches(pid: int | str | None, state_dir: str | Path) -> bo
     if code != 0:
         return False
     command = output.lower()
-    return "terminal_monitor.py" in command and str(Path(state_dir).resolve()).lower() in command
+    state_candidates = {str(Path(state_dir)).lower(), str(Path(state_dir).resolve()).lower()}
+    return "terminal_monitor.py" in command and any(candidate in command for candidate in state_candidates)
 
 
 def stop_monitor(state_dir: str | Path, *, reason: str = "cli_stop") -> dict[str, Any]:
@@ -2223,10 +2224,10 @@ def resume_monitor(state_dir: str | Path, *, project_dir: str = ".") -> dict[str
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         return {"ok": False, "action": "resume", "error": f"launch metadata unavailable: {exc}"}
     command = [str(item) for item in metadata.get("command", [])] if isinstance(metadata, dict) else []
-    resolved_state = str(state_path.resolve()).lower()
+    state_candidates = {str(state_path).lower(), str(state_path.resolve()).lower()}
     command_text = " ".join(command).lower()
     trusted_entrypoint = "terminal_monitor.py" in command_text or "supervisor.py" in command_text
-    if not command or not trusted_entrypoint or ("supervise" not in command_text and "--supervise" not in command_text) or resolved_state not in command_text:
+    if not command or not trusted_entrypoint or ("supervise" not in command_text and "--supervise" not in command_text) or not any(candidate in command_text for candidate in state_candidates):
         return {"ok": False, "action": "resume", "error": "refusing untrusted monitor launch metadata"}
     with contextlib.suppress(OSError):
         (state_path / "stop").unlink()
