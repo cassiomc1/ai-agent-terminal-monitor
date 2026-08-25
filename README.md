@@ -63,13 +63,17 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
 - 🧾 **Task Summary Reconciliation**: Prefers an affirmative agent summary such as `35/35 COMPLETE` over stale checklist markers left by an overlaid TUI Todo pane, while rejecting question-shaped text as completion evidence.
 - 🧭 **Session Generations**: Separates terminal scrollback from the current interaction and rejects stale completion evidence after new work is assigned.
 - ⚙️ **Real Process Activity**: Observes descendant commands, command age and CPU data, preventing a quiet terminal from being treated as stalled while tests or builds are still running.
+- 🔂 **Agent Loop Guard**: Detects expensive commands relaunched repeatedly without task or Git progress, duplicate full test/build roots running concurrently, and monitored Git history rewrites. A changed task count, worktree, or commit resets the repetition counter; recoverable command loops are contained in-session while unsafe mutations pause for attention.
+- 🧯 **In-session Loop Recovery**: For repeated test/build loops, interrupts only verified expensive child trees, keeps the root agent session alive, and sends a corrective prompt that requires targeted diagnosis before another full-suite run. Unsafe history rewrites still fail closed for human attention.
 - 🧾 **Idempotent Attempt Ledger**: Persists `queued → sent → accepted → completed` (or `ignored`) events with IDs, timestamps, prompts, and observed states so queued continuations survive restarts without being duplicated blindly.
+- 📨 **Visible Queue Protection**: Treats a terminal `QUEUED` marker as delivery still pending, suppresses duplicate nudges, and raises attention when the queue remains stuck beyond the configured timeout.
 - 📜 **Durable Policy Envelope**: Stores the objective, prohibitions, task ID, required outcome, current stage, PR metadata, and session ID in `task-state.json`. Smart nudges are wrapped in permanent policy and cannot override an npm-publication prohibition.
 - 🔁 **Native PR/CI Lifecycle**: Tracks `PR_CREATED → CI_PENDING → FIX_REQUIRED` or `CI_RETRY_REQUIRED → CI_GREEN → POST_MERGE_VERIFY`; checks are classified as `passed`, `failed`, `cancelled-infra`, or `failed-external` before retry decisions.
 - 🔒 **Exact-Head Merge Gate**: `merge-pr` re-queries the full PR head SHA and every check immediately before calling `gh pr merge --match-head-commit`; changed heads, pending checks, cancellations, and failures fail closed.
 - ✅ **Final-State Verifier**: Verifies merged PR, checks for the exact PR head, synchronized clean `main`, unchanged npm registry state, no new tag/release, and no active publish process.
 - 🔍 **Refined Question vs Table Disambiguation**: Excludes Markdown/Unicode summary tables and code blocks from option parsing, eliminating false-positive dialog loops.
 - 📊 **Real-time Status JSON Export**: Continuously exports live structured JSON (`status.json`) with PIDs, state, mode, git details, uptime, and send counts for IDE or dashboard integrations.
+- 🖥️ **Automatic Web Command Center**: Every continuous monitor starts a localhost-only dark operations console, opens it in the browser, and streams color-coded lifecycle, safety, process, Git, task, and attempt events. The visual system uses a black glass shell, compact terminal typography, orange telemetry, and semantic status colors inspired by the referenced Evreghen Command Center.
 - 🧭 **Branch and Worktree Safety**: Reports expected branch, protected-branch dirtiness, attempt history, CI evidence, policy decisions, and pauses supervised work when repository safety is violated.
 - 🎯 **Stable Tab Targeting**: Prefers an exact custom Terminal.app tab title before the application suffix in a window name, avoiding cross-talk between neighboring OpenCode sessions.
 - 📝 **Structured Final Reports**: Writes `final-report.json` with verification evidence, CI classifications, continuation attempts, policy decisions, the explicit npm prohibition, and the npm-publication invariant.
@@ -161,7 +165,7 @@ python3 terminal_monitor.py resume --state-dir /tmp/terminal-monitor --project-d
 # Explicit operator message; this also outranks a visible "thinking" spinner
 python3 terminal_monitor.py send "Resume the remaining work" --profile opencode
 
-# Interrupt only PID 43210 when it is verified as a descendant of the agent
+# Interrupt PID 43210 and its descendants when it belongs to the agent
 python3 terminal_monitor.py interrupt-child --pid 43210 --profile opencode
 
 # Restart and continue the session saved in task-state.json
@@ -178,7 +182,7 @@ python3 terminal_monitor.py merge-pr --pr 42 --head <full-40-character-head-sha>
 python3 terminal_monitor.py merge-pr --pr 42 --head <full-40-character-head-sha> --dry-run
 ```
 
-`interrupt-child` refuses the root agent PID and any PID outside its descendant tree. `restart-agent` executes an argument vector directly without a shell. For a non-OpenCode CLI, use `--agent-command` when its continuation syntax differs.
+`interrupt-child` refuses the root agent PID and any PID outside its descendant tree. For a verified child it signals the complete subtree deepest-first, avoiding orphaned test runners and wrappers. `restart-agent` executes an argument vector directly without a shell. For a non-OpenCode CLI, use `--agent-command` when its continuation syntax differs.
 
 ---
 
@@ -223,6 +227,13 @@ python3 terminal_monitor.py init --format toml -o .terminal-monitor.toml
   "protected_branches": ["main", "master"],
   "report_path": "/tmp/terminal-monitor/final-report.json",
   "attempt_history_limit": 100,
+  "loop_guard": true,
+  "loop_repeat_limit": 3,
+  "queued_attempt_seconds": 45.0,
+  "allow_history_rewrite": false,
+  "web_ui": true,
+  "web_port": 8765,
+  "web_open_browser": true,
   "unsafe_phrases": [
     "bypass",
     "delete",

@@ -81,6 +81,13 @@ Um modo `--dry-run` deve mostrar qual ação o monitor tomaria, sem enviar tecla
 aprovar permissões ou alterar o GitHub. Isso facilita validar políticas antes de
 usar o supervisor em um projeto novo.
 
+## Protecoes operacionais implementadas
+
+- O ledger diferencia entrega aceita de mensagem ainda visivelmente `QUEUED`, impede reenvio duplicado e escala filas vencidas para atencao humana.
+- O supervisor detecta suites/builds caros duplicados, repeticoes sem progresso observavel e comandos de reescrita de historico Git.
+- A interrupcao validada encerra a arvore inteira do comando, dos descendentes mais profundos ao processo solicitado, sem sinalizar o agente raiz.
+- As deteccoes sao exportadas no status estruturado e podem ser ajustadas por configuracao, mantendo defaults fail-closed.
+
 ## Implementação desta rodada
 
 As cinco melhorias priorizadas a partir do uso real foram implementadas:
