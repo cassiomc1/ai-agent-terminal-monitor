@@ -2079,6 +2079,48 @@ class GitStatus:
     modified_files: tuple[str, ...] = ()
 
 
+def discover_agent_project_dir(pids: list[int] | tuple[int, ...] | set[int]) -> str | None:
+    """Discover the working directory of a running agent process via lsof or /proc."""
+    for pid in pids:
+        try:
+            # macOS / Unix lsof
+            proc = subprocess.run(
+                ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+            if proc.returncode == 0:
+                for line in proc.stdout.splitlines():
+                    if line.startswith("n"):
+                        candidate = line[1:].strip()
+                        if candidate and os.path.isdir(candidate):
+                            return candidate
+            # Linux /proc/<pid>/cwd
+            proc_cwd = Path(f"/proc/{pid}/cwd")
+            if proc_cwd.exists():
+                resolved = str(proc_cwd.resolve())
+                if os.path.isdir(resolved):
+                    return resolved
+        except Exception:
+            continue
+    return None
+
+
+def resolve_project_state_dir(base_state_dir: str, project_dir: str) -> str:
+    """Isolate monitor state and logs per project directory."""
+    try:
+        resolved_proj = str(Path(project_dir).resolve())
+    except Exception:
+        resolved_proj = str(project_dir)
+    proj_hash = hashlib.sha256(resolved_proj.encode("utf-8")).hexdigest()[:10]
+    proj_name = Path(resolved_proj).name or "project"
+    scoped_dir = Path(base_state_dir, f"{proj_name}-{proj_hash}")
+    scoped_dir.mkdir(parents=True, exist_ok=True)
+    return str(scoped_dir)
+
+
 GIT_STATUS_TTL_SECONDS = 30.0
 _GIT_STATUS_CACHE: dict[str, tuple[float, GitStatus]] = {}
 
@@ -2275,6 +2317,40 @@ def _explicit_todo_completion(history: str, marker_total: int) -> dict[str, Any]
     return None
 
 
+def find_full_task_titles(text: str) -> dict[str, str]:
+    """Extract full task titles from plan outlines or numbered lists in history."""
+    titles: dict[str, str] = {}
+    pattern = re.compile(
+        r"(?:^|\n)\s*(?:[-*•\d\.]+\s*)?(?:\b(?:Task|Tarefa)\s+(\d+)[:\s]+)(?P<title>[^\n\r\|┃│]{6,140})",
+        re.IGNORECASE,
+    )
+    for m in pattern.finditer(str(text)):
+        num = m.group(1)
+        title_text = m.group("title").strip().rstrip("+-: ,(")
+        if title_text and not title_text.endswith("-"):
+            full = f"Task {num}: {title_text}"
+            titles[f"task {num}"] = full
+            titles[f"task{num}"] = full
+    return titles
+
+
+def reconcile_task_labels(items: list[dict[str, str]], history: str) -> list[dict[str, str]]:
+    """Reconcile truncated TUI labels with full task descriptions found in history."""
+    full_titles = find_full_task_titles(history)
+    if not full_titles:
+        return items
+    reconciled = []
+    for it in items:
+        lbl = it["label"]
+        m = re.search(r"\b(?:Task|Tarefa)\s+(\d+)\b", lbl, re.IGNORECASE)
+        if m:
+            key = f"task {m.group(1)}"
+            if key in full_titles:
+                lbl = full_titles[key]
+        reconciled.append({"label": lbl, "state": it["state"]})
+    return reconciled
+
+
 def extract_todo_progress(history: str, *, session_history: str = "") -> dict[str, Any]:
     """Extract task progress, preferring a current explicit summary to TUI markers."""
     raw_items = []
@@ -2318,7 +2394,7 @@ def extract_todo_progress(history: str, *, session_history: str = "") -> dict[st
         else:
             consolidated[norm_key] = {"label": lbl, "state": st}
 
-    ordered = list(consolidated.values())
+    ordered = reconcile_task_labels(list(consolidated.values()), history)
     counts = {
         "total": len(ordered),
         "completed": sum(item["state"] == "completed" for item in ordered),
@@ -2742,26 +2818,326 @@ def _public_event_line(line: str) -> str:
 
 DASHBOARD_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Agent Command Center</title><style>
-:root{color-scheme:dark;--orange:#fe6e00;--bg:#0b0908;--panel:rgba(25,22,20,.82);--line:rgba(255,255,255,.12);--text:#fafaf9;--muted:#b9b3ac;--green:#00c758;--yellow:#edb200;--red:#fb2c36;--blue:#3080ff}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 85% 0,rgba(254,110,0,.13),transparent 34%),var(--bg);color:var(--text);font:14px ui-sans-serif,system-ui,sans-serif;min-height:100vh}.shell{display:grid;grid-template-columns:230px 1fr;min-height:100vh}.side{padding:26px 20px;border-right:1px solid var(--line);background:rgba(0,0,0,.7);backdrop-filter:blur(18px)}.brand{font-weight:800;letter-spacing:.11em}.brand b{color:var(--orange)}.nav{margin-top:38px;color:var(--muted);line-height:2.8}.nav button{display:block;width:100%;padding:0 0 0 0;border:0;border-left:2px solid transparent;background:transparent;color:inherit;text-align:left;font:inherit;cursor:pointer}.nav button:hover{color:#fff}.nav button.active{color:#fff;border-left-color:var(--orange);padding-left:12px}.main{padding:28px;min-width:0}.top{display:flex;justify-content:space-between;align-items:end;margin-bottom:20px}.eyebrow{font:700 11px ui-monospace,monospace;color:var(--orange);letter-spacing:.15em}.top h1{font-size:27px;margin:6px 0 0}.live{font:700 11px ui-monospace,monospace;color:var(--green)}.live:before{content:'●';margin-right:7px}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}.card,.terminal,.detail{border:1px solid var(--line);background:var(--panel);backdrop-filter:blur(16px);border-radius:8px}.card{padding:15px}.label{font:700 10px ui-monospace,monospace;color:var(--muted);letter-spacing:.12em}.value{font-size:18px;font-weight:750;margin-top:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.accent{color:var(--orange)}.terminal{height:calc(100vh - 180px);min-height:430px;display:flex;flex-direction:column}.terminal-head{padding:12px 15px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;font:700 11px ui-monospace,monospace}.dots{color:var(--orange);letter-spacing:4px}.log{padding:16px;overflow:auto;white-space:pre-wrap;word-break:break-word;font:13px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace;flex:1}.line{color:var(--muted)}.line.info{color:var(--blue)}.line.ok{color:var(--green)}.line.warn{color:var(--yellow)}.line.bad{color:var(--red)}.line.action{color:var(--orange)}.empty{color:#797067}.view[hidden]{display:none}.detail{padding:18px;min-height:300px}.detail h2{font-size:18px;margin:0 0 16px}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.detail-row{padding:12px;border:1px solid var(--line);border-radius:6px;color:var(--muted)}.detail-row b{display:block;color:var(--text);margin-top:5px}.detail-list{margin:0;padding:0;list-style:none}.detail-list li{padding:10px 0;border-bottom:1px solid var(--line);font:13px/1.5 ui-monospace,monospace;color:var(--muted)}.detail-list li:last-child{border-bottom:0}@media(max-width:850px){.shell{grid-template-columns:1fr}.side{display:none}.cards{grid-template-columns:repeat(2,1fr)}.main{padding:18px}.terminal{height:calc(100vh - 230px)}.detail-grid{grid-template-columns:1fr}}
-</style></head><body><div class="shell"><aside class="side"><div class="brand"><b>◉</b> AGENT // CENTER</div><nav class="nav" aria-label="Dashboard views"><button class="active" type="button" data-view="live" aria-selected="true">Live Operations</button><button type="button" data-view="tasks" aria-selected="false">Task Plan</button><button type="button" data-view="process" aria-selected="false">Process Activity</button><button type="button" data-view="safety" aria-selected="false">Safety Events</button><button type="button" data-view="attempts" aria-selected="false">Attempt Ledger</button></nav></aside><main class="main"><div class="top"><div><div class="eyebrow">AUTONOMOUS OPERATIONS CONSOLE</div><h1>Terminal Monitor</h1></div><div class="live" id="connection">LIVE</div></div><section class="view" data-view-panel="live"><section class="cards"><div class="card"><div class="label">AGENT STATE</div><div class="value accent" id="state">—</div></div><div class="card"><div class="label">PROCESS</div><div class="value" id="process">—</div></div><div class="card"><div class="label">TASK PROGRESS</div><div class="value" id="progress">—</div></div><div class="card"><div class="label">GIT BRANCH</div><div class="value" id="branch">—</div></div></section><section class="terminal"><div class="terminal-head"><span>LIVE OPERATIONAL LOG</span><span class="dots">● ● ●</span></div><div class="log" id="log"><span class="empty">Waiting for monitor events…</span></div></section><section class="terminal snapshot-terminal" style="margin-top:14px;height:260px;min-height:160px"><div class="terminal-head"><span>AGENT TERMINAL SNAPSHOT (REDACTED)</span><span class="dots">◉</span></div><pre class="log" id="terminal"><span class="empty">Waiting for terminal output…</span></pre></section></section><section class="view" data-view-panel="tasks" hidden><div class="detail"><h2>Task Plan & Progress</h2><div class="detail-grid" style="grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:20px"><div class="detail-row">Total Tasks<b id="task-total">0</b></div><div class="detail-row">Completed<b id="task-completed" style="color:var(--green)">0</b></div><div class="detail-row">In Progress<b id="task-in-progress" style="color:var(--yellow)">0</b></div><div class="detail-row">Pending<b id="task-pending">0</b></div></div><h2 style="margin-top:24px">Detected Task Items</h2><ul class="detail-list" id="task-items"><li>Waiting for task data…</li></ul></div></section><section class="view" data-view-panel="process" hidden><div class="detail"><h2>Process Activity</h2><div class="detail-grid"><div class="detail-row">Agent<b id="process-agent">—</b></div><div class="detail-row">CPU<b id="process-cpu">—</b></div><div class="detail-row">Oldest command<b id="process-age">—</b></div><div class="detail-row">PIDs<b id="process-pids">—</b></div></div><h2 style="margin-top:24px">Current commands</h2><ul class="detail-list" id="process-commands"><li>Waiting for process data…</li></ul></div></section><section class="view" data-view-panel="safety" hidden><div class="detail"><h2>Safety Events</h2><ul class="detail-list" id="safety-list"><li>No safety events recorded.</li></ul></div></section><section class="view" data-view-panel="attempts" hidden><div class="detail"><h2>Attempt Ledger</h2><ul class="detail-list" id="attempt-list"><li>No continuation attempts recorded.</li></ul></div></section></main></div><script>
+<title>Agent Command Center — Architecture & Verification Pipeline</title><style>
+:root{
+  --paper-site:#0b0908;--paper-raised:#15181c;--paper-card:#1c2026;
+  --ink-site:#f8faf9;--ink-soft:#d2d7dc;--muted:#8e979d;--dim:#5c646a;
+  --line:rgba(255,255,255,0.12);--line-hi:rgba(255,255,255,0.24);
+  --accent-site:#fe6e00;--accent-soft:rgba(254,110,0,0.12);
+  --emerald:#00c758;--emerald-soft:rgba(0,199,88,0.12);
+  --yellow:#edb200;--red:#fb2c36;--blue:#3080ff;
+  --font-display:'Inter',-apple-system,BlinkMacSystemFont,system-ui,sans-serif;
+  --font-mono:ui-monospace,'JetBrains Mono',SFMono-Regular,Menlo,monospace;
+  --ease:cubic-bezier(.22,1,.36,1);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  background:radial-gradient(circle at 85% 0,rgba(254,110,0,.15),transparent 36%),var(--paper-site);
+  color:var(--ink-site);font:14px/1.5 var(--font-display);min-height:100vh;overflow-x:hidden;
+}
+.grid-bg{
+  position:fixed;inset:0;pointer-events:none;z-index:0;
+  background-image:linear-gradient(rgba(255,255,255,.03) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.03) 1px,transparent 1px);
+  background-size:48px 48px;mask-image:radial-gradient(ellipse 90% 60% at 50% 0%,black 15%,transparent 80%);
+}
+.shell{display:grid;grid-template-columns:240px 1fr;min-height:100vh;position:relative;z-index:1}
+.side{padding:26px 20px;border-right:1px solid var(--line);background:rgba(11,9,8,.85);backdrop-filter:blur(20px)}
+.brand{display:flex;align-items:center;gap:8px;font-weight:800;letter-spacing:.12em;font-size:14px;color:var(--ink-site)}
+.brand b{color:var(--accent-site);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.nav{margin-top:36px;display:flex;flex-direction:column;gap:6px}
+.nav button{
+  display:block;width:100%;padding:10px 12px;border:1px solid transparent;border-radius:6px;
+  background:transparent;color:var(--muted);text-align:left;font:500 13px var(--font-display);cursor:pointer;
+  transition:all .18s var(--ease);
+}
+.nav button:hover{color:var(--ink-site);background:rgba(255,255,255,.04)}
+.nav button.active{color:var(--ink-site);background:var(--paper-raised);border-color:var(--line);border-left:3px solid var(--accent-site)}
+.main{padding:30px 34px;min-width:0;display:flex;flex-direction:column;gap:20px}
+.top{display:flex;justify-content:space-between;align-items:flex-end}
+.lead-label{font:700 10px var(--font-mono);color:var(--accent-site);letter-spacing:.18em;text-transform:uppercase;margin-bottom:4px}
+.top h1{font-size:26px;font-weight:700;letter-spacing:-.02em}
+.live-badge{
+  display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border:1px solid var(--emerald);
+  border-radius:999px;background:var(--emerald-soft);color:var(--emerald);font:700 11px var(--font-mono);letter-spacing:.1em;
+}
+.live-badge.reconnecting{border-color:var(--yellow);color:var(--yellow);background:rgba(237,178,0,.1)}
+.live-badge:before{content:'';width:7px;height:7px;border-radius:50%;background:currentColor;animation:pulse 1.6s infinite}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+.card{padding:16px;border:1px solid var(--line);background:var(--paper-raised);border-radius:10px;backdrop-filter:blur(14px)}
+.card-label{font:600 10px var(--font-mono);color:var(--dim);letter-spacing:.14em;text-transform:uppercase}
+.card-value{font-size:20px;font-weight:750;margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.accent{color:var(--accent-site)}
+.action-bar{
+  display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;
+  border:1px solid var(--line-hi);background:var(--paper-raised);border-radius:10px;flex-wrap:wrap;
+}
+.action-pills{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.act-btn{
+  display:inline-flex;align-items:center;gap:6px;padding:7px 13px;border:1px solid var(--line);
+  border-radius:6px;background:var(--paper-site);color:var(--ink-soft);font:500 12px var(--font-display);
+  cursor:pointer;transition:all .18s var(--ease);
+}
+.act-btn:hover{color:var(--ink-site);border-color:var(--accent-site);transform:translateY(-1px)}
+.act-btn.primary{border-color:var(--emerald);color:var(--emerald);background:var(--emerald-soft)}
+.act-btn.primary:hover{background:var(--emerald);color:#000}
+.cmd-box{display:flex;align-items:center;gap:8px;flex:1;min-width:280px}
+.cmd-input{
+  flex:1;padding:7px 12px;border:1px solid var(--line);border-radius:6px;
+  background:var(--paper-site);color:var(--ink-site);font:12px var(--font-mono);outline:none;
+}
+.cmd-input:focus{border-color:var(--accent-site)}
+.cmd-submit{
+  padding:7px 14px;border:1px solid var(--accent-site);border-radius:6px;
+  background:var(--accent-site);color:#000;font:700 12px var(--font-display);cursor:pointer;transition:all .18s var(--ease);
+}
+.cmd-submit:hover{opacity:.9}
+.terminal{border:1px solid var(--line);background:var(--paper-raised);border-radius:10px;overflow:hidden;display:flex;flex-direction:column}
+.terminal-head{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;font:700 11px var(--font-mono)}
+.log{padding:16px;overflow:auto;white-space:pre-wrap;word-break:break-word;font:13px/1.65 var(--font-mono);flex:1;max-height:360px}
+.line{color:var(--muted)}.line.info{color:var(--blue)}.line.ok{color:var(--emerald)}.line.warn{color:var(--yellow)}.line.bad{color:var(--red)}.line.action{color:var(--accent-site)}
+.view[hidden]{display:none}
+
+/* Pipeline Architecture View */
+.pipeline{display:grid;grid-template-columns:repeat(6,1fr);gap:1px;background:var(--line);border:1px solid var(--line-hi);border-radius:10px;overflow:hidden;margin-bottom:18px}
+.pipe-step{padding:12px;background:var(--paper-raised);display:flex;flex-direction:column;gap:4px;position:relative}
+.pipe-step.active{background:rgba(254,110,0,.1);border-bottom:2px solid var(--accent-site)}
+.pipe-step.done{background:rgba(0,199,88,.05);border-bottom:2px solid var(--emerald)}
+.pipe-num{font:700 9px var(--font-mono);color:var(--dim);letter-spacing:.12em}
+.pipe-name{font:600 11px var(--font-mono);color:var(--ink-soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pipe-badge{font:700 9px var(--font-mono);color:var(--muted);margin-top:2px}
+.pipe-step.active .pipe-badge{color:var(--accent-site)}
+.pipe-step.done .pipe-badge{color:var(--emerald)}
+
+/* Task Filter & List */
+.filter-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:16px 0 12px;flex-wrap:wrap}
+.filter-pills{display:flex;gap:6px}
+.fpill{
+  padding:5px 11px;border:1px solid var(--line);border-radius:999px;background:transparent;
+  color:var(--muted);font:600 10px var(--font-mono);cursor:pointer;transition:all .18s var(--ease);
+}
+.fpill.active,.fpill:hover{color:var(--ink-site);border-color:var(--ink-site);background:var(--paper-raised)}
+.task-grid{display:grid;grid-template-columns:1fr;gap:8px}
+.task-card{
+  display:grid;grid-template-columns:46px 90px 1fr;align-items:center;gap:12px;padding:12px 16px;
+  border:1px solid var(--line);border-radius:8px;background:var(--paper-raised);transition:all .18s var(--ease);
+}
+.task-card:hover{border-color:var(--line-hi);transform:translateX(2px)}
+.task-idx{font:700 12px var(--font-mono);color:var(--dim)}
+.task-badge{
+  font:700 10px var(--font-mono);padding:3px 7px;border-radius:4px;border:1px solid currentColor;
+  text-align:center;letter-spacing:.08em;
+}
+.task-badge.DONE{color:var(--emerald);border-color:var(--emerald);background:var(--emerald-soft)}
+.task-badge.ACTIVE{color:var(--accent-site);border-color:var(--accent-site);background:var(--accent-soft);animation:pulse 2s infinite}
+.task-badge.TODO{color:var(--muted);border-color:var(--line)}
+.task-label{font-size:13px;color:var(--ink-site);font-weight:500}
+
+/* Detail Section */
+.detail{padding:22px;border:1px solid var(--line);border-radius:10px;background:var(--paper-raised)}
+.detail h2{font-size:18px;margin-bottom:14px;font-weight:600}
+.detail-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+.detail-row{padding:12px;border:1px solid var(--line);border-radius:6px;color:var(--muted)}
+.detail-row b{display:block;color:var(--ink-site);font-size:15px;margin-top:4px}
+.detail-list{list-style:none;margin-top:8px}
+.detail-list li{padding:10px 0;border-bottom:1px solid var(--line);font:12px/1.5 var(--font-mono);color:var(--muted)}
+.toast{
+  position:fixed;bottom:24px;right:24px;padding:10px 16px;border-radius:6px;
+  background:var(--emerald);color:#000;font:700 12px var(--font-display);
+  box-shadow:0 8px 24px rgba(0,0,0,.4);opacity:0;pointer-events:none;transition:opacity .2s var(--ease);z-index:999;
+}
+.toast.visible{opacity:1}
+@media(max-width:920px){.shell{grid-template-columns:1fr}.side{display:none}.cards{grid-template-columns:repeat(2,1fr)}.pipeline{grid-template-columns:repeat(3,1fr)}}
+</style></head><body><div class="grid-bg"></div><div class="shell">
+<aside class="side"><div class="brand"><b>◉</b> AGENT // CENTER</div><nav class="nav" aria-label="Views">
+<button class="active" type="button" data-view="live">Live Operations</button>
+<button type="button" data-view="tasks">Task Plan</button>
+<button type="button" data-view="process">Process Activity</button>
+<button type="button" data-view="safety">Safety Events</button>
+<button type="button" data-view="attempts">Attempt Ledger</button>
+</nav></aside>
+<main class="main">
+<div class="top"><div><div class="lead-label">// AUTONOMOUS OPERATIONS CONSOLE</div><h1>Terminal Monitor</h1></div><div class="live-badge" id="connection">LIVE ●</div></div>
+
+<!-- LIVE OPERATIONS VIEW -->
+<section class="view" data-view-panel="live">
+<section class="cards">
+<div class="card"><div class="card-label">AGENT STATE</div><div class="card-value accent" id="state">—</div></div>
+<div class="card"><div class="card-label">PROCESS &amp; CPU</div><div class="card-value" id="process">—</div></div>
+<div class="card"><div class="card-label">TASK PROGRESS</div><div class="card-value" id="progress">—</div></div>
+<div class="card"><div class="card-label">GIT BRANCH</div><div class="card-value" id="branch">—</div></div>
+</section>
+
+<div class="action-bar">
+<div class="action-pills">
+<button class="act-btn primary" type="button" onclick="sendAction('answer','yes')">✓ Approve (yes)</button>
+<button class="act-btn" type="button" onclick="sendAction('answer','proceed')">▶ Continue</button>
+<button class="act-btn" type="button" onclick="sendAction('key','tab')">⇥ Mode (Tab)</button>
+<button class="act-btn" type="button" onclick="sendAction('answer','proceed with the next task')">⚡ Nudge</button>
+</div>
+<form class="cmd-box" onsubmit="event.preventDefault();submitCommand();">
+<input class="cmd-input" id="cmd-input" type="text" placeholder="Type prompt or operator instruction…"/>
+<button class="cmd-submit" type="submit">Send</button>
+</form>
+</div>
+
+<section class="terminal"><div class="terminal-head"><span>LIVE OPERATIONAL LOG</span><span class="dots" style="color:var(--accent-site)">● ● ●</span></div><div class="log" id="log">Waiting for monitor events…</div></section>
+<section class="terminal snapshot-terminal" style="margin-top:14px;height:240px"><div class="terminal-head"><span>AGENT TERMINAL SNAPSHOT (REDACTED)</span><span style="color:var(--accent-site)">◉</span></div><pre class="log" id="terminal">Waiting for terminal output…</pre></section>
+</section>
+
+<!-- TASK PLAN VIEW (ARCHIFY STYLE) -->
+<section class="view" data-view-panel="tasks" hidden>
+<div class="pipeline" id="pipeline-steps">
+<div class="pipe-step" data-step="TASK_RECEIVED"><div class="pipe-num">01</div><div class="pipe-name">TASK_RECEIVED</div><div class="pipe-badge">INIT</div></div>
+<div class="pipe-step" data-step="EXECUTING"><div class="pipe-num">02</div><div class="pipe-name">EXECUTING</div><div class="pipe-badge">PENDING</div></div>
+<div class="pipe-step" data-step="VERIFYING"><div class="pipe-num">03</div><div class="pipe-name">VERIFYING</div><div class="pipe-badge">PENDING</div></div>
+<div class="pipe-step" data-step="PR_CREATED"><div class="pipe-num">04</div><div class="pipe-name">PR_CREATED</div><div class="pipe-badge">PENDING</div></div>
+<div class="pipe-step" data-step="CI_CHECKS"><div class="pipe-num">05</div><div class="pipe-name">CI_CHECKS</div><div class="pipe-badge">PENDING</div></div>
+<div class="pipe-step" data-step="MERGED"><div class="pipe-num">06</div><div class="pipe-name">MERGED</div><div class="pipe-badge">PENDING</div></div>
+</div>
+
+<div class="cards" style="margin-bottom:12px">
+<div class="card"><div class="card-label">TOTAL TASKS</div><div class="card-value" id="task-total">0</div></div>
+<div class="card"><div class="card-label">COMPLETED</div><div class="card-value" id="task-completed" style="color:var(--emerald)">0</div></div>
+<div class="card"><div class="card-label">IN PROGRESS</div><div class="card-value" id="task-in-progress" style="color:var(--yellow)">0</div></div>
+<div class="card"><div class="card-label">PENDING</div><div class="card-value" id="task-pending">0</div></div>
+</div>
+
+<div class="filter-bar">
+<div class="filter-pills">
+<button class="fpill active" onclick="filterTasks('all')">ALL (<span id="fc-all">0</span>)</button>
+<button class="fpill" onclick="filterTasks('active')">ACTIVE (<span id="fc-act">0</span>)</button>
+<button class="fpill" onclick="filterTasks('pending')">PENDING (<span id="fc-pen">0</span>)</button>
+<button class="fpill" onclick="filterTasks('completed')">DONE (<span id="fc-don">0</span>)</button>
+</div>
+<input class="cmd-input" id="task-search" type="text" placeholder="Filter task titles…" oninput="renderTaskList()" style="max-width:240px"/>
+</div>
+
+<div class="task-grid" id="task-items"><div class="task-card"><div class="task-idx">—</div><div class="task-badge TODO">WAIT</div><div class="task-label">Waiting for task data…</div></div></div>
+</section>
+
+<!-- PROCESS ACTIVITY VIEW -->
+<section class="view" data-view-panel="process" hidden>
+<div class="detail"><h2>Process Activity</h2><div class="detail-grid">
+<div class="detail-row">Agent<b id="process-agent">—</b></div>
+<div class="detail-row">CPU<b id="process-cpu">—</b></div>
+<div class="detail-row">Oldest command<b id="process-age">—</b></div>
+<div class="detail-row">PIDs<b id="process-pids">—</b></div>
+</div><h2 style="margin-top:24px">Current commands</h2><ul class="detail-list" id="process-commands"><li>Waiting for process data…</li></ul></div>
+</section>
+
+<!-- SAFETY VIEW -->
+<section class="view" data-view-panel="safety" hidden>
+<div class="detail"><h2>Safety Events</h2><ul class="detail-list" id="safety-list"><li>No safety events recorded.</li></ul></div>
+</section>
+
+<!-- ATTEMPTS VIEW -->
+<section class="view" data-view-panel="attempts" hidden>
+<div class="detail"><h2>Attempt Ledger</h2><ul class="detail-list" id="attempt-list"><li>No continuation attempts recorded.</li></ul></div>
+</section>
+</main></div>
+<div class="toast" id="toast">Dispatched</div>
+<script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let currentFilter='all',allTaskList=[],stages=['TASK_RECEIVED','EXECUTING','VERIFYING','PR_CREATED','CI_CHECKS','MERGED'];
 function tone(s){s=s.toUpperCase();if(/SUCCESS|COMPLETED|GREEN|MERGED/.test(s))return'ok';if(/ATTENTION|PAUSE|WARN|QUEUED/.test(s))return'warn';if(/FAILED|ERROR|BLOCKED|REFUSED/.test(s))return'bad';if(/SEND|MODE|START|INTERRUPT|RECOVER/.test(s))return'action';return'info'}
-function listItems(items, empty){return items.length?items.map(x=>'<li>'+esc(x)+'</li>').join(''):'<li>'+esc(empty)+'</li>'}
-function showView(view){document.querySelectorAll('[data-view-panel]').forEach(panel=>{panel.hidden=panel.dataset.viewPanel!==view});document.querySelectorAll('[data-view]').forEach(button=>{const active=button.dataset.view===view;button.classList.toggle('active',active);button.setAttribute('aria-selected',String(active))})}
+function showToast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('visible');setTimeout(()=>t.classList.remove('visible'),2200)}
+async function sendAction(action,payload){try{const res=await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,payload,key:action==='key'?payload:''})});const d=await res.json();showToast(d.ok?'Action Dispatched ✓':'Error: '+(d.error||'Failed'))}catch(e){showToast('Network error')}}
+function submitCommand(){const el=document.getElementById('cmd-input');if(el&&el.value.trim()){sendAction('answer',el.value.trim());el.value=''}}
+function showView(view){document.querySelectorAll('[data-view-panel]').forEach(p=>{p.hidden=p.dataset.viewPanel!==view});document.querySelectorAll('[data-view]').forEach(b=>{const a=b.dataset.view===view;b.classList.toggle('active',a);b.setAttribute('aria-selected',String(a))})}
 document.querySelectorAll('[data-view]').forEach(button=>button.addEventListener('click',()=>showView(button.dataset.view)));
-async function tick(){try{const [sr,er,tr]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/events',{cache:'no-store'}),fetch('/api/terminal',{cache:'no-store'})]);const s=await sr.json(),e=await er.json(),terminalData=await tr.json();const activity=s.activity||{};state.textContent=s.state||'starting';process.textContent=(s.process||'agent')+' · '+((s.pids||[]).length)+' pid';const t=s.todo||{};progress.textContent=(t.completed||0)+' / '+(t.total||0);branch.textContent=(s.git||{}).branch||'—';log.innerHTML=(e.lines||[]).map(x=>'<div class="line '+tone(x)+'">'+esc(x)+'</div>').join('')||'<span class="empty">Waiting for monitor events…</span>';log.scrollTop=log.scrollHeight;terminal.textContent=terminalData.snapshot||'Waiting for terminal output…';document.getElementById('process-agent').textContent=(s.process||'agent')+' · '+(activity.active?'active':'idle');document.getElementById('process-cpu').textContent=String(activity.cpu_percent??0)+'%';document.getElementById('process-age').textContent=String(activity.oldest_seconds??0)+'s';document.getElementById('process-pids').textContent=(s.pids||[]).join(', ')||'none';document.getElementById('process-commands').innerHTML=listItems(activity.commands||[],'No active commands.');document.getElementById('task-total').textContent=String(t.total||0);document.getElementById('task-completed').textContent=String(t.completed||0);document.getElementById('task-in-progress').textContent=String(t.in_progress||0);document.getElementById('task-pending').textContent=String(t.pending||0);const items=t.items||[];const taskHtml=items.length?items.map(x=>{const st=x.state||'pending';const badgeCls=st==='completed'?'ok':st==='in_progress'?'action':'warn';const badgeText=st==='completed'?'DONE':st==='in_progress'?'ACTIVE':'TODO';return '<li style="display:flex;align-items:center;gap:10px;padding:8px 0"><span class="line '+badgeCls+'" style="font-weight:700;font-size:11px;padding:2px 6px;border:1px solid currentColor;border-radius:4px;min-width:55px;text-align:center">'+badgeText+'</span><span style="color:var(--text)">'+esc(x.label)+'</span></li>'}).join(''):'<li>No tasks detected in agent terminal.</li>';document.getElementById('task-items').innerHTML=taskHtml;const safety=(s.policy_decisions||[]).map(x=>(x.timestamp||'')+' · '+(x.decision||'event')).concat((e.lines||[]).filter(x=>/ATTENTION|BLOCK|REFUSED|UNSAFE|SAFETY/i.test(x)));document.getElementById('safety-list').innerHTML=listItems(safety,'No safety events recorded.');const attempts=(s.attempts||[]).map(x=>(x.timestamp||'')+' · '+(x.status||'unknown')+' · '+(x.observed_state||''));document.getElementById('attempt-list').innerHTML=listItems(attempts,'No continuation attempts recorded.');connection.textContent='LIVE'}catch(e){connection.textContent='RECONNECTING'}}setInterval(tick,1000);tick();
+function filterTasks(f){currentFilter=f;document.querySelectorAll('.fpill').forEach(p=>p.classList.remove('active'));event&&event.target&&event.target.classList.add('active');renderTaskList()}
+function renderTaskList(){
+  const search=(document.getElementById('task-search')?.value||'').toLowerCase();
+  const listEl=document.getElementById('task-items');
+  if(!listEl)return;
+  const filtered=allTaskList.filter(t=>{
+    if(currentFilter==='active'&&t.state!=='in_progress')return false;
+    if(currentFilter==='pending'&&t.state!=='pending')return false;
+    if(currentFilter==='completed'&&t.state!=='completed')return false;
+    if(search&&!t.label.toLowerCase().includes(search))return false;
+    return true;
+  });
+  if(!filtered.length){listEl.innerHTML='<div class="task-card"><div class="task-idx">—</div><div class="task-badge TODO">EMPTY</div><div class="task-label">No matching tasks.</div></div>';return}
+  listEl.innerHTML=filtered.map((t,i)=>{
+    const st=t.state||'pending';
+    const badgeText=st==='completed'?'DONE':st==='in_progress'?'ACTIVE':'TODO';
+    const num=String(i+1).padStart(2,'0');
+    return '<div class="task-card"><div class="task-idx">'+num+'</div><div class="task-badge '+badgeText+'">'+badgeText+'</div><div class="task-label">'+esc(t.label)+'</div></div>';
+  }).join('');
+}
+function updatePipeline(curStage){
+  const idx=stages.indexOf(curStage);
+  stages.forEach((st,i)=>{
+    const el=document.querySelector('[data-step="'+st+'"]');
+    if(!el)return;
+    el.classList.remove('active','done');
+    const badge=el.querySelector('.pipe-badge');
+    if(i<idx||curStage==='MERGED'){el.classList.add('done');if(badge)badge.textContent='PASSED ✓'}
+    else if(i===idx){el.classList.add('active');if(badge)badge.textContent='ACTIVE ●'}
+    else{if(badge)badge.textContent='PENDING'}
+  });
+}
+function applySnapshot(s,e,terminalData){
+  const activity=s.activity||{};
+  state.textContent=s.state||'starting';
+  process.textContent=(s.process||'agent')+' · '+(activity.cpu_percent??0)+'% CPU';
+  const t=s.todo||{};
+  progress.textContent=(t.completed||0)+' / '+(t.total||0);
+  branch.textContent=(s.git||{}).branch||'—';
+  log.innerHTML=(e.lines||[]).map(x=>'<div class="line '+tone(x)+'">'+esc(x)+'</div>').join('')||'Waiting for events…';
+  log.scrollTop=log.scrollHeight;
+  terminal.textContent=terminalData.snapshot||'Waiting for terminal output…';
+  document.getElementById('process-agent').textContent=(s.process||'agent')+' · '+(activity.active?'active':'idle');
+  document.getElementById('process-cpu').textContent=String(activity.cpu_percent??0)+'%';
+  document.getElementById('process-age').textContent=String(activity.oldest_seconds??0)+'s';
+  document.getElementById('process-pids').textContent=(s.pids||[]).join(', ')||'none';
+  document.getElementById('process-commands').innerHTML=(activity.commands||[]).length?activity.commands.map(x=>'<li>'+esc(x)+'</li>').join(''):'<li>No active commands.</li>';
+  document.getElementById('task-total').textContent=String(t.total||0);
+  document.getElementById('task-completed').textContent=String(t.completed||0);
+  document.getElementById('task-in-progress').textContent=String(t.in_progress||0);
+  document.getElementById('task-pending').textContent=String(t.pending||0);
+  document.getElementById('fc-all').textContent=String(t.total||0);
+  document.getElementById('fc-act').textContent=String(t.in_progress||0);
+  document.getElementById('fc-pen').textContent=String(t.pending||0);
+  document.getElementById('fc-don').textContent=String(t.completed||0);
+  allTaskList=t.items||[];
+  renderTaskList();
+  updatePipeline((s.task||{}).stage||'TASK_RECEIVED');
+  const safety=(s.policy_decisions||[]).map(x=>(x.timestamp||'')+' · '+(x.decision||'event')).concat((e.lines||[]).filter(x=>/ATTENTION|BLOCK|REFUSED|UNSAFE|SAFETY/i.test(x)));
+  document.getElementById('safety-list').innerHTML=safety.length?safety.map(x=>'<li>'+esc(x)+'</li>').join(''):'<li>No safety events recorded.</li>';
+  const attempts=(s.attempts||[]).map(x=>(x.timestamp||'')+' · '+(x.status||'unknown')+' · '+(x.observed_state||''));
+  document.getElementById('attempt-list').innerHTML=attempts.length?attempts.map(x=>'<li>'+esc(x)+'</li>').join(''):'<li>No continuation attempts recorded.</li>';
+  connection.textContent='LIVE ●';connection.classList.remove('reconnecting');
+}
+async function pollFallback(){try{const [sr,er,tr]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/events',{cache:'no-store'}),fetch('/api/terminal',{cache:'no-store'})]);const s=await sr.json(),e=await er.json(),terminalData=await tr.json();applySnapshot(s,e,terminalData)}catch(e){connection.textContent='RECONNECTING';connection.classList.add('reconnecting')}}
+function setupStream(){
+  if(window.EventSource){
+    const ev=new EventSource('/api/stream');
+    ev.onmessage=m=>{try{const d=JSON.parse(m.data);applySnapshot(d.status||{},d.events||{},d.terminal||{})}catch(e){}};
+    ev.onerror=()=>{connection.textContent='POLLING ●';connection.classList.remove('reconnecting');setInterval(pollFallback,1000)};
+  }else{setInterval(pollFallback,1000)}
+}
+setupStream();pollFallback();
 </script></body></html>"""
 
 
 class MonitorWebServer:
-    """Local read-only dashboard serving status and the bounded event log."""
+    """Local dashboard serving status, streaming events, and accepting manual operator actions."""
 
-    def __init__(self, status_path: str, log_path: str, port: int = 8765, snapshot_path: str = "") -> None:
+    def __init__(
+        self,
+        status_path: str,
+        log_path: str,
+        port: int = 8765,
+        snapshot_path: str = "",
+        *,
+        answer_path: str = "",
+    ) -> None:
         self.status_path = status_path
         self.log_path = log_path
         self.snapshot_path = snapshot_path
+        self.answer_path = answer_path
         self.port = validate_web_port(port)
         self.httpd: ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
@@ -2794,6 +3170,67 @@ class MonitorWebServer:
                     except (OSError, UnicodeError):
                         snapshot = ""
                     self._reply(200, "application/json", json.dumps({"snapshot": snapshot}).encode())
+                elif self.path == "/api/stream":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
+                    self.send_header("X-Accel-Buffering", "no")
+                    self.end_headers()
+                    last_hash = ""
+                    try:
+                        for _ in range(300):
+                            try:
+                                status_raw = Path(owner.status_path).read_text(encoding="utf-8") if owner.status_path and os.path.exists(owner.status_path) else "{}"
+                                curr_hash = hashlib.sha256(status_raw.encode()).hexdigest()[:16]
+                                if curr_hash != last_hash:
+                                    last_hash = curr_hash
+                                    status_obj = json.loads(status_raw) if status_raw.strip() else {}
+                                    events_lines = []
+                                    if owner.log_path and os.path.exists(owner.log_path):
+                                        events_lines = [_public_event_line(entry) for entry in Path(owner.log_path).read_text(encoding="utf-8").splitlines()[-400:]]
+                                    term_snap = Path(owner.snapshot_path).read_text(encoding="utf-8") if owner.snapshot_path and os.path.exists(owner.snapshot_path) else ""
+                                    combined = {
+                                        "status": _public_status(status_obj),
+                                        "events": {"lines": events_lines},
+                                        "terminal": {"snapshot": term_snap},
+                                    }
+                                    self.wfile.write(f"data: {json.dumps(combined)}\n\n".encode())
+                                    self.wfile.flush()
+                                else:
+                                    self.wfile.write(b": ping\n\n")
+                                    self.wfile.flush()
+                            except (OSError, UnicodeError, json.JSONDecodeError):
+                                pass
+                            time.sleep(1.0)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    return
+                else:
+                    self._reply(404, "application/json", b'{"error":"not found"}')
+
+            def do_POST(self) -> None:
+                if self.path in ("/api/send", "/api/answer"):
+                    try:
+                        length = int(self.headers.get("Content-Length", 0))
+                        body = self.rfile.read(length).decode("utf-8")
+                        data = json.loads(body) if body else {}
+                        action = str(data.get("action", "answer")).strip()
+                        payload = str(data.get("payload", "")).strip()
+                        key = str(data.get("key", "")).strip()
+                        target_path = owner.answer_path or "/tmp/terminal-monitor/answer.txt"
+                        Path(target_path).parent.mkdir(parents=True, exist_ok=True)
+                        if action == "key" and key:
+                            Path(target_path).write_text(f"KEY:{key}\n", encoding="utf-8")
+                            self._reply(200, "application/json", b'{"ok":true,"dispatched":"key"}')
+                            return
+                        if payload:
+                            Path(target_path).write_text(payload + "\n", encoding="utf-8")
+                            self._reply(200, "application/json", b'{"ok":true,"dispatched":"payload"}')
+                            return
+                        self._reply(400, "application/json", b'{"ok":false,"error":"missing payload or key"}')
+                    except Exception as exc:
+                        self._reply(500, "application/json", json.dumps({"ok": False, "error": str(exc)}).encode())
                 else:
                     self._reply(404, "application/json", b'{"error":"not found"}')
 
@@ -2818,7 +3255,6 @@ class MonitorWebServer:
         self.thread = threading.Thread(target=self.httpd.serve_forever, name="terminal-monitor-web", daemon=True)
         self.thread.start()
         return f"http://127.0.0.1:{self.port}/"
-
     def stop(self) -> None:
         if self.httpd:
             self.httpd.shutdown()
@@ -3020,8 +3456,17 @@ class TerminalMonitor:
         if config.unsafe_phrases:
             self.profile.unsafe_phrases = list(set(self.profile.unsafe_phrases + config.unsafe_phrases))
 
-        # Setup state paths
-        self.state_dir = config.state_dir
+        # Auto-discover agent project directory if default
+        if self.config.project_dir in (".", ""):
+            discovered = discover_agent_project_dir(self.backend.get_pids(self.config.process))
+            if discovered and get_git_status(discovered, ttl_seconds=0.0).is_repo:
+                self.config = replace(self.config, project_dir=discovered)
+
+        # Setup state paths with project-level isolation
+        if self.config.state_dir == "/tmp/terminal-monitor":
+            self.state_dir = resolve_project_state_dir(self.config.state_dir, self.config.project_dir)
+        else:
+            self.state_dir = self.config.state_dir
         os.makedirs(self.state_dir, exist_ok=True)
         self.log_path = os.path.join(self.state_dir, "monitor.log")
         self.attention_path = os.path.join(self.state_dir, "attention.txt")
@@ -3034,7 +3479,7 @@ class TerminalMonitor:
         self.task_state_path = os.path.join(self.state_dir, "task-state.json")
         self.report_path = config.report_path or os.path.join(self.state_dir, "final-report.json")
         stored_state = TaskState.load(self.task_state_path)
-        current_git_status = get_git_status(config.project_dir, ttl_seconds=0.0)
+        current_git_status = get_git_status(self.config.project_dir, ttl_seconds=0.0)
         detected_branch = current_git_status.branch or stored_state.branch
         expected_branch = config.expected_branch or stored_state.expected_branch
         if config.supervise and not expected_branch:
@@ -3053,7 +3498,7 @@ class TerminalMonitor:
         )
         if config.supervise and not self.task_state.pr.get("safetyBaselineCaptured"):
             baseline = dict(self.task_state.pr)
-            baseline.update(capture_safety_baseline(config.project_dir))
+            baseline.update(capture_safety_baseline(self.config.project_dir))
             self.task_state = replace(self.task_state, pr=baseline)
         self.task_state.save(self.task_state_path)
         self.session_tracker = SessionTracker(
@@ -3082,6 +3527,8 @@ class TerminalMonitor:
         self.last_action = "initialized"
         self.last_command = ""
         self.last_event_signature = ""
+        self._protected_branch_nudged: bool = False
+        self._protected_branch_nudge_time: float = 0.0
         self.todo_progress: dict[str, Any] = {"total": 0, "completed": 0, "in_progress": 0, "pending": 0, "items": []}
         self.detected_task_id = ""
         self.web_server: MonitorWebServer | None = None
@@ -3513,6 +3960,9 @@ class TerminalMonitor:
                 f"EVENT state={state} mode={mode or 'unknown'} roots={len(pids)} children={len(activity.descendants)} "
                 f"task={self.todo_progress.get('completed', 0)}/{self.todo_progress.get('total', 0)} git={git_status.head[:8] or 'none'}"
             )
+        if git_status.branch not in self.config.protected_branches:
+            self._protected_branch_nudged = False
+
         repository_safety = evaluate_repository_safety(
             git_status,
             expected_branch=self.task_state.expected_branch,
@@ -3520,16 +3970,43 @@ class TerminalMonitor:
         )
         if self.config.supervise and not repository_safety["safe"]:
             reason = str(repository_safety["reason"])
-            self._record_policy_decision(
-                f"branch={repository_safety.get('branch', '')}",
-                "attention",
-                reason,
-            )
-            with open(self.attention_path, "w", encoding="utf-8") as handle:
-                handle.write(json.dumps(repository_safety, indent=2) + "\n" + safe_snapshot + "\n")
-            self.log(f"PAUSE kind=repository_safety reason={reason}")
-            self.export_status_json(pids, "branch_safety", {"repository_safety": repository_safety})
-            return 3, f"ATTENTION_REQUIRED kind=repository_safety reason={reason} file={self.attention_path}"
+            if (
+                reason == "protected_branch_dirty"
+                and self.config.smart_nudges
+                and not self._protected_branch_nudged
+                and not (self.config.expected_branch and self.config.expected_branch != git_status.branch)
+            ):
+                self._protected_branch_nudged = True
+                self._protected_branch_nudge_time = time.monotonic()
+                nudge_msg = (
+                    f"Direct changes detected on protected branch '{git_status.branch}'. "
+                    f"Please create and switch to a dedicated feature branch (e.g. 'git checkout -b <feature-name>') "
+                    f"and commit your changes before proceeding."
+                )
+                attempt_id = self._queue_attempt("branch_safety", nudge_msg, state)
+                ok, detail = self.backend.send(self.config.process, self.config.title, nudge_msg)
+                self._transition_attempt(attempt_id, "sent", detail=detail, observed_state=state)
+                self._transition_attempt(attempt_id, "accepted" if ok else "ignored", detail=detail, observed_state=state)
+                self.log(f"NUDGE kind=protected_branch_dirty branch={git_status.branch}")
+                return None, "NUDGE_SENT kind=protected_branch_dirty"
+            if (
+                reason == "protected_branch_dirty"
+                and self._protected_branch_nudged
+                and (time.monotonic() - self._protected_branch_nudge_time < 45.0)
+                and not (self.config.expected_branch and self.config.expected_branch != git_status.branch)
+            ):
+                pass
+            else:
+                self._record_policy_decision(
+                    f"branch={repository_safety.get('branch', '')}",
+                    "attention",
+                    reason,
+                )
+                with open(self.attention_path, "w", encoding="utf-8") as handle:
+                    handle.write(json.dumps(repository_safety, indent=2) + "\n" + safe_snapshot + "\n")
+                self.log(f"PAUSE kind=repository_safety reason={reason}")
+                self.export_status_json(pids, "branch_safety", {"repository_safety": repository_safety})
+                return 3, f"ATTENTION_REQUIRED kind=repository_safety reason={reason} file={self.attention_path}"
 
         immediate_assessment = assess_agent_commands(
             activity.commands,
@@ -3799,6 +4276,7 @@ class TerminalMonitor:
                         self.log_path,
                         self.config.web_port,
                         self.terminal_snapshot_path,
+                        answer_path=self.answer_path,
                     )
                     self.web_url = self.web_server.start()
                     self.log(f"WEB_UI url={self.web_url}")
