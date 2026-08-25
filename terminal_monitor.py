@@ -17,12 +17,14 @@ import shutil
 import signal
 import subprocess
 import sys
+import textwrap
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 # Optional TOML support (standard in Python 3.11+)
 try:
@@ -98,11 +100,26 @@ class StateFileError(RuntimeError):
     """Raised when persistent supervisor state cannot be trusted."""
 
 
+def json_safe(value: Any) -> Any:
+    """Convert monitor values into deterministic JSON-compatible structures."""
+    if is_dataclass(value):
+        return {key: json_safe(item) for key, item in asdict(value).items()}
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, set):
+        return [json_safe(item) for item in sorted(value, key=str)]
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
 def _atomic_json_write(path: str | Path, data: dict[str, Any]) -> None:
     target = Path(path).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.write_text(json.dumps(json_safe(data), indent=2, sort_keys=True), encoding="utf-8")
     os.replace(temporary, target)
 
 
@@ -1317,6 +1334,7 @@ class MonitorConfig:
     protected_branches: tuple[str, ...] = ("main", "master")
     report_path: str | None = None
     attempt_history_limit: int = 100
+    launch_command: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -1945,6 +1963,280 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+SENSITIVE_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?i)(\b(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|token)\b\s*[:=]\s*)([^\s,;]+)"),
+    re.compile(r"(?i)(\bBearer\s+)([A-Za-z0-9._~+/=-]{12,})"),
+    re.compile(r"\b(?:ghp|gho|ghs|ghr|github_pat)_[A-Za-z0-9_\-]{12,}\b"),
+    re.compile(r"(?i)([?&](?:token|key|secret|password|signature)=)([^&\s]+)"),
+)
+
+
+def redact_sensitive(text: str) -> str:
+    """Mask common credentials before terminal history leaves the local monitor."""
+    redacted = str(text)
+    for pattern in SENSITIVE_VALUE_PATTERNS:
+        if pattern.groups >= 2 and (
+            pattern.pattern.startswith("(?i)(\\b") or "Bearer" in pattern.pattern or "(?:token|key" in pattern.pattern
+        ):
+            redacted = pattern.sub(lambda match: f"{match.group(1)}<redacted>", redacted)
+        else:
+            redacted = pattern.sub("<redacted>", redacted)
+    return redacted
+
+
+TODO_ITEM_PATTERN = re.compile(r"(?P<marker>\[(?:\s|x|X|•|·|✓|✔|~|-)\])\s*(?P<label>.+?)\s*$")
+
+
+def extract_todo_progress(history: str) -> dict[str, Any]:
+    """Extract a deduplicated, best-effort task panel summary from TUI history."""
+    items: dict[str, dict[str, str]] = {}
+    for line in str(history).splitlines():
+        match = TODO_ITEM_PATTERN.search(line)
+        if not match:
+            continue
+        label = re.sub(r"\s+", " ", match.group("label")).strip(" │┃")
+        if not label:
+            continue
+        marker = match.group("marker").lower()
+        state = "completed" if marker in {"[x]", "[✓]", "[✔]"} else "in_progress" if marker in {"[•]", "[·]", "[~]", "[-]"} else "pending"
+        key = label.rstrip("+").strip().lower()
+        existing = items.get(key)
+        priority = {"pending": 0, "in_progress": 1, "completed": 2}
+        if existing is None or priority[state] > priority[existing["state"]]:
+            items[key] = {"label": label.rstrip("+").strip(), "state": state}
+    ordered = list(items.values())
+    counts = {
+        "total": len(ordered),
+        "completed": sum(item["state"] == "completed" for item in ordered),
+        "in_progress": sum(item["state"] == "in_progress" for item in ordered),
+        "pending": sum(item["state"] == "pending" for item in ordered),
+    }
+    return {**counts, "items": ordered}
+
+
+def infer_current_task_id(history: str) -> str:
+    """Infer a task identifier from recent commands without mutating durable state."""
+    patterns = (
+        r"--task\s+([A-Za-z0-9][A-Za-z0-9_.:-]*)",
+        r"\btask(?:\s+id)?\s*[:=]\s*([A-Za-z0-9][A-Za-z0-9_.:-]*)",
+    )
+    for line in reversed(str(history).splitlines()):
+        for pattern in patterns:
+            match = re.search(pattern, line, re.IGNORECASE)
+            if match:
+                return match.group(1)
+    return ""
+
+
+def redact_snapshot(snapshot: str, *, max_chars: int = 6000) -> tuple[str, bool]:
+    """Return a bounded, credential-masked snapshot for human/JSON inspection."""
+    safe = redact_sensitive(str(snapshot))
+    truncated = len(safe) > max_chars
+    return (safe[-max_chars:] if truncated else safe), truncated
+
+
+def pid_is_alive(pid: int | str | None) -> bool:
+    """Return whether a local process exists without treating permission as absence."""
+    try:
+        value = int(pid or 0)
+        if value <= 0:
+            return False
+        os.kill(value, 0)
+        return True
+    except PermissionError:
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+ANSI_CODES = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+    "cyan": "\033[36m",
+    "blue": "\033[34m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "red": "\033[31m",
+    "magenta": "\033[35m",
+    "white": "\033[37m",
+}
+
+
+def _ansi(text: str, tone: str, enabled: bool = True) -> str:
+    if not enabled:
+        return text
+    return f"{ANSI_CODES.get(tone, '')}{text}{ANSI_CODES['reset']}"
+
+
+def read_status_snapshot(state_dir: str | Path, project_dir: str = ".") -> dict[str, Any]:
+    """Read live status plus durable state and mark stale monitor PIDs explicitly."""
+    state_path = Path(state_dir)
+    status_path = state_path / "status.json"
+    task_path = state_path / "task-state.json"
+    status: dict[str, Any] = {}
+    task: dict[str, Any] = {}
+    for path, target in ((status_path, status), (task_path, task)):
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                target.update(loaded)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+    if not status:
+        status = {
+            "running": False,
+            "state": "stopped",
+            "timestamp": "",
+            "git": {},
+            "task": {},
+        }
+    monitor_pid = status.get("monitor_pid") or status.get("pid")
+    pid_alive = bool(status.get("running") and pid_is_alive(monitor_pid))
+    identity_checked = bool(status.get("monitor_instance_id") or status.get("schema_version", 1) >= 2)
+    status["monitor_alive"] = bool(pid_alive and (not identity_checked or _monitor_process_matches(monitor_pid, state_path)))
+    status["stale"] = bool(status.get("running") and monitor_pid and not status["monitor_alive"])
+    if task:
+        status["durable_task_state"] = task
+        task_view = dict(status.get("task") or {})
+        task_view.setdefault("task_id", task.get("taskId", ""))
+        task_view.setdefault("stage", task.get("lastKnownStage", "TASK_RECEIVED"))
+        task_view.setdefault("npm_publish_allowed", task.get("npmPublishAllowed", False))
+        status["task"] = task_view
+    if not status.get("git"):
+        git = get_git_status(project_dir, ttl_seconds=0.0)
+        status["git"] = {
+            "branch": git.branch,
+            "head": git.head,
+            "dirty": git.dirty,
+            "modified": git.modified_count,
+            "untracked": git.untracked_count,
+            "open_prs": git.open_prs_count,
+            "last_commit": git.last_commit,
+        }
+    return status
+
+
+def _status_monitor_label(snapshot: dict[str, Any]) -> tuple[str, str]:
+    if snapshot.get("monitor_alive"):
+        return "RUNNING", "green"
+    if snapshot.get("stale"):
+        return "STALE", "red"
+    return "STOPPED", "yellow"
+
+
+def render_status_dashboard(snapshot: dict[str, Any], *, color: bool = True, width: int = 78) -> str:
+    """Render a compact ANSI dashboard suitable for a terminal or CI log."""
+    monitor_label, monitor_tone = _status_monitor_label(snapshot)
+    state = str(snapshot.get("state", "unknown")).upper()
+    state_tone = "green" if state in {"THINKING", "COMPLETED"} else "yellow" if state in {"IDLE", "PERMISSION", "QUESTION"} else "red" if state in {"MISSING", "ATTENTION", "STOPPED"} else "cyan"
+    task = snapshot.get("task") if isinstance(snapshot.get("task"), dict) else {}
+    todo = snapshot.get("todo") if isinstance(snapshot.get("todo"), dict) else {}
+    activity = snapshot.get("activity") if isinstance(snapshot.get("activity"), dict) else {}
+    git = snapshot.get("git") if isinstance(snapshot.get("git"), dict) else {}
+    ci_events = snapshot.get("ci_events") if isinstance(snapshot.get("ci_events"), list) else []
+    ci_categories = [str(item.get("category", "unknown")) for item in ci_events[-8:] if isinstance(item, dict)]
+    ci_label = "green" if ci_categories and all(item == "passed" for item in ci_categories) else "attention" if any(item in {"failed", "failed-external"} for item in ci_categories) else "waiting" if ci_categories else "not observed"
+    ci_tone = "green" if ci_label == "green" else "red" if ci_label == "attention" else "yellow" if ci_label == "waiting" else "dim"
+    npm_allowed = bool(snapshot.get("npm_publish_allowed", task.get("npm_publish_allowed", False)))
+    npm_label = "ALLOWED" if npm_allowed else "BLOCKED"
+    npm_tone = "red" if npm_allowed else "green"
+    branch = str(git.get("branch") or "-")
+    head = str(git.get("head") or "")[:12] or "-"
+    dirty = bool(git.get("dirty"))
+    current_command = ""
+    commands = activity.get("commands")
+    if isinstance(commands, list) and commands:
+        current_command = redact_sensitive(str(commands[0]))
+    todo_total = int(todo.get("total", 0) or 0)
+    todo_completed = int(todo.get("completed", 0) or 0)
+    todo_pending = int(todo.get("pending", 0) or 0) + int(todo.get("in_progress", 0) or 0)
+    progress = f"{todo_completed}/{todo_total}" if todo_total else "not detected"
+    task_id = str(task.get("detected_id") or task.get("task_id") or "-")
+    state_fragment = _ansi(state, state_tone, color)
+    mode = str(snapshot.get("mode") or "-")
+    lines = [
+        _ansi("╭─ AI Agent Terminal Monitor", "cyan", color),
+        _ansi(f"│ Monitor   {monitor_label:<7}  Agent ", monitor_tone, color) + f"{state_fragment:<10}" + _ansi(f"  Mode {mode!s:<6}", monitor_tone, color),
+        _ansi(f"│ Heartbeat {snapshot.get('heartbeat') or snapshot.get('timestamp') or '-'}", "dim", color),
+        _ansi("├─ Task", "blue", color),
+        f"│ {task_id}  ·  progress {progress}  ·  remaining {todo_pending}",
+        f"│ Stage     {task.get('stage') or snapshot.get('stage') or '-'}",
+        _ansi("├─ Repository", "blue", color),
+        f"│ {branch} @ {head}  ·  {'DIRTY' if dirty else 'clean'}  ·  open PRs {git.get('open_prs', 0)}",
+        _ansi("├─ Safety & CI", "blue", color),
+        f"│ npm { _ansi(npm_label, npm_tone, color) }  ·  CI { _ansi(ci_label, ci_tone, color) }",
+    ]
+    if current_command:
+        wrapped = textwrap.wrap(current_command, width=max(20, width - 4)) or [current_command]
+        lines.append(_ansi("├─ Current command", "blue", color))
+        lines.extend(f"│ {line}" for line in wrapped[:3])
+    else:
+        lines.append(_ansi("├─ Current command", "blue", color))
+        lines.append("│ no child command observed")
+    if snapshot.get("stale"):
+        lines.append(_ansi("│ Monitor PID is no longer alive; status file is stale.", "red", color))
+    lines.append(_ansi("╰────────────────────────────────────────────────────────────────────────────", "cyan", color))
+    return "\n".join(lines)
+
+
+def _monitor_process_matches(pid: int | str | None, state_dir: str | Path) -> bool:
+    """Verify a PID belongs to this monitor before sending it a signal."""
+    if not pid_is_alive(pid):
+        return False
+    code, output, _ = run_command(["ps", "-p", str(pid), "-o", "command="])
+    if code != 0:
+        return False
+    command = output.lower()
+    return "terminal_monitor.py" in command and str(Path(state_dir).resolve()).lower() in command
+
+
+def stop_monitor(state_dir: str | Path, *, reason: str = "cli_stop") -> dict[str, Any]:
+    """Stop only a verified monitor process and leave the agent process untouched."""
+    state_path = Path(state_dir)
+    status = read_status_snapshot(state_path)
+    pid = status.get("monitor_pid") or status.get("pid")
+    stop_path = state_path / "stop"
+    stop_path.parent.mkdir(parents=True, exist_ok=True)
+    stop_path.touch()
+    result: dict[str, Any] = {"ok": True, "action": "stop", "state_dir": str(state_path), "pid": pid, "agent_untouched": True}
+    if _monitor_process_matches(pid, state_path):
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+            result.update({"signal": "SIGTERM", "reason": reason})
+        except OSError as exc:
+            result.update({"ok": False, "error": str(exc)})
+    else:
+        result.update({"signal": "none", "reason": "no verified live monitor"})
+    return result
+
+
+def resume_monitor(state_dir: str | Path, *, project_dir: str = ".") -> dict[str, Any]:
+    """Resume a previously launched supervisor from its validated launch metadata."""
+    state_path = Path(state_dir)
+    status = read_status_snapshot(state_path, project_dir)
+    if status.get("monitor_alive"):
+        return {"ok": True, "action": "resume", "already_running": True, "pid": status.get("monitor_pid")}
+    metadata_path = state_path / "monitor.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return {"ok": False, "action": "resume", "error": f"launch metadata unavailable: {exc}"}
+    command = [str(item) for item in metadata.get("command", [])] if isinstance(metadata, dict) else []
+    resolved_state = str(state_path.resolve()).lower()
+    command_text = " ".join(command).lower()
+    trusted_entrypoint = "terminal_monitor.py" in command_text or "supervisor.py" in command_text
+    if not command or not trusted_entrypoint or ("supervise" not in command_text and "--supervise" not in command_text) or resolved_state not in command_text:
+        return {"ok": False, "action": "resume", "error": "refusing untrusted monitor launch metadata"}
+    with contextlib.suppress(OSError):
+        (state_path / "stop").unlink()
+    try:
+        process = subprocess.Popen(command, cwd=project_dir, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as exc:
+        return {"ok": False, "action": "resume", "error": str(exc)}
+    return {"ok": True, "action": "resume", "pid": process.pid, "command": command, "agent_untouched": True}
+
+
 def normalize_snapshot(history: str) -> str:
     """Clean and normalize history snapshot for state hashing."""
     text = re.sub(r"[ \t]+", " ", history)
@@ -2223,6 +2515,8 @@ class TerminalMonitor:
         self.attention_path = os.path.join(self.state_dir, "attention.txt")
         self.answer_path = os.path.join(self.state_dir, "answer.txt")
         self.stop_path = os.path.join(self.state_dir, "stop")
+        self.monitor_lock_path = os.path.join(self.state_dir, "monitor.pid")
+        self.monitor_meta_path = os.path.join(self.state_dir, "monitor.json")
         self.status_json_path = config.status_json_path or os.path.join(self.state_dir, "status.json")
         self.task_state_path = os.path.join(self.state_dir, "task-state.json")
         self.report_path = config.report_path or os.path.join(self.state_dir, "final-report.json")
@@ -2267,6 +2561,18 @@ class TerminalMonitor:
         self.current_state = "unknown"
         self.current_mode: str | None = None
         self.last_git_fingerprint = ""
+        self.monitor_instance_id = uuid4().hex
+        self.monitor_started_at = now_iso()
+        self.last_heartbeat = self.monitor_started_at
+        self.last_action = "initialized"
+        self.last_command = ""
+        self.todo_progress: dict[str, Any] = {"total": 0, "completed": 0, "in_progress": 0, "pending": 0, "items": []}
+        self.detected_task_id = ""
+        self._shutdown_requested = False
+        self._shutdown_reason = ""
+        self._previous_signal_handlers: dict[int, Any] = {}
+        self._lock_claimed = False
+        self._lifecycle = "stopped"
 
         # Callbacks
         self.on_state_change: Callable[[str, str], None] | None = None
@@ -2275,6 +2581,71 @@ class TerminalMonitor:
         self.on_attention: Callable[[str, str], None] | None = None
         self.on_complete: Callable[[str], None] | None = None
         self.on_tick: Callable[[str, int], None] | None = None
+
+    def _monitor_metadata(self, lifecycle: str = "running") -> dict[str, Any]:
+        """Build the durable monitor identity used by status/stop/resume commands."""
+        return {
+            "pid": os.getpid(),
+            "instance_id": self.monitor_instance_id,
+            "lifecycle": lifecycle,
+            "started_at": self.monitor_started_at,
+            "heartbeat": self.last_heartbeat,
+            "state_dir": str(Path(self.state_dir).resolve()),
+            "project_dir": str(Path(self.config.project_dir).resolve()),
+            "command": list(self.config.launch_command),
+        }
+
+    def _write_monitor_metadata(self, lifecycle: str = "running") -> None:
+        _atomic_json_write(self.monitor_meta_path, self._monitor_metadata(lifecycle))
+
+    def _claim_monitor_lock(self) -> bool:
+        """Claim one supervisor per state directory, replacing only a stale lock."""
+        try:
+            existing = json.loads(Path(self.monitor_lock_path).read_text(encoding="utf-8"))
+            existing_pid = existing.get("pid") if isinstance(existing, dict) else None
+            if existing_pid and int(existing_pid) != os.getpid() and pid_is_alive(existing_pid):
+                return False
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        _atomic_json_write(self.monitor_lock_path, {"pid": os.getpid(), "instance_id": self.monitor_instance_id, "started_at": self.monitor_started_at})
+        self._write_monitor_metadata("running")
+        self._lock_claimed = True
+        self._lifecycle = "running"
+        return True
+
+    def _release_monitor_lock(self, lifecycle: str = "stopped") -> None:
+        try:
+            lock = json.loads(Path(self.monitor_lock_path).read_text(encoding="utf-8"))
+            if int(lock.get("pid", 0)) == os.getpid():
+                Path(self.monitor_lock_path).unlink()
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        self.last_heartbeat = now_iso()
+        with contextlib.suppress(Exception):
+            self._write_monitor_metadata(lifecycle)
+        self._lock_claimed = False
+        self._lifecycle = lifecycle
+
+    def _request_shutdown(self, signum: int, _frame: Any) -> None:
+        self._shutdown_requested = True
+        self._shutdown_reason = signal.Signals(signum).name
+
+    def _install_shutdown_handlers(self) -> None:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            self._previous_signal_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, self._request_shutdown)
+
+    def _restore_shutdown_handlers(self) -> None:
+        for signum, handler in self._previous_signal_handlers.items():
+            with contextlib.suppress(ValueError):
+                signal.signal(signum, handler)
+        self._previous_signal_handlers.clear()
+
+    def _stop_status(self, reason: str) -> None:
+        self.last_action = f"stopped:{reason}"
+        self.last_heartbeat = now_iso()
+        self.export_status_json([], "stopped", {"running": False, "lifecycle": "stopped", "stop_reason": reason})
+        self._release_monitor_lock("stopped")
 
     def _persist_attempt_state(self, *, attempt_id: str = "", prompt: str = "") -> None:
         self.task_state = replace(
@@ -2337,14 +2708,23 @@ class TerminalMonitor:
         """Export live structured status for IDEs, dashboards, or subagents."""
         if not self.status_json_path:
             return
+        self.last_heartbeat = now_iso()
         git_status = get_git_status(self.config.project_dir, ttl_seconds=0.0)
         data: dict[str, Any] = {
+            "schema_version": 2,
             "running": True,
+            "lifecycle": "running",
+            "monitor_pid": os.getpid(),
+            "monitor_instance_id": self.monitor_instance_id,
+            "started_at": self.monitor_started_at,
+            "heartbeat": self.last_heartbeat,
             "pids": pids,
             "process": self.config.process,
             "profile": self.profile.name,
             "state": state,
             "mode": self.current_mode,
+            "last_action": self.last_action,
+            "last_command": redact_sensitive(self.last_command),
             "sends": self.sends,
             "stable_seconds": round(time.monotonic() - self.last_change, 1),
             "git": {
@@ -2358,9 +2738,17 @@ class TerminalMonitor:
                 "last_commit": git_status.last_commit,
             },
             "timestamp": now_iso(),
+            "todo": self.todo_progress,
+            "history": {"available": True, "redacted": True, "max_chars": 6000},
         }
         if extra:
             data.update(extra)
+        task_view = dict(data.get("task") or {})
+        task_view.setdefault("task_id", self.task_state.task_id)
+        task_view.setdefault("detected_id", self.detected_task_id)
+        task_view.setdefault("stage", self.task_state.last_known_stage)
+        task_view.setdefault("npm_publish_allowed", self.task_state.npm_publish_allowed)
+        data["task"] = task_view
         data["attempts"] = list(self.task_state.attempts[-self.config.attempt_history_limit :])
         data["ci_events"] = list(self.task_state.ci_events[-self.config.attempt_history_limit :])
         data["policy_decisions"] = list(self.task_state.policy_decisions[-self.config.attempt_history_limit :])
@@ -2388,14 +2776,28 @@ class TerminalMonitor:
         state = classify_state(history, self.profile, activity=activity, session_tracker=self.session_tracker)
         self._complete_observed_attempt(history, state)
         mode = self.profile.detect_mode(history)
+        self.last_heartbeat = now_iso()
+        if activity.commands:
+            self.last_command = activity.commands[0]
+        self.todo_progress = extract_todo_progress(history)
+        self.detected_task_id = infer_current_task_id(history)
+        self.last_action = f"observe:{state}"
+        safe_snapshot, snapshot_truncated = redact_snapshot(snapshot)
+        safe_tab = dict(tab)
+        safe_tab["hist"], _ = redact_snapshot(str(tab.get("hist", "")))
+        todo = extract_todo_progress(history)
+        detected_task_id = infer_current_task_id(history)
         return {
             "ok": True,
             "pids": pids,
             "state": state,
             "mode": mode,
-            "snapshot": snapshot,
-            "activity": activity,
-            "tab": tab,
+            "snapshot": safe_snapshot,
+            "snapshot_truncated": snapshot_truncated,
+            "activity": json_safe(activity),
+            "todo": todo,
+            "task": {"task_id": self.task_state.task_id, "detected_id": detected_task_id, "stage": self.task_state.last_known_stage},
+            "tab": safe_tab,
         }
 
     def step(self) -> tuple[int | None, str]:
@@ -2405,14 +2807,14 @@ class TerminalMonitor:
         If exit_code is None, the monitor should continue running.
         """
         if os.path.exists(self.stop_path):
-            self.export_status_json([], "cancelled", {"running": False})
+            self._stop_status("stop_file")
             return 0, "CANCELLED"
 
         pids = self.backend.get_pids(self.config.process)
         if pids:
             self.last_seen = time.monotonic()
         elif time.monotonic() - self.last_seen >= self.config.gone_seconds:
-            self.export_status_json([], "process_gone", {"running": False})
+            self._stop_status("agent_gone")
             return 0, "PROCESS_GONE"
 
         tab = self._get_tab(pids)
@@ -2423,11 +2825,18 @@ class TerminalMonitor:
 
         history = str(tab.get("hist", ""))
         snapshot = normalize_snapshot(history)
+        safe_snapshot, _ = redact_snapshot(snapshot)
         digest = hashlib.sha256(snapshot.encode("utf-8", "replace")).hexdigest()[:16]
         activity = self._process_activity(pids, bool(tab.get("busy")))
         state = classify_state(history, self.profile, activity=activity, session_tracker=self.session_tracker)
         self._complete_observed_attempt(history, state)
         mode = self.profile.detect_mode(history)
+        self.last_heartbeat = now_iso()
+        if activity.commands:
+            self.last_command = activity.commands[0]
+        self.todo_progress = extract_todo_progress(history)
+        self.detected_task_id = infer_current_task_id(history)
+        self.last_action = f"observe:{state}"
 
         if mode != self.current_mode:
             if self.on_mode_change:
@@ -2478,7 +2887,7 @@ class TerminalMonitor:
                 reason,
             )
             with open(self.attention_path, "w", encoding="utf-8") as handle:
-                handle.write(json.dumps(repository_safety, indent=2) + "\n" + snapshot + "\n")
+                handle.write(json.dumps(repository_safety, indent=2) + "\n" + safe_snapshot + "\n")
             self.log(f"PAUSE kind=repository_safety reason={reason}")
             self.export_status_json(pids, "branch_safety", {"repository_safety": repository_safety})
             return 3, f"ATTENTION_REQUIRED kind=repository_safety reason={reason} file={self.attention_path}"
@@ -2523,7 +2932,7 @@ class TerminalMonitor:
             if not allowed:
                 self._record_policy_decision(manual_answer, "blocked", policy_reason)
                 with open(self.attention_path, "w", encoding="utf-8") as handle:
-                    handle.write(snapshot + "\n")
+                    handle.write(safe_snapshot + "\n")
                 self.log(f"PAUSE kind=policy_conflict reason={policy_reason}")
                 return 3, f"ATTENTION_REQUIRED kind=policy_conflict file={self.attention_path}"
             attempt_id = self._queue_attempt("manual", manual_answer, state)
@@ -2537,6 +2946,7 @@ class TerminalMonitor:
             self.sends += 1
             self.last_send = time.monotonic()
             self.last_change = time.monotonic()
+            self.last_action = f"send:manual:{'accepted' if ok else 'failed'}"
             self.session_tracker.mark_interaction(history)
             self.task_state = replace(
                 self.task_state,
@@ -2571,6 +2981,7 @@ class TerminalMonitor:
                     self._transition_attempt(attempt_id, "accepted" if ok else "ignored", detail=detail, observed_state=state)
                     self.last_send = time.monotonic()
                     self.sends += 1
+                    self.last_action = f"send:final_verification:{'accepted' if ok else 'failed'}"
                     self.log(f"SEND kind=final_verification n={self.sends} ok={ok} detail={detail}")
                     return (None, "SENT kind=final_verification") if ok else (1, "SEND_FAILED kind=final_verification")
             self.log("SUCCESS: Completion indicators detected. Work complete.")
@@ -2596,6 +3007,7 @@ class TerminalMonitor:
         # Handle Plan Mode Auto-Transition
         if self.config.auto_switch_modes and mode == "plan" and self.profile.is_plan_ready(history) and stable_for >= mode_threshold:
             self.log("MODE: Plan completed. Auto-switching mode via switch key.")
+            self.last_action = "mode_switch:queued"
             attempt_id = self._queue_attempt("mode_switch", self.profile.mode_switch_key, state)
             if self.config.dry_run:
                 self._transition_attempt(attempt_id, "ignored", detail="dry_run", observed_state=state)
@@ -2606,6 +3018,7 @@ class TerminalMonitor:
             self._transition_attempt(attempt_id, "accepted" if ok else "ignored", detail=detail, observed_state=state)
             self.last_send = time.monotonic()
             self.last_change = time.monotonic()
+            self.last_action = "mode_switch:accepted" if ok else "mode_switch:failed"
             if self.config.continue_text:
                 time.sleep(0.5)
                 self.backend.send(self.config.process, self.config.title, self.config.continue_text)
@@ -2635,9 +3048,9 @@ class TerminalMonitor:
 
         if payload is None:
             with open(self.attention_path, "w", encoding="utf-8") as handle:
-                handle.write(snapshot + "\n")
+                handle.write(safe_snapshot + "\n")
             if self.on_attention:
-                self.on_attention(reason, snapshot)
+                self.on_attention(reason, safe_snapshot)
             self.log(f"PAUSE kind={reason} hash={digest}")
             return 3, f"ATTENTION_REQUIRED kind={reason} file={self.attention_path}"
 
@@ -2649,7 +3062,7 @@ class TerminalMonitor:
         if not allowed:
             self._record_policy_decision(payload, "blocked", policy_reason)
             with open(self.attention_path, "w", encoding="utf-8") as handle:
-                handle.write(snapshot + "\n")
+                handle.write(safe_snapshot + "\n")
             self.log(f"PAUSE kind=policy_conflict reason={policy_reason}")
             return 3, f"ATTENTION_REQUIRED kind=policy_conflict file={self.attention_path}"
 
@@ -2665,6 +3078,7 @@ class TerminalMonitor:
         self.export_status_json(pids, state, {"last_attempt_id": attempt_id})
         self.sends += 1
         self.last_send = time.monotonic()
+        self.last_action = f"send:{reason}:{'accepted' if ok else 'failed'}"
         self.log(f"SEND kind={reason} n={self.sends} ok={ok} detail={detail}")
         if ok:
             self.session_tracker.mark_interaction(history)
@@ -2688,12 +3102,26 @@ class TerminalMonitor:
 
     def run(self) -> int:
         """Run monitor loop continuously until exit condition is met."""
+        if not self._claim_monitor_lock():
+            self.log("EXIT code=2 msg=MONITOR_ALREADY_RUNNING")
+            return 2
         self.log(f"START process={self.config.process} profile={self.profile.name} backend={self.backend.name()}")
+        self._install_shutdown_handlers()
         try:
             while True:
+                if self._shutdown_requested:
+                    reason = self._shutdown_reason or "shutdown"
+                    self.log(f"EXIT code=0 msg=STOPPED reason={reason}")
+                    self._stop_status(reason)
+                    return 0
                 code, msg = self.step()
                 if code is not None:
                     self.log(f"EXIT code={code} msg={msg}")
+                    if msg == "COMPLETED":
+                        self.export_status_json([], "completed", {"running": False, "lifecycle": "completed", "done": True})
+                        self._release_monitor_lock("completed")
+                    elif self._lock_claimed:
+                        self._stop_status(msg.lower().replace(" ", "_"))
                     return code
                 pr_number = self.task_state.pr.get("number")
                 if self.task_state.last_known_stage == "CI_PENDING" and pr_number and shutil.which("gh"):
@@ -2708,8 +3136,12 @@ class TerminalMonitor:
                 )
         except KeyboardInterrupt:
             self.log("EXIT code=130 msg=INTERRUPTED")
-            self.export_status_json([], "interrupted", {"running": False})
+            self._stop_status("SIGINT")
             return 130
+        finally:
+            self._restore_shutdown_handlers()
+            if self._lock_claimed:
+                self._release_monitor_lock(self._lifecycle if self._lifecycle != "running" else "stopped")
 
     def _change_fingerprint(self) -> str:
         """Cheap file, process, and repository signals used for early wakeup."""
@@ -2763,6 +3195,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     # list profiles subcommand
     subparsers.add_parser("profiles", help="List built-in and discovered agent profiles")
+
+    status_parser = subparsers.add_parser("status", help="Show a live colored monitor dashboard")
+    status_parser.add_argument("--state-dir", default=None, help="Monitor state directory")
+    status_parser.add_argument("--project-dir", "-d", default=None, help="Project directory for repository details")
+    status_parser.add_argument("--json", action="store_true", dest="status_json", help="Print machine-readable JSON")
+    status_parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
+    status_parser.add_argument("--watch", action="store_true", help="Refresh the dashboard continuously")
+    status_parser.add_argument("--interval", type=float, default=2.0, help="Refresh interval for --watch")
+
+    stop_parser = subparsers.add_parser("stop", help="Stop the monitor without interrupting the agent")
+    stop_parser.add_argument("--state-dir", default=None, help="Monitor state directory")
+    stop_parser.add_argument("--reason", default="cli_stop", help="Reason recorded for the stop")
+
+    resume_parser = subparsers.add_parser("resume", help="Resume a monitor from saved launch metadata")
+    resume_parser.add_argument("--state-dir", default=None, help="Monitor state directory")
+    resume_parser.add_argument("--project-dir", "-d", default=None, help="Project directory for the monitor")
 
     send_parser = subparsers.add_parser("send", help="Send an explicit instruction to the selected agent terminal")
     send_parser.add_argument("text", help="Instruction text to send")
@@ -2845,20 +3293,20 @@ def config_from_args(args: argparse.Namespace) -> MonitorConfig:
         if discovered:
             file_cfg = load_config_file(discovered)
 
-    continue_text = args.continue_text if getattr(args, "continue_text", None) is not None else file_cfg.get("continue_text", "")
+    continue_text = getattr(args, "continue_text", None) if getattr(args, "continue_text", None) is not None else file_cfg.get("continue_text", "")
     if getattr(args, "continue_file", None):
         continue_path = Path(args.continue_file).resolve()
         if continue_path.is_file():
             continue_text = continue_path.read_text(encoding="utf-8").strip()
 
     is_supervise = bool(getattr(args, "supervise", False) or getattr(args, "command", "") == "supervise" or file_cfg.get("supervise", False))
-    auto_allow = bool(args.auto_allow_permissions if getattr(args, "auto_allow_permissions", None) is not None else (is_supervise or file_cfg.get("auto_allow_permissions", False)))
+    auto_allow = bool(getattr(args, "auto_allow_permissions", None) if getattr(args, "auto_allow_permissions", None) is not None else (is_supervise or file_cfg.get("auto_allow_permissions", False)))
     smart_nudges = not getattr(args, "no_smart_nudges", False) and bool(is_supervise or file_cfg.get("smart_nudges", True))
     auto_switch = not getattr(args, "no_mode_switch", False) and bool(is_supervise or file_cfg.get("auto_switch_modes", True))
     completion_check = not getattr(args, "no_completion_check", False) and bool(is_supervise or file_cfg.get("completion_check", True))
 
-    process = args.process or file_cfg.get("process", "opencode")
-    profile = args.profile or file_cfg.get("profile", process)
+    process = getattr(args, "process", None) or file_cfg.get("process", "opencode")
+    profile = getattr(args, "profile", None) or file_cfg.get("profile", process)
 
     def _val(arg_val: Any, cfg_key: str, default_val: Any) -> Any:
         if arg_val is not None:
@@ -2940,6 +3388,45 @@ def main() -> int:
         return 0
 
     config = config_from_args(args)
+    if config.supervise:
+        launch = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
+        if "--state-dir" not in launch:
+            launch.extend(["--state-dir", config.state_dir])
+        if "--project-dir" not in launch and "-d" not in launch:
+            launch.extend(["--project-dir", config.project_dir])
+        for prohibition in config.prohibitions:
+            if prohibition not in launch:
+                launch.extend(["--prohibition", prohibition])
+        config = replace(config, launch_command=tuple(launch))
+
+    if args.command == "status":
+        refresh = max(0.25, float(getattr(args, "interval", 2.0)))
+        color = not bool(getattr(args, "no_color", False)) and sys.stdout.isatty()
+        try:
+            while True:
+                snapshot = read_status_snapshot(config.state_dir, config.project_dir)
+                if getattr(args, "status_json", False):
+                    print(json.dumps(json_safe(snapshot), indent=2, sort_keys=True))
+                else:
+                    if getattr(args, "watch", False) and color:
+                        print("\033[2J\033[H", end="")
+                    print(render_status_dashboard(snapshot, color=color))
+                if not getattr(args, "watch", False):
+                    break
+                time.sleep(refresh)
+        except KeyboardInterrupt:
+            return 130
+        return 0
+
+    if args.command == "stop":
+        result = stop_monitor(config.state_dir, reason=str(getattr(args, "reason", "cli_stop")))
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result.get("ok") else 2
+
+    if args.command == "resume":
+        result = resume_monitor(config.state_dir, project_dir=config.project_dir)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result.get("ok") else 2
 
     if args.command == "send":
         policy = PolicyEnvelope(config.objective, tuple(config.prohibitions))
@@ -3004,7 +3491,7 @@ def main() -> int:
 
     if config.once:
         inspected = monitor.inspect()
-        print(json.dumps(inspected, indent=2))
+        print(json.dumps(json_safe(inspected), indent=2, sort_keys=True))
         return 0 if inspected.get("ok") else 2
 
     return monitor.run()

@@ -124,17 +124,33 @@ python3 terminal_monitor.py \
 
 ### 5. Inspect Without Sending (`--once` / `--dry-run`)
 ```bash
-# One-shot inspection
+# One-shot inspection (JSON-safe, bounded, and credential-redacted)
 python3 terminal_monitor.py --profile opencode --once
 
 # Monitor in dry-run mode (logs decisions without typing to terminal)
 python3 terminal_monitor.py --profile claude --dry-run
 ```
 
-### 6. Graceful Stop
-To gracefully stop a running supervisor or monitor daemon:
+### 6. Colored status dashboard and lifecycle control
+The status command reads the live heartbeat, agent state, current child
+command, task progress, repository/CI stage, and safety policy. It detects a
+stale PID instead of trusting an old `status.json` blindly:
+
 ```bash
-touch /tmp/terminal-monitor/stop
+python3 terminal_monitor.py status \
+  --state-dir /tmp/terminal-monitor \
+  --project-dir .
+
+# Refresh continuously, or use --json for integrations
+python3 terminal_monitor.py status --state-dir /tmp/terminal-monitor --watch
+python3 terminal_monitor.py status --state-dir /tmp/terminal-monitor --json
+```
+
+Stop and resume affect only the monitor process; the agent remains untouched:
+
+```bash
+python3 terminal_monitor.py stop --state-dir /tmp/terminal-monitor
+python3 terminal_monitor.py resume --state-dir /tmp/terminal-monitor --project-dir .
 ```
 
 ### 7. Operational control commands
@@ -286,7 +302,13 @@ Whenever a state directory exists, `TerminalMonitor` atomically maintains `<stat
 
 ```json
 {
+  "schema_version": 2,
   "running": true,
+  "lifecycle": "running",
+  "monitor_pid": 21340,
+  "monitor_instance_id": "4f2c...",
+  "started_at": "2026-08-24T18:00:00Z",
+  "heartbeat": "2026-08-24T18:00:12Z",
   "pids": [21353],
   "process": "opencode",
   "profile": "opencode",
@@ -303,11 +325,22 @@ Whenever a state directory exists, `TerminalMonitor` atomically maintains `<stat
   },
   "task": {
     "task_id": "work-42",
+    "detected_id": "work-42",
     "stage": "CI_PENDING",
     "session_generation": 3,
     "pr": {"number": 42, "head": "d78ae3d..."},
     "npm_publish_allowed": false
   },
+  "todo": {
+    "total": 6,
+    "completed": 3,
+    "in_progress": 1,
+    "pending": 2,
+    "items": [{"label": "Run tests", "state": "in_progress"}]
+  },
+  "last_action": "observe:thinking",
+  "last_command": "python3 -m unittest discover -s tests",
+  "history": {"available": true, "redacted": true, "max_chars": 6000},
   "attempts": [
     {
       "attempt_id": "attempt-1724440000000-1",
@@ -341,6 +374,12 @@ Whenever a state directory exists, `TerminalMonitor` atomically maintains `<stat
 }
 ```
 
+`status` renders this data as a colored dashboard. `--json` returns the
+combined live and durable state for integrations. Terminal history exposed by
+`--once` and `attention.txt` is bounded and credential-redacted by default.
+When a supervisor is killed without a final heartbeat, `status` reports
+`STALE` instead of claiming that it is still running.
+
 ## PR/CI and final-verification stages
 
 The supervisor persists these stages instead of inferring progress only from terminal prose:
@@ -372,6 +411,13 @@ failure requiring a fix.
 - `final-report.json` is written beside `status.json` by default and contains
   the final checks, evidence, attempts, CI classifications, policy decisions,
   and the explicit npm prohibition.
+- `monitor.json` and `monitor.pid` identify the live supervisor. `stop`
+  sends a signal only after verifying that PID belongs to this monitor;
+  `resume` uses the saved, validated launch vector and never targets the
+  agent process.
+- `SIGINT` and `SIGTERM` now write a final heartbeat with
+  `lifecycle: "stopped"`; consumers should use `monitor_alive`/stale
+  detection instead of trusting an old `running` value.
 - `--dry-run` never sends terminal text or keys, starts an agent, or merges a
   PR. `merge-pr --dry-run` only prints the planned exact-head action.
 - A malformed `task-state.json` stops initialization with `StateFileError` instead of silently discarding safety policy.

@@ -80,3 +80,16 @@ apenas testar a extração de texto do terminal.
 Um modo `--dry-run` deve mostrar qual ação o monitor tomaria, sem enviar teclas,
 aprovar permissões ou alterar o GitHub. Isso facilita validar políticas antes de
 usar o supervisor em um projeto novo.
+
+## Implementação desta rodada
+
+As cinco melhorias priorizadas a partir do uso real foram implementadas:
+
+- desligamento por sinal com heartbeat final, PID lock e detecção de estado
+  obsoleto;
+- inspeção `--once` JSON-safe, limitada e com mascaramento de credenciais;
+- painel `status` colorido com tarefa, progresso, comando atual, Git, CI e
+  política npm;
+- comandos `stop`, `status` e `resume` que nunca sinalizam o processo do
+  agente;
+- testes de regressão e documentação no README/ABOUT para o novo ciclo de vida.
