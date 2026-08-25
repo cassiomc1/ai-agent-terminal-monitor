@@ -2199,7 +2199,7 @@ def redact_sensitive(text: str) -> str:
     return redacted
 
 
-TODO_ITEM_PATTERN = re.compile(r"(?P<marker>\[(?:\s|x|X|•|·|✓|✔|~|-)\])\s*(?P<label>.+?)\s*$")
+TODO_ITEM_PATTERN = re.compile(r"(?P<marker>\[(?:\s|x|X|•|·|✓|✔|~|-)\])\s*(?P<label>[^\[\r\n\│\┃]+)")
 TODO_COMPLETION_RATIO_PATTERN = re.compile(
     r"(?<!\d)(?P<completed>\d+)\s*/\s*(?P<total>\d+)"
     r"(?:\s*(?:tasks?|tarefas?))?\s*"
@@ -2275,31 +2275,58 @@ def _explicit_todo_completion(history: str, marker_total: int) -> dict[str, Any]
     return None
 
 
-def extract_todo_progress(history: str) -> dict[str, Any]:
+def extract_todo_progress(history: str, *, session_history: str = "") -> dict[str, Any]:
     """Extract task progress, preferring a current explicit summary to TUI markers."""
-    items: dict[str, dict[str, str]] = {}
+    raw_items = []
+    priority = {"pending": 0, "in_progress": 1, "completed": 2}
     for line in str(history).splitlines():
-        match = TODO_ITEM_PATTERN.search(line)
-        if not match:
+        for match in TODO_ITEM_PATTERN.finditer(line):
+            raw_label = match.group("label")
+            label = re.sub(r"\s+", " ", raw_label).strip(" │┃")
+            if not label:
+                continue
+            marker = match.group("marker").lower()
+            state = "completed" if marker in {"[x]", "[✓]", "[✔]"} else "in_progress" if marker in {"[•]", "[·]", "[~]", "[-]"} else "pending"
+            raw_items.append({"label": label, "state": state})
+
+    consolidated: dict[str, dict[str, str]] = {}
+    for item in raw_items:
+        lbl = item["label"]
+        st = item["state"]
+        norm_key = re.sub(r"[^a-z0-9]+", " ", lbl.lower()).strip()
+        if not norm_key or len(norm_key) < 2:
             continue
-        label = re.sub(r"\s+", " ", match.group("label")).strip(" │┃")
-        if not label:
-            continue
-        marker = match.group("marker").lower()
-        state = "completed" if marker in {"[x]", "[✓]", "[✔]"} else "in_progress" if marker in {"[•]", "[·]", "[~]", "[-]"} else "pending"
-        key = label.rstrip("+").strip().lower()
-        existing = items.get(key)
-        priority = {"pending": 0, "in_progress": 1, "completed": 2}
-        if existing is None or priority[state] > priority[existing["state"]]:
-            items[key] = {"label": label.rstrip("+").strip(), "state": state}
-    ordered = list(items.values())
+
+        found_match = None
+        for existing_key in list(consolidated.keys()):
+            if norm_key == existing_key:
+                found_match = existing_key
+                break
+            if norm_key.startswith(existing_key) or existing_key.startswith(norm_key):
+                found_match = existing_key
+                break
+
+        if found_match:
+            ex = consolidated[found_match]
+            new_state = st if priority[st] > priority[ex["state"]] else ex["state"]
+            new_label = lbl if len(lbl) > len(ex["label"]) else ex["label"]
+            if len(norm_key) > len(found_match):
+                del consolidated[found_match]
+                consolidated[norm_key] = {"label": new_label, "state": new_state}
+            else:
+                consolidated[found_match] = {"label": new_label, "state": new_state}
+        else:
+            consolidated[norm_key] = {"label": lbl, "state": st}
+
+    ordered = list(consolidated.values())
     counts = {
         "total": len(ordered),
         "completed": sum(item["state"] == "completed" for item in ordered),
         "in_progress": sum(item["state"] == "in_progress" for item in ordered),
         "pending": sum(item["state"] == "pending" for item in ordered),
     }
-    explicit = _explicit_todo_completion(history, counts["total"])
+    explicit_target = session_history if session_history else history
+    explicit = _explicit_todo_completion(explicit_target, counts["total"])
     if explicit:
         return explicit
     return {**counts, "items": ordered, "source": "tui_markers", "evidence": ""}
@@ -2718,29 +2745,14 @@ DASHBOARD_HTML = """<!doctype html>
 <title>Agent Command Center</title><style>
 :root{color-scheme:dark;--orange:#fe6e00;--bg:#0b0908;--panel:rgba(25,22,20,.82);--line:rgba(255,255,255,.12);--text:#fafaf9;--muted:#b9b3ac;--green:#00c758;--yellow:#edb200;--red:#fb2c36;--blue:#3080ff}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 85% 0,rgba(254,110,0,.13),transparent 34%),var(--bg);color:var(--text);font:14px ui-sans-serif,system-ui,sans-serif;min-height:100vh}.shell{display:grid;grid-template-columns:230px 1fr;min-height:100vh}.side{padding:26px 20px;border-right:1px solid var(--line);background:rgba(0,0,0,.7);backdrop-filter:blur(18px)}.brand{font-weight:800;letter-spacing:.11em}.brand b{color:var(--orange)}.nav{margin-top:38px;color:var(--muted);line-height:2.8}.nav button{display:block;width:100%;padding:0 0 0 0;border:0;border-left:2px solid transparent;background:transparent;color:inherit;text-align:left;font:inherit;cursor:pointer}.nav button:hover{color:#fff}.nav button.active{color:#fff;border-left-color:var(--orange);padding-left:12px}.main{padding:28px;min-width:0}.top{display:flex;justify-content:space-between;align-items:end;margin-bottom:20px}.eyebrow{font:700 11px ui-monospace,monospace;color:var(--orange);letter-spacing:.15em}.top h1{font-size:27px;margin:6px 0 0}.live{font:700 11px ui-monospace,monospace;color:var(--green)}.live:before{content:'●';margin-right:7px}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}.card,.terminal,.detail{border:1px solid var(--line);background:var(--panel);backdrop-filter:blur(16px);border-radius:8px}.card{padding:15px}.label{font:700 10px ui-monospace,monospace;color:var(--muted);letter-spacing:.12em}.value{font-size:18px;font-weight:750;margin-top:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.accent{color:var(--orange)}.terminal{height:calc(100vh - 180px);min-height:430px;display:flex;flex-direction:column}.terminal-head{padding:12px 15px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;font:700 11px ui-monospace,monospace}.dots{color:var(--orange);letter-spacing:4px}.log{padding:16px;overflow:auto;white-space:pre-wrap;word-break:break-word;font:13px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace;flex:1}.line{color:var(--muted)}.line.info{color:var(--blue)}.line.ok{color:var(--green)}.line.warn{color:var(--yellow)}.line.bad{color:var(--red)}.line.action{color:var(--orange)}.empty{color:#797067}.view[hidden]{display:none}.detail{padding:18px;min-height:300px}.detail h2{font-size:18px;margin:0 0 16px}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.detail-row{padding:12px;border:1px solid var(--line);border-radius:6px;color:var(--muted)}.detail-row b{display:block;color:var(--text);margin-top:5px}.detail-list{margin:0;padding:0;list-style:none}.detail-list li{padding:10px 0;border-bottom:1px solid var(--line);font:13px/1.5 ui-monospace,monospace;color:var(--muted)}.detail-list li:last-child{border-bottom:0}@media(max-width:850px){.shell{grid-template-columns:1fr}.side{display:none}.cards{grid-template-columns:repeat(2,1fr)}.main{padding:18px}.terminal{height:calc(100vh - 230px)}.detail-grid{grid-template-columns:1fr}}
-</style></head><body><div class="shell"><aside class="side"><div class="brand"><b>◉</b> AGENT // CENTER</div><nav class="nav" aria-label="Dashboard views"><button class="active" type="button" data-view="live" aria-selected="true">Live Operations</button><button type="button" data-view="process" aria-selected="false">Process Activity</button><button type="button" data-view="safety" aria-selected="false">Safety Events</button><button type="button" data-view="attempts" aria-selected="false">Attempt Ledger</button></nav></aside><main class="main"><div class="top"><div><div class="eyebrow">AUTONOMOUS OPERATIONS CONSOLE</div><h1>Terminal Monitor</h1></div><div class="live" id="connection">LIVE</div></div><section class="view" data-view-panel="live"><section class="cards"><div class="card"><div class="label">AGENT STATE</div><div class="value accent" id="state">—</div></div><div class="card"><div class="label">PROCESS</div><div class="value" id="process">—</div></div><div class="card"><div class="label">TASK PROGRESS</div><div class="value" id="progress">—</div></div><div class="card"><div class="label">GIT BRANCH</div><div class="value" id="branch">—</div></div></section><section class="terminal"><div class="terminal-head"><span>LIVE OPERATIONAL LOG</span><span class="dots">● ● ●</span></div><div class="log" id="log"><span class="empty">Waiting for monitor events…</span></div></section></section><section class="view" data-view-panel="process" hidden><div class="detail"><h2>Process Activity</h2><div class="detail-grid"><div class="detail-row">Agent<b id="process-agent">—</b></div><div class="detail-row">CPU<b id="process-cpu">—</b></div><div class="detail-row">Oldest command<b id="process-age">—</b></div><div class="detail-row">PIDs<b id="process-pids">—</b></div></div><h2 style="margin-top:24px">Current commands</h2><ul class="detail-list" id="process-commands"><li>Waiting for process data…</li></ul></div></section><section class="view" data-view-panel="safety" hidden><div class="detail"><h2>Safety Events</h2><ul class="detail-list" id="safety-list"><li>No safety events recorded.</li></ul></div></section><section class="view" data-view-panel="attempts" hidden><div class="detail"><h2>Attempt Ledger</h2><ul class="detail-list" id="attempt-list"><li>No continuation attempts recorded.</li></ul></div></section></main></div><script>
+</style></head><body><div class="shell"><aside class="side"><div class="brand"><b>◉</b> AGENT // CENTER</div><nav class="nav" aria-label="Dashboard views"><button class="active" type="button" data-view="live" aria-selected="true">Live Operations</button><button type="button" data-view="tasks" aria-selected="false">Task Plan</button><button type="button" data-view="process" aria-selected="false">Process Activity</button><button type="button" data-view="safety" aria-selected="false">Safety Events</button><button type="button" data-view="attempts" aria-selected="false">Attempt Ledger</button></nav></aside><main class="main"><div class="top"><div><div class="eyebrow">AUTONOMOUS OPERATIONS CONSOLE</div><h1>Terminal Monitor</h1></div><div class="live" id="connection">LIVE</div></div><section class="view" data-view-panel="live"><section class="cards"><div class="card"><div class="label">AGENT STATE</div><div class="value accent" id="state">—</div></div><div class="card"><div class="label">PROCESS</div><div class="value" id="process">—</div></div><div class="card"><div class="label">TASK PROGRESS</div><div class="value" id="progress">—</div></div><div class="card"><div class="label">GIT BRANCH</div><div class="value" id="branch">—</div></div></section><section class="terminal"><div class="terminal-head"><span>LIVE OPERATIONAL LOG</span><span class="dots">● ● ●</span></div><div class="log" id="log"><span class="empty">Waiting for monitor events…</span></div></section><section class="terminal snapshot-terminal" style="margin-top:14px;height:260px;min-height:160px"><div class="terminal-head"><span>AGENT TERMINAL SNAPSHOT (REDACTED)</span><span class="dots">◉</span></div><pre class="log" id="terminal"><span class="empty">Waiting for terminal output…</span></pre></section></section><section class="view" data-view-panel="tasks" hidden><div class="detail"><h2>Task Plan & Progress</h2><div class="detail-grid" style="grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:20px"><div class="detail-row">Total Tasks<b id="task-total">0</b></div><div class="detail-row">Completed<b id="task-completed" style="color:var(--green)">0</b></div><div class="detail-row">In Progress<b id="task-in-progress" style="color:var(--yellow)">0</b></div><div class="detail-row">Pending<b id="task-pending">0</b></div></div><h2 style="margin-top:24px">Detected Task Items</h2><ul class="detail-list" id="task-items"><li>Waiting for task data…</li></ul></div></section><section class="view" data-view-panel="process" hidden><div class="detail"><h2>Process Activity</h2><div class="detail-grid"><div class="detail-row">Agent<b id="process-agent">—</b></div><div class="detail-row">CPU<b id="process-cpu">—</b></div><div class="detail-row">Oldest command<b id="process-age">—</b></div><div class="detail-row">PIDs<b id="process-pids">—</b></div></div><h2 style="margin-top:24px">Current commands</h2><ul class="detail-list" id="process-commands"><li>Waiting for process data…</li></ul></div></section><section class="view" data-view-panel="safety" hidden><div class="detail"><h2>Safety Events</h2><ul class="detail-list" id="safety-list"><li>No safety events recorded.</li></ul></div></section><section class="view" data-view-panel="attempts" hidden><div class="detail"><h2>Attempt Ledger</h2><ul class="detail-list" id="attempt-list"><li>No continuation attempts recorded.</li></ul></div></section></main></div><script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function tone(s){s=s.toUpperCase();if(/SUCCESS|COMPLETED|GREEN|MERGED/.test(s))return'ok';if(/ATTENTION|PAUSE|WARN|QUEUED/.test(s))return'warn';if(/FAILED|ERROR|BLOCKED|REFUSED/.test(s))return'bad';if(/SEND|MODE|START|INTERRUPT|RECOVER/.test(s))return'action';return'info'}
 function listItems(items, empty){return items.length?items.map(x=>'<li>'+esc(x)+'</li>').join(''):'<li>'+esc(empty)+'</li>'}
 function showView(view){document.querySelectorAll('[data-view-panel]').forEach(panel=>{panel.hidden=panel.dataset.viewPanel!==view});document.querySelectorAll('[data-view]').forEach(button=>{const active=button.dataset.view===view;button.classList.toggle('active',active);button.setAttribute('aria-selected',String(active))})}
 document.querySelectorAll('[data-view]').forEach(button=>button.addEventListener('click',()=>showView(button.dataset.view)));
-async function tick(){try{const [sr,er,tr]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/events',{cache:'no-store'}),fetch('/api/terminal',{cache:'no-store'})]);const s=await sr.json(),e=await er.json(),terminalData=await tr.json();const activity=s.activity||{};state.textContent=s.state||'starting';process.textContent=(s.process||'agent')+' · '+((s.pids||[]).length)+' pid';const t=s.todo||{};progress.textContent=(t.completed||0)+' / '+(t.total||0);branch.textContent=(s.git||{}).branch||'—';log.innerHTML=(e.lines||[]).map(x=>'<div class="line '+tone(x)+'">'+esc(x)+'</div>').join('')||'<span class="empty">Waiting for monitor events…</span>';log.scrollTop=log.scrollHeight;terminal.textContent=terminalData.snapshot||'Waiting for terminal output…';document.getElementById('process-agent').textContent=(s.process||'agent')+' · '+(activity.active?'active':'idle');document.getElementById('process-cpu').textContent=String(activity.cpu_percent??0)+'%';document.getElementById('process-age').textContent=String(activity.oldest_seconds??0)+'s';document.getElementById('process-pids').textContent=(s.pids||[]).join(', ')||'none';document.getElementById('process-commands').innerHTML=listItems(activity.commands||[],'No active commands.');const safety=(s.policy_decisions||[]).map(x=>(x.timestamp||'')+' · '+(x.decision||'event')).concat((e.lines||[]).filter(x=>/ATTENTION|BLOCK|REFUSED|UNSAFE|SAFETY/i.test(x)));document.getElementById('safety-list').innerHTML=listItems(safety,'No safety events recorded.');const attempts=(s.attempts||[]).map(x=>(x.timestamp||'')+' · '+(x.status||'unknown')+' · '+(x.observed_state||''));document.getElementById('attempt-list').innerHTML=listItems(attempts,'No continuation attempts recorded.');connection.textContent='LIVE'}catch(e){connection.textContent='RECONNECTING'}}setInterval(tick,1000);tick();
+async function tick(){try{const [sr,er,tr]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/events',{cache:'no-store'}),fetch('/api/terminal',{cache:'no-store'})]);const s=await sr.json(),e=await er.json(),terminalData=await tr.json();const activity=s.activity||{};state.textContent=s.state||'starting';process.textContent=(s.process||'agent')+' · '+((s.pids||[]).length)+' pid';const t=s.todo||{};progress.textContent=(t.completed||0)+' / '+(t.total||0);branch.textContent=(s.git||{}).branch||'—';log.innerHTML=(e.lines||[]).map(x=>'<div class="line '+tone(x)+'">'+esc(x)+'</div>').join('')||'<span class="empty">Waiting for monitor events…</span>';log.scrollTop=log.scrollHeight;terminal.textContent=terminalData.snapshot||'Waiting for terminal output…';document.getElementById('process-agent').textContent=(s.process||'agent')+' · '+(activity.active?'active':'idle');document.getElementById('process-cpu').textContent=String(activity.cpu_percent??0)+'%';document.getElementById('process-age').textContent=String(activity.oldest_seconds??0)+'s';document.getElementById('process-pids').textContent=(s.pids||[]).join(', ')||'none';document.getElementById('process-commands').innerHTML=listItems(activity.commands||[],'No active commands.');document.getElementById('task-total').textContent=String(t.total||0);document.getElementById('task-completed').textContent=String(t.completed||0);document.getElementById('task-in-progress').textContent=String(t.in_progress||0);document.getElementById('task-pending').textContent=String(t.pending||0);const items=t.items||[];const taskHtml=items.length?items.map(x=>{const st=x.state||'pending';const badgeCls=st==='completed'?'ok':st==='in_progress'?'action':'warn';const badgeText=st==='completed'?'DONE':st==='in_progress'?'ACTIVE':'TODO';return '<li style="display:flex;align-items:center;gap:10px;padding:8px 0"><span class="line '+badgeCls+'" style="font-weight:700;font-size:11px;padding:2px 6px;border:1px solid currentColor;border-radius:4px;min-width:55px;text-align:center">'+badgeText+'</span><span style="color:var(--text)">'+esc(x.label)+'</span></li>'}).join(''):'<li>No tasks detected in agent terminal.</li>';document.getElementById('task-items').innerHTML=taskHtml;const safety=(s.policy_decisions||[]).map(x=>(x.timestamp||'')+' · '+(x.decision||'event')).concat((e.lines||[]).filter(x=>/ATTENTION|BLOCK|REFUSED|UNSAFE|SAFETY/i.test(x)));document.getElementById('safety-list').innerHTML=listItems(safety,'No safety events recorded.');const attempts=(s.attempts||[]).map(x=>(x.timestamp||'')+' · '+(x.status||'unknown')+' · '+(x.observed_state||''));document.getElementById('attempt-list').innerHTML=listItems(attempts,'No continuation attempts recorded.');connection.textContent='LIVE'}catch(e){connection.textContent='RECONNECTING'}}setInterval(tick,1000);tick();
 </script></body></html>"""
-
-# Keep the static console easy to review while adding the redacted terminal
-# snapshot as a first-class live surface for operators.
-DASHBOARD_HTML = DASHBOARD_HTML.replace(
-    '<section class="terminal"><div class="terminal-head"><span>LIVE OPERATIONAL LOG</span><span class="dots">● ● ●</span></div><div class="log" id="log"><span class="empty">Waiting for monitor events…</span></div></section>',
-    '<section class="terminal"><div class="terminal-head"><span>LIVE OPERATIONAL LOG</span><span class="dots">● ● ●</span></div><div class="log" id="log"><span class="empty">Waiting for monitor events…</span></div></section><section class="terminal snapshot-terminal" style="margin-top:14px;height:260px;min-height:160px"><div class="terminal-head"><span>AGENT TERMINAL SNAPSHOT (REDACTED)</span><span class="dots">◉</span></div><pre class="log" id="terminal"><span class="empty">Waiting for terminal output…</span></pre></section>',
-)
-DASHBOARD_HTML = DASHBOARD_HTML.replace(
-    "const [sr,er]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/events',{cache:'no-store'})]);const s=await sr.json(),e=await er.json();",
-    "const [sr,er,tr]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/events',{cache:'no-store'}),fetch('/api/terminal',{cache:'no-store'})]);const s=await sr.json(),e=await er.json(),terminalData=await tr.json();",
-)
-DASHBOARD_HTML = DASHBOARD_HTML.replace(
-    "log.scrollTop=log.scrollHeight;connection.textContent='LIVE'",
-    "log.scrollTop=log.scrollHeight;terminal.textContent=terminalData.snapshot||'Waiting for terminal output…';connection.textContent='LIVE'",
-)
 
 
 class MonitorWebServer:
@@ -3371,8 +3383,8 @@ class TerminalMonitor:
         if activity.commands:
             self.last_command = activity.commands[0]
         todo_history = self.session_tracker.current_segment(history) if self.session_tracker.interaction_history else history
-        if todo_history.strip():
-            self.todo_progress = extract_todo_progress(todo_history)
+        if history.strip():
+            self.todo_progress = extract_todo_progress(history, session_history=todo_history)
         self.detected_task_id = infer_current_task_id(history)
         self.last_action = f"observe:{state}"
         safe_snapshot, snapshot_truncated = redact_snapshot(snapshot)
@@ -3429,8 +3441,8 @@ class TerminalMonitor:
         if activity.commands:
             self.last_command = activity.commands[0]
         todo_history = self.session_tracker.current_segment(history) if self.session_tracker.interaction_history else history
-        if todo_history.strip():
-            self.todo_progress = extract_todo_progress(todo_history)
+        if history.strip():
+            self.todo_progress = extract_todo_progress(history, session_history=todo_history)
         self.detected_task_id = infer_current_task_id(history)
         self.last_action = f"observe:{state}"
 
