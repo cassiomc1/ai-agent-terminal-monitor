@@ -520,6 +520,40 @@ class RobustnessTests(unittest.TestCase):
         self.assertEqual(progress["pending"], 0)
         self.assertEqual(progress["source"], "explicit_summary")
 
+    def test_extract_todo_progress_handles_split_column_and_side_pane(self):
+        history = (
+            "  ┃    \"refactor\",                                      [•] Read ForgeLoop protocol docs (               [•] Read ForgeLoop protocol docs (      \n"
+            "  ┃                                                     [ ] Discover existing ForgeLoop                  [ ] Discover existing ForgeLoop         \n"
+            "  ┃  $ node src/cli.js route                            [ ] Task 1: Freeze security-                     [ ] Task 1: Freeze security-            \n"
+            "  ┃  error: ROUTING_FAILURE                             [✓] Task 2: Complete capability-                 [✓] Task 2: Complete capability-        \n"
+        )
+        progress = terminal_monitor.extract_todo_progress(history)
+        self.assertEqual(progress["total"], 4)
+        self.assertEqual(progress["completed"], 1)
+        self.assertEqual(progress["in_progress"], 1)
+        self.assertEqual(progress["pending"], 2)
+        self.assertEqual(len(progress["items"]), 4)
+        self.assertEqual(progress["items"][0]["label"], "Read ForgeLoop protocol docs (")
+        self.assertEqual(progress["items"][0]["state"], "in_progress")
+        self.assertEqual(progress["items"][3]["state"], "completed")
+
+    def test_extract_todo_progress_consolidates_prefix_labels(self):
+        history = (
+            "[•] Read ForgeLoop protocol docs (LOOP_ENGINEERING, PROTOCOL_INTEGRATION)\n"
+            "[•] Read ForgeLoop protocol docs (\n"
+            "[ ] Task 1: Freeze security-sensitive transition contracts\n"
+            "[ ] Task 1: Freeze security-\n"
+        )
+        progress = terminal_monitor.extract_todo_progress(history)
+        self.assertEqual(progress["total"], 2)
+        self.assertEqual(progress["items"][0]["label"], "Read ForgeLoop protocol docs (LOOP_ENGINEERING, PROTOCOL_INTEGRATION)")
+        self.assertEqual(progress["items"][1]["label"], "Task 1: Freeze security-sensitive transition contracts")
+
+    def test_dashboard_html_contains_task_plan(self):
+        self.assertIn("Task Plan", terminal_monitor.DASHBOARD_HTML)
+        self.assertIn("task-total", terminal_monitor.DASHBOARD_HTML)
+        self.assertIn("task-items", terminal_monitor.DASHBOARD_HTML)
+
     def test_completion_summary_overrides_terminal_busy_without_child_command(self):
         history = "Tarefas ForgeLoop: 35/35 COMPLETE (nenhuma pendente)"
         activity = terminal_monitor.ProcessActivity(active=True)
