@@ -2591,8 +2591,15 @@ def _monitor_process_matches(pid: int | str | None, state_dir: str | Path) -> bo
     if code != 0:
         return False
     command = output.lower()
-    state_candidates = {str(Path(state_dir)).lower(), str(Path(state_dir).resolve()).lower()}
-    return "terminal_monitor.py" in command and any(candidate in command for candidate in state_candidates)
+    if "terminal_monitor" not in command:
+        return False
+    state_path = Path(state_dir).resolve()
+    state_candidates = {
+        str(state_path).lower(),
+        str(state_path.name).lower(),
+        state_path.name.split("-")[0].lower(),
+    }
+    return any(candidate in command for candidate in state_candidates) or "terminal_monitor" in command
 
 
 def stop_monitor(state_dir: str | Path, *, reason: str = "cli_stop") -> dict[str, Any]:
