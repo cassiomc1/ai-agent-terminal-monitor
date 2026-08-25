@@ -20,6 +20,7 @@ import sys
 import textwrap
 import threading
 import time
+import urllib.request
 import webbrowser
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
@@ -1538,6 +1539,8 @@ class MonitorConfig:
     web_port: int = 8765
     web_open_browser: bool = True
     loop_interrupt_wait_seconds: float = 2.0
+    desktop_notifications: bool = True
+    webhook_url: str = ""
     launch_command: tuple[str, ...] = ()
 
 
@@ -2119,6 +2122,79 @@ def resolve_project_state_dir(base_state_dir: str, project_dir: str) -> str:
     scoped_dir = Path(base_state_dir, f"{proj_name}-{proj_hash}")
     scoped_dir.mkdir(parents=True, exist_ok=True)
     return str(scoped_dir)
+
+
+def send_desktop_notification(title: str, message: str) -> bool:
+    """Send a native desktop notification on macOS or Linux without blocking."""
+    try:
+        clean_title = redact_sensitive(title).replace('"', '\\"')
+        clean_msg = redact_sensitive(message).replace('"', '\\"')
+        if sys.platform == "darwin":
+            subprocess.Popen(
+                ["osascript", "-e", f'display notification "{clean_msg}" with title "{clean_title}"'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        elif shutil.which("notify-send"):
+            subprocess.Popen(
+                ["notify-send", clean_title, clean_msg],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def dispatch_webhook(webhook_url: str, event_type: str, payload: dict[str, Any]) -> bool:
+    """Post an event payload to a configured webhook URL asynchronously in a daemon thread."""
+    if not webhook_url:
+        return False
+
+    def _post() -> None:
+        try:
+            body = json.dumps({"event": event_type, "timestamp": now_iso(), "data": json_safe(payload)}).encode("utf-8")
+            req = urllib.request.Request(
+                webhook_url,
+                data=body,
+                headers={"Content-Type": "application/json", "User-Agent": "AI-Agent-Terminal-Monitor/2.0"},
+            )
+            with urllib.request.urlopen(req, timeout=4.0):
+                pass
+        except Exception:
+            pass
+
+    threading.Thread(target=_post, name="terminal-monitor-webhook", daemon=True).start()
+    return True
+
+
+def extract_test_progress(log_text: str) -> dict[str, Any] | None:
+    """Extract real-time test execution counts from log outputs."""
+    if not log_text:
+        return None
+    sum_match = re.search(r"Tests:\s*(?:(\d+)\s*passed)?(?:[,\s]*(\d+)\s*failed)?(?:[,\s]*(\d+)\s*total)?", log_text, re.IGNORECASE)
+    if sum_match:
+        p_str, f_str, t_str = sum_match.groups()
+        passed = int(p_str or 0)
+        failed = int(f_str or 0)
+        total = int(t_str or (passed + failed))
+    else:
+        pass_matches = re.findall(r"(?:✔|✓|\bPASS\b)\s+", log_text)
+        fail_matches = re.findall(r"(?:✖|✗|\bFAIL\b)\s+", log_text)
+        if pass_matches or fail_matches:
+            passed = len(pass_matches)
+            failed = len(fail_matches)
+            total = passed + failed
+        else:
+            return None
+
+    if total > 0 or passed > 0 or failed > 0:
+        pct = round((passed / max(1, total)) * 100, 1) if total else 0.0
+        return {"passed": passed, "failed": failed, "total": total, "percent": pct}
+    return None
+
 
 
 GIT_STATUS_TTL_SECONDS = 30.0
@@ -2964,7 +3040,16 @@ body{
 <button type="button" data-view="attempts">Attempt Ledger</button>
 </nav></aside>
 <main class="main">
-<div class="top"><div><div class="lead-label">// AUTONOMOUS OPERATIONS CONSOLE</div><h1>Terminal Monitor</h1></div><div class="live-badge" id="connection">LIVE ●</div></div>
+<div class="top">
+  <div><div class="lead-label">// AUTONOMOUS OPERATIONS CONSOLE</div><h1>Terminal Monitor</h1></div>
+  <div style="display:flex;align-items:center;gap:10px">
+    <div id="instances-box" style="display:flex;align-items:center;gap:6px">
+      <span style="font:600 10px var(--font-mono);color:var(--dim)">INSTANCE:</span>
+      <select id="instance-picker" style="background:var(--paper-site);color:var(--ink-site);border:1px solid var(--line);border-radius:4px;font:11px var(--font-mono);padding:4px 8px;outline:none" onchange="switchInstance(this.value)"><option value="">Default Instance</option></select>
+    </div>
+    <div class="live-badge" id="connection">LIVE ●</div>
+  </div>
+</div>
 
 <!-- LIVE OPERATIONS VIEW -->
 <section class="view" data-view-panel="live">
@@ -2974,6 +3059,17 @@ body{
 <div class="card"><div class="card-label">TASK PROGRESS</div><div class="card-value" id="progress">—</div></div>
 <div class="card"><div class="card-label">GIT BRANCH</div><div class="card-value" id="branch">—</div></div>
 </section>
+
+<!-- TEST SUITE PROGRESS (WHEN OBSERVED) -->
+<div class="detail" id="test-progress-box" style="padding:14px 18px;margin-top:2px" hidden>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+    <span style="font:700 11px var(--font-mono);color:var(--dim);letter-spacing:.1em">TEST SUITE PROGRESS</span>
+    <span style="font:600 12px var(--font-mono)"><b id="tp-passed" style="color:var(--emerald)">0</b> passed · <b id="tp-failed" style="color:var(--red)">0</b> failed / <span id="tp-total">0</span> total</span>
+  </div>
+  <div style="width:100%;height:6px;background:var(--paper-site);border:1px solid var(--line);border-radius:999px;overflow:hidden">
+    <div id="tp-bar" style="height:100%;width:0%;background:linear-gradient(90deg,var(--emerald),var(--accent-site));transition:width .3s ease"></div>
+  </div>
+</div>
 
 <div class="action-bar">
 <div class="action-pills">
@@ -2989,7 +3085,16 @@ body{
 </div>
 
 <section class="terminal"><div class="terminal-head"><span>LIVE OPERATIONAL LOG</span><span class="dots" style="color:var(--accent-site)">● ● ●</span></div><div class="log" id="log">Waiting for monitor events…</div></section>
-<section class="terminal snapshot-terminal" style="margin-top:14px;height:240px"><div class="terminal-head"><span>AGENT TERMINAL SNAPSHOT (REDACTED)</span><span style="color:var(--accent-site)">◉</span></div><pre class="log" id="terminal">Waiting for terminal output…</pre></section>
+<section class="terminal snapshot-terminal" style="margin-top:14px;height:240px">
+  <div class="terminal-head">
+    <span>AGENT TERMINAL SNAPSHOT (REDACTED)</span>
+    <div style="display:flex;align-items:center;gap:12px">
+      <label style="font:11px var(--font-mono);color:var(--dim);display:flex;align-items:center;gap:4px;cursor:pointer"><input type="checkbox" id="autoscroll-chk" checked/> Auto-scroll</label>
+      <span style="color:var(--accent-site)">◉</span>
+    </div>
+  </div>
+  <pre class="log" id="terminal" style="font-family:var(--font-mono)">Waiting for terminal output…</pre>
+</section>
 </section>
 
 <!-- TASK PLAN VIEW (ARCHIFY STYLE) -->
@@ -3007,7 +3112,7 @@ body{
 <div class="card"><div class="card-label">TOTAL TASKS</div><div class="card-value" id="task-total">0</div></div>
 <div class="card"><div class="card-label">COMPLETED</div><div class="card-value" id="task-completed" style="color:var(--emerald)">0</div></div>
 <div class="card"><div class="card-label">IN PROGRESS</div><div class="card-value" id="task-in-progress" style="color:var(--yellow)">0</div></div>
-<div class="card"><div class="card-label">PENDING</div><div class="card-value" id="task-pending">0</div></div>
+<div class="card"><div class="card-label">VELOCITY &amp; ETA</div><div class="card-value" id="task-eta" style="font-size:16px;color:var(--ink-soft)">—</div></div>
 </div>
 
 <div class="filter-bar">
@@ -3054,6 +3159,22 @@ function submitCommand(){const el=document.getElementById('cmd-input');if(el&&el
 function showView(view){document.querySelectorAll('[data-view-panel]').forEach(p=>{p.hidden=p.dataset.viewPanel!==view});document.querySelectorAll('[data-view]').forEach(b=>{const a=b.dataset.view===view;b.classList.toggle('active',a);b.setAttribute('aria-selected',String(a))})}
 document.querySelectorAll('[data-view]').forEach(button=>button.addEventListener('click',()=>showView(button.dataset.view)));
 function filterTasks(f){currentFilter=f;document.querySelectorAll('.fpill').forEach(p=>p.classList.remove('active'));event&&event.target&&event.target.classList.add('active');renderTaskList()}
+function ansiToHtml(text){
+  if(!text)return'';
+  const c={'30':'#555','31':'#ff5c5c','32':'#00c758','33':'#edb200','34':'#4daafc','35':'#d180ff','36':'#00e5ff','37':'#e6e1d6','90':'#777','91':'#ff8a80','92':'#69f0ae','93':'#ffe57f','94':'#82b1ff','95':'#ea80fc','96':'#84ffff','97':'#ffffff'};
+  let t=esc(text);
+  return t.replace(/\\x1b\\[([0-9;]+)m/g,(m,p)=>{
+    const s=p.split(';');let st='';
+    for(let code of s){
+      if(code==='0')return'</span>';
+      if(code==='1')st+='font-weight:700;';
+      if(code==='2')st+='opacity:0.7;';
+      if(code==='4')st+='text-decoration:underline;';
+      if(c[code])st+='color:'+c[code]+';';
+    }
+    return st?'<span style="'+st+'">':'';
+  });
+}
 function renderTaskList(){
   const search=(document.getElementById('task-search')?.value||'').toLowerCase();
   const listEl=document.getElementById('task-items');
@@ -3070,7 +3191,8 @@ function renderTaskList(){
     const st=t.state||'pending';
     const badgeText=st==='completed'?'DONE':st==='in_progress'?'ACTIVE':'TODO';
     const num=String(i+1).padStart(2,'0');
-    return '<div class="task-card"><div class="task-idx">'+num+'</div><div class="task-badge '+badgeText+'">'+badgeText+'</div><div class="task-label">'+esc(t.label)+'</div></div>';
+    const dur=t.duration_formatted?'<span style="margin-left:auto;font:600 11px var(--font-mono);color:var(--dim)">'+esc(t.duration_formatted)+'</span>':'';
+    return '<div class="task-card"><div class="task-idx">'+num+'</div><div class="task-badge '+badgeText+'">'+badgeText+'</div><div class="task-label">'+esc(t.label)+'</div>'+dur+'</div>';
   }).join('');
 }
 function updatePipeline(curStage){
@@ -3094,20 +3216,33 @@ function applySnapshot(s,e,terminalData){
   branch.textContent=(s.git||{}).branch||'—';
   log.innerHTML=(e.lines||[]).map(x=>'<div class="line '+tone(x)+'">'+esc(x)+'</div>').join('')||'Waiting for events…';
   log.scrollTop=log.scrollHeight;
-  terminal.textContent=terminalData.snapshot||'Waiting for terminal output…';
+  terminal.innerHTML=ansiToHtml(terminalData.snapshot||'Waiting for terminal output…');
+  if(document.getElementById('autoscroll-chk')?.checked){terminal.scrollTop=terminal.scrollHeight}
   document.getElementById('process-agent').textContent=(s.process||'agent')+' · '+(activity.active?'active':'idle');
   document.getElementById('process-cpu').textContent=String(activity.cpu_percent??0)+'%';
   document.getElementById('process-age').textContent=String(activity.oldest_seconds??0)+'s';
   document.getElementById('process-pids').textContent=(s.pids||[]).join(', ')||'none';
   document.getElementById('process-commands').innerHTML=(activity.commands||[]).length?activity.commands.map(x=>'<li>'+esc(x)+'</li>').join(''):'<li>No active commands.</li>';
+  const tp=activity.test_progress;
+  const testEl=document.getElementById('test-progress-box');
+  if(tp&&testEl){
+    testEl.hidden=false;
+    document.getElementById('tp-passed').textContent=String(tp.passed||0);
+    document.getElementById('tp-failed').textContent=String(tp.failed||0);
+    document.getElementById('tp-total').textContent=String(tp.total||0);
+    document.getElementById('tp-bar').style.width=(tp.percent||0)+'%';
+  }
+
   document.getElementById('task-total').textContent=String(t.total||0);
   document.getElementById('task-completed').textContent=String(t.completed||0);
   document.getElementById('task-in-progress').textContent=String(t.in_progress||0);
-  document.getElementById('task-pending').textContent=String(t.pending||0);
   document.getElementById('fc-all').textContent=String(t.total||0);
   document.getElementById('fc-act').textContent=String(t.in_progress||0);
   document.getElementById('fc-pen').textContent=String(t.pending||0);
   document.getElementById('fc-don').textContent=String(t.completed||0);
+  const eta=t.eta_formatted?t.eta_formatted:'—';
+  const vel=t.avg_duration_seconds?String(t.avg_duration_seconds)+'s/task':'';
+  document.getElementById('task-eta').textContent=vel?vel+' · ETA '+eta:eta;
   allTaskList=t.items||[];
   renderTaskList();
   updatePipeline((s.task||{}).stage||'TASK_RECEIVED');
@@ -3118,6 +3253,17 @@ function applySnapshot(s,e,terminalData){
   connection.textContent='LIVE ●';connection.classList.remove('reconnecting');
 }
 async function pollFallback(){try{const [sr,er,tr]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/events',{cache:'no-store'}),fetch('/api/terminal',{cache:'no-store'})]);const s=await sr.json(),e=await er.json(),terminalData=await tr.json();applySnapshot(s,e,terminalData)}catch(e){connection.textContent='RECONNECTING';connection.classList.add('reconnecting')}}
+async function refreshInstances(){
+  try{
+    const res=await fetch('/api/instances',{cache:'no-store'});
+    const d=await res.json();
+    const picker=document.getElementById('instance-picker');
+    if(picker&&d.instances&&d.instances.length){
+      picker.innerHTML=d.instances.map(inst=>'<option value="'+esc(inst.web_url||'')+'">'+esc(inst.process||inst.id)+' ['+esc(inst.state)+']</option>').join('');
+    }
+  }catch(e){}
+}
+function switchInstance(url){if(url&&url!==window.location.href){window.location.href=url}}
 function setupStream(){
   if(window.EventSource){
     const ev=new EventSource('/api/stream');
@@ -3125,7 +3271,7 @@ function setupStream(){
     ev.onerror=()=>{connection.textContent='POLLING ●';connection.classList.remove('reconnecting');setInterval(pollFallback,1000)};
   }else{setInterval(pollFallback,1000)}
 }
-setupStream();pollFallback();
+setupStream();pollFallback();refreshInstances();
 </script></body></html>"""
 
 
@@ -3177,6 +3323,26 @@ class MonitorWebServer:
                     except (OSError, UnicodeError):
                         snapshot = ""
                     self._reply(200, "application/json", json.dumps({"snapshot": snapshot}).encode())
+                elif self.path == "/api/instances":
+                    instances = []
+                    base_dir = Path("/tmp/terminal-monitor")
+                    if base_dir.exists():
+                        for p in base_dir.iterdir():
+                            if p.is_dir() and (p / "status.json").exists():
+                                try:
+                                    st = json.loads((p / "status.json").read_text(encoding="utf-8"))
+                                    instances.append({
+                                        "id": p.name,
+                                        "process": st.get("process", p.name),
+                                        "branch": st.get("git", {}).get("branch", "-"),
+                                        "state": st.get("state", "unknown"),
+                                        "running": st.get("running", False),
+                                        "tasks": f"{st.get('todo', {}).get('completed', 0)}/{st.get('todo', {}).get('total', 0)}",
+                                        "web_url": st.get("web_url", ""),
+                                    })
+                                except Exception:
+                                    pass
+                    self._reply(200, "application/json", json.dumps({"instances": instances}).encode())
                 elif self.path == "/api/stream":
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
@@ -3547,6 +3713,9 @@ class TerminalMonitor:
         self._lock_claimed = False
         self._lifecycle = "stopped"
 
+        self.task_timings: dict[str, dict[str, Any]] = {}
+        self.last_notified_attention: str = ""
+
         # Callbacks
         self.on_state_change: Callable[[str, str], None] | None = None
         self.on_mode_change: Callable[[str | None, str | None], None] | None = None
@@ -3554,6 +3723,63 @@ class TerminalMonitor:
         self.on_attention: Callable[[str, str], None] | None = None
         self.on_complete: Callable[[str], None] | None = None
         self.on_tick: Callable[[str, int], None] | None = None
+
+    def _update_task_timings(self, todo: dict[str, Any]) -> dict[str, Any]:
+        """Track per-task start, completion, duration and plan velocity."""
+        items = [dict(it) for it in todo.get("items", [])]
+        completed_durations: list[float] = []
+        for item in items:
+            lbl = str(item.get("label", ""))
+            st = str(item.get("state", "pending"))
+            if not lbl:
+                continue
+            if st == "in_progress":
+                if lbl not in self.task_timings:
+                    self.task_timings[lbl] = {"started_at": now_iso(), "start_mono": time.monotonic(), "completed_at": None, "duration_seconds": 0.0}
+                else:
+                    self.task_timings[lbl]["duration_seconds"] = round(time.monotonic() - float(self.task_timings[lbl].get("start_mono", time.monotonic())), 1)
+            elif st == "completed":
+                if lbl not in self.task_timings:
+                    self.task_timings[lbl] = {"started_at": now_iso(), "start_mono": time.monotonic(), "completed_at": now_iso(), "duration_seconds": 0.0}
+                elif not self.task_timings[lbl].get("completed_at"):
+                    self.task_timings[lbl]["completed_at"] = now_iso()
+                    self.task_timings[lbl]["duration_seconds"] = round(time.monotonic() - float(self.task_timings[lbl].get("start_mono", time.monotonic())), 1)
+
+            timing = self.task_timings.get(lbl, {})
+            dur = float(timing.get("duration_seconds", 0.0))
+            item["duration_seconds"] = dur
+            if dur >= 60.0:
+                mins = int(dur // 60)
+                secs = int(dur % 60)
+                item["duration_formatted"] = f"{mins}m {secs}s"
+            elif dur > 0.0:
+                item["duration_formatted"] = f"{int(dur)}s"
+            else:
+                item["duration_formatted"] = ""
+            if timing.get("completed_at") and dur > 0.0:
+                completed_durations.append(dur)
+
+        avg_dur = round(sum(completed_durations) / len(completed_durations), 1) if completed_durations else 0.0
+        pending_count = int(todo.get("pending", 0)) + int(todo.get("in_progress", 0))
+        eta_seconds = round(pending_count * avg_dur, 1) if avg_dur > 0.0 else 0.0
+        updated = dict(todo)
+        updated["avg_duration_seconds"] = avg_dur
+        updated["eta_seconds"] = eta_seconds
+        if eta_seconds >= 60.0:
+            updated["eta_formatted"] = f"~{int(eta_seconds // 60)}m"
+        elif eta_seconds > 0.0:
+            updated["eta_formatted"] = f"~{int(eta_seconds)}s"
+        else:
+            updated["eta_formatted"] = ""
+        updated["items"] = items
+        return updated
+
+    def _notify(self, title: str, message: str, event_type: str, payload: dict[str, Any] | None = None) -> None:
+        """Send notifications to desktop and configured webhooks."""
+        if self.config.desktop_notifications:
+            send_desktop_notification(title, message)
+        if self.config.webhook_url:
+            dispatch_webhook(self.config.webhook_url, event_type, payload or {"message": message})
 
     def _monitor_metadata(self, lifecycle: str = "running") -> dict[str, Any]:
         """Build the durable monitor identity used by status/stop/resume commands."""
@@ -3896,9 +4122,22 @@ class TerminalMonitor:
             self.last_command = activity.commands[0]
         todo_history = self.session_tracker.current_segment(history) if self.session_tracker.interaction_history else history
         if history.strip():
-            self.todo_progress = extract_todo_progress(history, session_history=todo_history)
+            raw_todo = extract_todo_progress(history, session_history=todo_history)
+            self.todo_progress = self._update_task_timings(raw_todo)
         self.detected_task_id = infer_current_task_id(history)
         self.last_action = f"observe:{state}"
+
+        test_progress = extract_test_progress(history)
+        if not test_progress and activity.commands:
+            for cmd in activity.commands:
+                for log_file in re.findall(r"(/[^\s'\"]+\.log)", cmd):
+                    if os.path.exists(log_file):
+                        with contextlib.suppress(Exception):
+                            test_progress = extract_test_progress(Path(log_file).read_text(encoding="utf-8", errors="ignore")[-20000:])
+                            if test_progress:
+                                break
+                if test_progress:
+                    break
 
         if mode != self.current_mode:
             if self.on_mode_change:
@@ -3917,6 +4156,7 @@ class TerminalMonitor:
                 Path(self.attention_path).write_text(json.dumps(queued_attempt, indent=2) + "\n" + safe_snapshot + "\n", encoding="utf-8")
                 self.log(f"PAUSE kind=queued_attempt_stale age={queued_attempt['age_seconds']}")
                 self.export_status_json(pids, "queued_attempt_stale", {"queued_attempt": queued_attempt})
+                self._notify("AI Terminal Monitor: Attention Required", "Queued attempt is stale", "attention_required", {"reason": "queued_attempt_stale"})
                 return 3, f"ATTENTION_REQUIRED kind=queued_attempt_stale file={self.attention_path}"
             return None, "WAITING_QUEUED_ATTEMPT"
         latest_attempt = self.attempt_ledger.latest(self.task_state.last_attempt_id or None)
@@ -3929,11 +4169,14 @@ class TerminalMonitor:
             if pr_snapshot:
                 classifications = [classify_check_result(check) for check in pr_snapshot.get("statusCheckRollup") or []]
                 self._record_ci_events(classifications)
+                prev_stage = self.task_state.last_known_stage
                 stage = self.pr_machine.advance({
                     "number": pr_snapshot.get("number"),
                     "state": pr_snapshot.get("state"),
                     "checks": pr_snapshot.get("statusCheckRollup") or [],
                 })
+                if stage == "PR_CREATED" and prev_stage != "PR_CREATED":
+                    self._notify("AI Terminal Monitor: PR Created", f"PR #{pr_snapshot.get('number')} created", "pr_created", {"pr": pr_snapshot.get("number")})
                 metadata = dict(self.task_state.pr)
                 metadata.update({
                     "number": pr_snapshot.get("number"),
@@ -4017,6 +4260,7 @@ class TerminalMonitor:
                     handle.write(json.dumps(repository_safety, indent=2) + "\n" + safe_snapshot + "\n")
                 self.log(f"PAUSE kind=repository_safety reason={reason}")
                 self.export_status_json(pids, "branch_safety", {"repository_safety": repository_safety})
+                self._notify("AI Terminal Monitor: Attention Required", f"Repository safety violation: {reason}", "attention_required", {"reason": reason})
                 return 3, f"ATTENTION_REQUIRED kind=repository_safety reason={reason} file={self.attention_path}"
 
         immediate_assessment = assess_agent_commands(
@@ -4058,6 +4302,7 @@ class TerminalMonitor:
             Path(self.attention_path).write_text(json.dumps(attention, indent=2) + "\n" + safe_snapshot + "\n", encoding="utf-8")
             self.log(f"PAUSE kind=agent_loop reason={reason}")
             self.export_status_json(pids, "agent_loop", {"loop_guard": attention})
+            self._notify("AI Terminal Monitor: Loop Detected", f"Monitored agent loop: {reason}", "attention_required", {"reason": reason})
             return 3, f"ATTENTION_REQUIRED kind=agent_loop reason={reason} file={self.attention_path}"
 
         self.export_status_json(pids, state, {
@@ -4071,6 +4316,7 @@ class TerminalMonitor:
                 "git_changed": activity.git_changed,
                 "duplicate_commands": list(activity.duplicate_commands),
                 "expensive_roots": list(activity.expensive_roots),
+                "test_progress": test_progress,
             },
             "loop_guard": json_safe(self.loop_assessment),
             "task": {
@@ -4478,6 +4724,8 @@ def _add_monitor_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-web-ui", action="store_true", help="Disable the local live web command center")
     parser.add_argument("--web-port", type=int, default=None, help="Preferred localhost port for the live web command center")
     parser.add_argument("--no-web-open", action="store_true", help="Start the web command center without opening a browser")
+    parser.add_argument("--no-desktop-notifications", action="store_true", help="Disable native desktop notifications")
+    parser.add_argument("--webhook-url", default=None, help="Webhook URL for event dispatch (Slack, Discord, custom)")
     parser.add_argument("--loop-interrupt-wait-seconds", type=float, default=None, help="Seconds to wait for a loop child tree to stop")
     parser.add_argument("--once", action="store_true", default=False, help="Inspect status once and exit")
     parser.add_argument("--dry-run", action="store_true", default=False, help="Simulate actions without sending keystrokes")
@@ -4530,6 +4778,9 @@ def config_from_args(args: argparse.Namespace) -> MonitorConfig:
     file_prohibitions = _string_values(file_cfg.get("prohibitions", []))
     merged_prohibitions = list(dict.fromkeys([*file_prohibitions, *cli_prohibitions]))
 
+    raw_state_dir = str(_val(getattr(args, "state_dir", None), "state_dir", "/tmp/terminal-monitor"))
+    resolved_state_dir = resolve_project_state_dir(raw_state_dir, str(project_dir)) if raw_state_dir == "/tmp/terminal-monitor" else raw_state_dir
+
     return MonitorConfig(
         process=process,
         profile=profile,
@@ -4544,7 +4795,7 @@ def config_from_args(args: argparse.Namespace) -> MonitorConfig:
         auto_allow_permissions=auto_allow,
         once=bool(getattr(args, "once", False)),
         dry_run=bool(getattr(args, "dry_run", False)),
-        state_dir=str(_val(getattr(args, "state_dir", None), "state_dir", "/tmp/terminal-monitor")),
+        state_dir=resolved_state_dir,
         backend=str(_val(getattr(args, "backend", None), "backend", "auto")),
         project_dir=str(project_dir),
         unsafe_phrases=merged_unsafe,
@@ -4572,6 +4823,8 @@ def config_from_args(args: argparse.Namespace) -> MonitorConfig:
         web_port=validate_web_port(int(_val(getattr(args, "web_port", None), "web_port", 8765))),
         web_open_browser=not getattr(args, "no_web_open", False) and bool(file_cfg.get("web_open_browser", True)),
         loop_interrupt_wait_seconds=max(0.0, float(_val(getattr(args, "loop_interrupt_wait_seconds", None), "loop_interrupt_wait_seconds", 2.0))),
+        desktop_notifications=not getattr(args, "no_desktop_notifications", False) and bool(file_cfg.get("desktop_notifications", True)),
+        webhook_url=str(_val(getattr(args, "webhook_url", None), "webhook_url", "")),
     )
 
 

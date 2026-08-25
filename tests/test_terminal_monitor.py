@@ -4,6 +4,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import urllib.request
 from unittest import mock
@@ -1605,5 +1606,87 @@ class SupervisorV2Tests(unittest.TestCase):
         self.assertIn("/api/stream", terminal_monitor.DASHBOARD_HTML)
 
 
+    def test_send_desktop_notification_and_webhook(self):
+        with mock.patch("subprocess.Popen") as mock_popen:
+            ok = terminal_monitor.send_desktop_notification("Test Alert", "Sample message")
+            self.assertTrue(ok)
+            mock_popen.assert_called()
+
+        with mock.patch("urllib.request.urlopen"):
+            dispatched = terminal_monitor.dispatch_webhook("http://example.com/webhook", "test_event", {"foo": "bar"})
+            self.assertTrue(dispatched)
+            # Give daemon thread a moment to fire
+            time.sleep(0.05)
+
+        self.assertFalse(terminal_monitor.dispatch_webhook("", "test_event", {}))
+
+    def test_extract_test_progress(self):
+        log_sample = "Running tests...\n✔ Task 1 passed\n✔ Task 2 passed\n✖ Task 3 failed\nTests: 2 passed, 1 failed, 3 total"
+        res = terminal_monitor.extract_test_progress(log_sample)
+        self.assertIsNotNone(res)
+        self.assertEqual(res["passed"], 2)
+        self.assertEqual(res["failed"], 1)
+        self.assertEqual(res["total"], 3)
+        self.assertEqual(res["percent"], 66.7)
+
+        # Fallback checkmarks
+        log_checkmarks = "PASS src/index.test.ts\nPASS src/app.test.ts\nFAIL src/auth.test.ts"
+        res2 = terminal_monitor.extract_test_progress(log_checkmarks)
+        self.assertIsNotNone(res2)
+        self.assertEqual(res2["passed"], 2)
+        self.assertEqual(res2["failed"], 1)
+        self.assertEqual(res2["total"], 3)
+
+        self.assertIsNone(terminal_monitor.extract_test_progress("Just some normal output without tests"))
+
+    def test_task_timings_and_eta(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = terminal_monitor.MonitorConfig(process="opencode", state_dir=directory)
+            backend = MockBackend()
+            backend.pids = [1234]
+            monitor = terminal_monitor.TerminalMonitor(config, backend=backend)
+
+            raw_todo = {
+                "total": 3,
+                "completed": 1,
+                "in_progress": 1,
+                "pending": 1,
+                "items": [
+                    {"label": "Task 1", "state": "completed"},
+                    {"label": "Task 2", "state": "in_progress"},
+                    {"label": "Task 3", "state": "pending"},
+                ],
+            }
+            updated = monitor._update_task_timings(raw_todo)
+            self.assertIn("Task 1", monitor.task_timings)
+            self.assertIn("Task 2", monitor.task_timings)
+            self.assertIn("items", updated)
+            self.assertIn("avg_duration_seconds", updated)
+            self.assertIn("eta_seconds", updated)
+
+    def test_web_server_instances_api(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status_path = pathlib.Path(directory, "status.json")
+            log_path = pathlib.Path(directory, "monitor.log")
+            status_path.write_text(json.dumps({"state": "thinking", "pids": [100]}), encoding="utf-8")
+            log_path.write_text("START\n", encoding="utf-8")
+            server = terminal_monitor.MonitorWebServer(str(status_path), str(log_path), port=0)
+            url = server.start()
+            try:
+                req = urllib.request.Request(url + "api/instances")
+                resp = json.loads(urllib.request.urlopen(req, timeout=2).read())
+                self.assertIn("instances", resp)
+                self.assertIsInstance(resp["instances"], list)
+            finally:
+                server.stop()
+
+    def test_cli_state_dir_auto_resolution(self):
+        parser = terminal_monitor.build_parser()
+        args = parser.parse_args(["status", "--project-dir", "/tmp/my-test-proj"])
+        cfg = terminal_monitor.config_from_args(args)
+        self.assertIn("/tmp/terminal-monitor/my-test-proj-", cfg.state_dir)
+
+
 if __name__ == "__main__":
     unittest.main()
+
