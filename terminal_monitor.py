@@ -3969,6 +3969,10 @@ class TerminalMonitor:
             )
         if git_status.branch not in self.config.protected_branches:
             self._protected_branch_nudged = False
+            if self.task_state.expected_branch in self.config.protected_branches or not self.task_state.expected_branch:
+                self.task_state = replace(self.task_state, expected_branch=git_status.branch, branch=git_status.branch)
+                self.task_state.save(self.task_state_path)
+                self.log(f"BRANCH_TRACK branch={git_status.branch}")
 
         repository_safety = evaluate_repository_safety(
             git_status,
