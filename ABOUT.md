@@ -106,25 +106,21 @@ Different AI agents use distinct visual conventions in the terminal:
   history, and masks common tokens, API keys, passwords, Bearer credentials, and
   GitHub tokens before writing inspection or attention artifacts.
 
-### 14. Web command center contract
+### 14. Archify-Inspired Web Command Center & Architecture Pipeline
 
-The continuous monitor owns a localhost-only web server. It serves the static
-dark console and three read-only JSON resources: a projected `/api/status`, a
-redacted `/api/events` tail, and a bounded redacted `/api/terminal` snapshot.
-The projection intentionally omits prompts, attempt payloads, configured
-prohibitions, policy actions, and child command text even though the supervisor
-keeps the full audit data in its permission-restricted state directory.
+The continuous monitor owns a localhost-only web server with a visual system inspired by the
+[Archify Proof Lab](https://tt-a1i.github.io/archify/gallery.html#proof-web-app). It provides:
+- **Architecture Stage Pipeline:** Interactive step sequence tracking lifecycle progress across `TASK_RECEIVED → EXECUTING → VERIFYING → PR_CREATED → CI_CHECKS → MERGED`.
+- **Task Plan & Progress:** Categorized task breakdown with live badges (`DONE`, `ACTIVE`, `TODO`), search filter, and category pills (`ALL`, `ACTIVE`, `PENDING`, `DONE`).
+- **Real-Time Streaming:** Server-Sent Events (`/api/stream`) for low-latency, event-driven updates.
+- **Operator Action Dispatch:** Quick buttons (`Approve (yes)`, `Continue`, `Mode (Tab)`, `Nudge`) and custom instruction prompt input dispatched directly to the monitor via `POST /api/send`.
+- **Privacy & Safety Projections:** The JSON projection intentionally masks credentials, prompts, attempt payloads, configured prohibitions, and policy actions while serving status safely over HTTP.
 
-Startup is lifecycle-safe: invalid ports are rejected before the loop begins,
-occupied ports fall back to an ephemeral localhost port, and a failed web
-startup releases its partial server and monitor lock instead of killing or
-blocking the monitored agent. The event log rotates once it reaches 2 MiB.
-
-Loop recovery is also lifecycle-safe. The supervisor verifies ancestry before
-signalling, protects every root PID, waits for descendants to exit after
-`SIGINT`, escalates each remaining tree to `SIGTERM`, and refuses to send a
-replacement prompt while a child is still running. A persisted queue timestamp
-uses UTC wall time when a monotonic clock value belongs to a previous boot.
+### 15. Supervisor Intelligence & State Isolation
+- **Project-Level State Isolation:** Automatically scopes monitor state, logs, and artifacts per project in `/tmp/terminal-monitor/<project-name>-<hash>/`.
+- **Automatic CWD Discovery:** Automatically resolves the target agent process directory via `lsof` or `/proc` when `--project-dir` is not explicitly passed.
+- **Smart Protected Branch Nudges:** Rather than crashing or halting when `main` has uncommitted changes, automatically sends a guidance nudge instructing the agent to create a feature branch before enforcing repository safety gates.
+- **Task Title Reconciliation:** Expands truncated TUI checklist labels into full task descriptions discovered in planning blocks throughout the terminal history.
 
 ---
 

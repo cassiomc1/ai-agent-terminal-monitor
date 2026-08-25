@@ -162,22 +162,30 @@ python3 terminal_monitor.py merge-pr --pr 42 --head <full-40-character-head-sha>
 
 `interrupt-child` refuses the root agent PID and any PID outside its descendant tree. For a verified child it signals the complete subtree deepest-first, avoiding orphaned test runners and wrappers. `restart-agent` executes an argument vector directly without a shell. For a non-OpenCode CLI, use `--agent-command` when its continuation syntax differs.
 
-### 8. Local web command center
+### 8. Local web command center & Architecture Pipeline
 
 Every continuous run (`supervise` or the regular monitor without `--once`) starts
-the dark command center on `127.0.0.1`. The chosen `web_port` is used when it is
-available; a busy port falls back to an ephemeral localhost port and the URL is
-recorded in `status.json`. Use `--no-web-ui` to disable the server or
-`--no-web-open` to keep the server running without opening a browser.
+the dark command center on `127.0.0.1` with a visual design inspired by the
+[Archify Proof Lab](https://tt-a1i.github.io/archify/gallery.html#proof-web-app).
+The chosen `web_port` is used when it is available; a busy port falls back to an
+ephemeral localhost port and the URL is recorded in `status.json`. Use `--no-web-ui`
+to disable the server or `--no-web-open` to keep the server running without opening a browser.
 
-The read-only HTTP surface is deliberately smaller than the local state files:
+The HTTP surface supports real-time Server-Sent Events (SSE) streaming and manual operator interaction:
 
-| Endpoint | Contents |
-|---|---|
-| `/` | Dark, color-coded operations console with live cards and terminal panes |
-| `/api/status` | Safe projection of state, Git, task progress, CI stage and attempt status |
-| `/api/events` | Last 400 event lines with credentials and free-form payloads redacted |
-| `/api/terminal` | Last bounded terminal snapshot after credential masking |
+| Endpoint | Method | Contents |
+|---|---|---|
+| `/` | `GET` | Dark Archify-style console with stage pipeline, task plan, live metrics, quick actions, and terminal panes |
+| `/api/stream` | `GET` | Real-time Server-Sent Events (SSE) stream for instant, low-latency UI updates |
+| `/api/send` | `POST` | Dispatches operator answers, continuation prompts, smart nudges, or mode switch keystrokes (`Tab`) |
+| `/api/status` | `GET` | Safe projection of state, Git, task progress, CI stage and attempt status |
+| `/api/events` | `GET` | Last 400 event lines with credentials and free-form payloads redacted |
+| `/api/terminal` | `GET` | Last bounded terminal snapshot after credential masking |
+
+#### 🎛️ Operator Quick Actions & Task Plan View
+- **Architecture Stage Pipeline:** Visual indicator tracking progress across `TASK_RECEIVED → EXECUTING → VERIFYING → PR_CREATED → CI_CHECKS → MERGED`.
+- **Interactive Task Showcase:** Displays all detected tasks with state badges (`DONE`, `ACTIVE`, `TODO`), search filter, and category pills (`ALL`, `ACTIVE`, `PENDING`, `DONE`).
+- **Quick Action Bar:** One-click operator actions (`Approve (yes)`, `Continue`, `Mode (Tab)`, `Nudge`) and custom instruction prompt dispatch directly from the browser.
 
 Prompts, attempt payloads, child commands, configured prohibitions and policy
 actions are not returned by the HTTP projection. The files remain local and are
@@ -186,12 +194,11 @@ when it reaches the 2 MiB bound. The terminal snapshot is written to
 `terminal-snapshot.txt` and is limited to the same 6,000-character inspection
 bound.
 
-When the loop guard identifies a repeated test/build episode, it signals only
-verified descendants. It sends `SIGINT`, waits up to
-`loop_interrupt_wait_seconds` (default `2.0`), escalates each still-running
-descendant tree to `SIGTERM`, and waits again. If any child remains alive, the
-monitor stops with `ATTENTION_REQUIRED` and does not inject a prompt. The agent
-root PID and its terminal session are never recovery targets.
+#### 🗂️ Project-Level State Isolation & Working Directory Discovery
+- **State Isolation:** Automatically scopes monitor state and logs per project directory in `/tmp/terminal-monitor/<project-name>-<hash>/`, preventing cross-project state pollution.
+- **Process Working Directory Discovery:** When `--project-dir` is unspecified, automatically detects the agent process `cwd` via `lsof` / `/proc`.
+- **Smart Protected Branch Nudge:** When direct changes occur on `main` before a feature branch is created, automatically prompts the agent to branch before halting.
+- **Task Title Reconciliation:** Reconciles truncated TUI checklist labels (e.g. `[ ] Task 1: Freeze security-`) with full plan descriptions found in the terminal history.
 
 ---
 
