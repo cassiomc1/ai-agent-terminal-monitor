@@ -1312,6 +1312,11 @@ class SupervisorV2Tests(unittest.TestCase):
             self.assertIn("#fe6e00", html)
             self.assertIn("AGENT TERMINAL SNAPSHOT (REDACTED)", html)
             self.assertIn("/api/terminal", html)
+            self.assertIn('data-view="process"', html)
+            self.assertIn('data-view="safety"', html)
+            self.assertIn('data-view="attempts"', html)
+            self.assertIn("showView(button.dataset.view)", html)
+            self.assertIn("aria-selected", html)
             self.assertEqual(events["lines"], ["START process=opencode"])
             self.assertEqual(terminal["snapshot"], "token=<redacted>\nagent output")
 
