@@ -85,18 +85,26 @@ usar o supervisor em um projeto novo.
 
 - O ledger diferencia entrega aceita de mensagem ainda visivelmente `QUEUED`, impede reenvio duplicado e escala filas vencidas para atencao humana.
 - O supervisor detecta suites/builds caros duplicados, repeticoes sem progresso observavel e comandos de reescrita de historico Git.
-- A interrupcao validada encerra a arvore inteira do comando, dos descendentes mais profundos ao processo solicitado, sem sinalizar o agente raiz.
+- A interrupcao validada encerra a arvore inteira do comando, dos descendentes mais profundos ao processo solicitado, sem sinalizar o agente raiz; a recuperacao aguarda a saida, escala para `SIGTERM` e nao injeta um prompt enquanto qualquer descendente ainda estiver vivo.
 - As deteccoes sao exportadas no status estruturado e podem ser ajustadas por configuracao, mantendo defaults fail-closed.
+- O painel web local expõe somente projeções seguras, mostra um snapshot de terminal mascarado e mantém o log rotacionado para evitar vazamento ou crescimento ilimitado.
 
 ## Implementação desta rodada
 
-As cinco melhorias priorizadas a partir do uso real foram implementadas:
+As cinco melhorias priorizadas a partir do uso real e o hardening observado na
+revisão do command center foram implementados:
 
 - desligamento por sinal com heartbeat final, PID lock e detecção de estado
   obsoleto;
 - inspeção `--once` JSON-safe, limitada e com mascaramento de credenciais;
 - painel `status` colorido com tarefa, progresso, comando atual, Git, CI e
   política npm;
+- command center web escuro com snapshot de terminal redigido, status sem
+  prompts/comandos e inicialização que libera o lock mesmo quando a porta
+  escolhida não pode ser usada;
+- documentação operacional dos endpoints `/api/status`, `/api/events` e
+  `/api/terminal`, dos arquivos de estado redigidos/rotacionados e do ciclo
+  `SIGINT` → espera → `SIGTERM` da recuperação de loops;
 - comandos `stop`, `status` e `resume` que nunca sinalizam o processo do
   agente;
 - testes de regressão e documentação no README/ABOUT para o novo ciclo de vida.

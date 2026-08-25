@@ -64,8 +64,8 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
 - 🧭 **Session Generations**: Separates terminal scrollback from the current interaction and rejects stale completion evidence after new work is assigned.
 - ⚙️ **Real Process Activity**: Observes descendant commands, command age and CPU data, preventing a quiet terminal from being treated as stalled while tests or builds are still running.
 - 🔂 **Agent Loop Guard**: Detects expensive commands relaunched repeatedly without task or Git progress, duplicate full test/build roots running concurrently, and monitored Git history rewrites. A changed task count, worktree, or commit resets the repetition counter; recoverable command loops are contained in-session while unsafe mutations pause for attention.
-- 🧯 **In-session Loop Recovery**: For repeated test/build loops, interrupts only verified expensive child trees, keeps the root agent session alive, and sends a corrective prompt that requires targeted diagnosis before another full-suite run. Unsafe history rewrites still fail closed for human attention.
-- 🧾 **Idempotent Attempt Ledger**: Persists `queued → sent → accepted → completed` (or `ignored`) events with IDs, timestamps, prompts, and observed states so queued continuations survive restarts without being duplicated blindly.
+- 🧯 **In-session Loop Recovery**: For repeated test/build loops, interrupts only verified expensive child trees, waits for the complete tree to exit, escalates to `SIGTERM` when needed, keeps the root agent session alive, and sends a corrective prompt only after the child work has stopped. Unsafe history rewrites still fail closed for human attention.
+- 🧾 **Idempotent Attempt Ledger**: Persists `queued → sent → accepted → completed` (or `ignored`) events with IDs, timestamps, prompts, and observed states so queued continuations survive restarts without being duplicated blindly; persisted monotonic timestamps fall back to UTC wall time after a reboot.
 - 📨 **Visible Queue Protection**: Treats a terminal `QUEUED` marker as delivery still pending, suppresses duplicate nudges, and raises attention when the queue remains stuck beyond the configured timeout.
 - 📜 **Durable Policy Envelope**: Stores the objective, prohibitions, task ID, required outcome, current stage, PR metadata, and session ID in `task-state.json`. Smart nudges are wrapped in permanent policy and cannot override an npm-publication prohibition.
 - 🔁 **Native PR/CI Lifecycle**: Tracks `PR_CREATED → CI_PENDING → FIX_REQUIRED` or `CI_RETRY_REQUIRED → CI_GREEN → POST_MERGE_VERIFY`; checks are classified as `passed`, `failed`, `cancelled-infra`, or `failed-external` before retry decisions.
@@ -73,7 +73,7 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
 - ✅ **Final-State Verifier**: Verifies merged PR, checks for the exact PR head, synchronized clean `main`, unchanged npm registry state, no new tag/release, and no active publish process.
 - 🔍 **Refined Question vs Table Disambiguation**: Excludes Markdown/Unicode summary tables and code blocks from option parsing, eliminating false-positive dialog loops.
 - 📊 **Real-time Status JSON Export**: Continuously exports live structured JSON (`status.json`) with PIDs, state, mode, git details, uptime, and send counts for IDE or dashboard integrations.
-- 🖥️ **Automatic Web Command Center**: Every continuous monitor starts a localhost-only dark operations console, opens it in the browser, and streams color-coded lifecycle, safety, process, Git, task, and attempt events. The visual system uses a black glass shell, compact terminal typography, orange telemetry, and semantic status colors inspired by the referenced Evreghen Command Center.
+- 🖥️ **Automatic Web Command Center**: Every continuous monitor starts a localhost-only dark operations console, opens it in the browser, and streams color-coded lifecycle, safety, process, Git, task, and attempt events plus a bounded redacted terminal snapshot. HTTP status is a safe projection (prompts, payloads, child commands, and policy text are withheld), logs rotate at a bounded size, and the visual system uses a black glass shell, compact terminal typography, orange telemetry, and semantic status colors inspired by the referenced Evreghen Command Center.
 - 🧭 **Branch and Worktree Safety**: Reports expected branch, protected-branch dirtiness, attempt history, CI evidence, policy decisions, and pauses supervised work when repository safety is violated.
 - 🎯 **Stable Tab Targeting**: Prefers an exact custom Terminal.app tab title before the application suffix in a window name, avoiding cross-talk between neighboring OpenCode sessions.
 - 📝 **Structured Final Reports**: Writes `final-report.json` with verification evidence, CI classifications, continuation attempts, policy decisions, the explicit npm prohibition, and the npm-publication invariant.
@@ -86,7 +86,7 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
 - ⏱️ **Hard Timeouts & Resilience**: All subprocess calls (`osascript`, `git`, `gh`, `tmux`) run with hard timeouts, so a stuck terminal dialog or hung network call can never freeze the monitor. `Ctrl+C` exits cleanly (exit code `130`) and marks the status JSON as not running.
 - 🔐 **Input Validation**: Process names and window-title filters are validated/sanitized before being embedded into AppleScript or shell commands.
 - 📁 **Hierarchical Project Configuration**: Reads project settings from `.terminal-monitor.json` or `.terminal-monitor.toml` in your repository root, or globally from `~/.config/terminal-monitor/`. Unsafe phrases from CLI flags (`--unsafe-phrase`) are merged with the ones from the config file instead of replacing them.
-- 🗂️ **Cached Git Context**: Repository status is cached with a 30-second TTL, keeping the polling loop cheap even with live status JSON export enabled.
+- 🗂️ **Cached Git Context**: Repository status is cached with a 30-second TTL and short-lived status-export refreshes, keeping the polling loop cheap even with live status JSON export enabled.
 - ✍️ **Live Human-in-the-Loop Override**: Write a message into `/tmp/terminal-monitor/answer.txt` — it is consumed, dispatched, and cleaned up automatically.
 - 🐍 **Python SDK & OOP API**: Clean object-oriented library API (`TerminalMonitor`, `MonitorConfig`, `AgentProfile`) with lifecycle hooks (`on_state_change`, `on_mode_change`, `on_send`, `on_attention`, `on_complete`, `on_tick`).
 - ⚡ **Zero External Dependencies**: Pure Python standard library. No pip installation required.
@@ -184,6 +184,37 @@ python3 terminal_monitor.py merge-pr --pr 42 --head <full-40-character-head-sha>
 
 `interrupt-child` refuses the root agent PID and any PID outside its descendant tree. For a verified child it signals the complete subtree deepest-first, avoiding orphaned test runners and wrappers. `restart-agent` executes an argument vector directly without a shell. For a non-OpenCode CLI, use `--agent-command` when its continuation syntax differs.
 
+### 8. Local web command center
+
+Every continuous run (`supervise` or the regular monitor without `--once`) starts
+the dark command center on `127.0.0.1`. The chosen `web_port` is used when it is
+available; a busy port falls back to an ephemeral localhost port and the URL is
+recorded in `status.json`. Use `--no-web-ui` to disable the server or
+`--no-web-open` to keep the server running without opening a browser.
+
+The read-only HTTP surface is deliberately smaller than the local state files:
+
+| Endpoint | Contents |
+|---|---|
+| `/` | Dark, color-coded operations console with live cards and terminal panes |
+| `/api/status` | Safe projection of state, Git, task progress, CI stage and attempt status |
+| `/api/events` | Last 400 event lines with credentials and free-form payloads redacted |
+| `/api/terminal` | Last bounded terminal snapshot after credential masking |
+
+Prompts, attempt payloads, child commands, configured prohibitions and policy
+actions are not returned by the HTTP projection. The files remain local and are
+written with restrictive permissions; `monitor.log` rotates to `monitor.log.1`
+when it reaches the 2 MiB bound. The terminal snapshot is written to
+`terminal-snapshot.txt` and is limited to the same 6,000-character inspection
+bound.
+
+When the loop guard identifies a repeated test/build episode, it signals only
+verified descendants. It sends `SIGINT`, waits up to
+`loop_interrupt_wait_seconds` (default `2.0`), escalates each still-running
+descendant tree to `SIGTERM`, and waits again. If any child remains alive, the
+monitor stops with `ATTENTION_REQUIRED` and does not inject a prompt. The agent
+root PID and its terminal session are never recovery targets.
+
 ---
 
 ## 📦 Project Configuration
@@ -231,6 +262,7 @@ python3 terminal_monitor.py init --format toml -o .terminal-monitor.toml
   "loop_repeat_limit": 3,
   "queued_attempt_seconds": 45.0,
   "allow_history_rewrite": false,
+  "loop_interrupt_wait_seconds": 2.0,
   "web_ui": true,
   "web_port": 8765,
   "web_open_browser": true,
@@ -438,6 +470,13 @@ failure requiring a fix.
 - `SIGINT` and `SIGTERM` now write a final heartbeat with
   `lifecycle: "stopped"`; consumers should use `monitor_alive`/stale
   detection instead of trusting an old `running` value.
+- `web_ui`, `web_port`, `web_open_browser` and `loop_interrupt_wait_seconds`
+  control the command center and loop containment. The generated JSON/TOML
+  templates include these fields; `web_port` accepts only `0..65535`, where `0`
+  requests an ephemeral port.
+- `terminal-snapshot.txt` is the redacted dashboard feed and `monitor.log.1`
+  is the single rotated event-log archive. Consumers should use `/api/status`
+  rather than exposing `status.json` directly when serving a UI.
 - `--dry-run` never sends terminal text or keys, starts an agent, or merges a
   PR. `merge-pr --dry-run` only prints the planned exact-head action.
 - A malformed `task-state.json` stops initialization with `StateFileError` instead of silently discarding safety policy.

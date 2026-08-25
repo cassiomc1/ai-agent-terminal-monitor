@@ -962,6 +962,18 @@ class SupervisorV2Tests(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertIn("queued_attempt_stale", message)
 
+    def test_stale_queued_attempt_falls_back_to_wall_clock_after_reboot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            monitor = terminal_monitor.TerminalMonitor(
+                terminal_monitor.MonitorConfig(process="opencode", state_dir=directory, queued_attempt_seconds=1.0),
+                backend=MockBackend(),
+            )
+            attempt_id = monitor._queue_attempt("manual", "Continue", "idle")
+            monitor._transition_attempt(attempt_id, "queued", detail="terminal reports message queued", observed_state="idle")
+            monitor.attempt_ledger.records[-1]["monotonic"] = 9999999999.0
+            monitor.attempt_ledger.records[-1]["timestamp"] = "2000-01-01T00:00:00Z"
+            self.assertIsNotNone(monitor._stale_queued_attempt())
+
     def test_loop_guard_detects_repeated_full_suite_without_progress(self):
         guard = terminal_monitor.AgentLoopGuard(repeat_limit=3)
         assessment = None
@@ -981,6 +993,21 @@ class SupervisorV2Tests(unittest.TestCase):
         guard.observe("same", "3/18", "tree-a", "abc", ("npm test",))
         assessment = guard.observe("same", "4/18", "tree-b", "def", ("npm test",))
         self.assertFalse(assessment.detected)
+
+    def test_expensive_command_detection_covers_common_test_variants(self):
+        for command in (
+            "npm run test",
+            "pnpm test:unit",
+            "node ./scripts/run-tests.js",
+            "python -m pytest",
+            "cargo test",
+            "go test ./...",
+        ):
+            self.assertEqual(terminal_monitor.canonical_expensive_command(command), "full-test-suite", command)
+
+    def test_git_rebase_recovery_commands_are_not_history_rewrite_alerts(self):
+        for command in ("git rebase --abort", "git rebase --continue", "git rebase --skip"):
+            self.assertFalse(terminal_monitor.assess_agent_commands((command,)).detected, command)
 
     def test_history_rewrite_commands_require_attention_by_default(self):
         for command in (
@@ -1236,7 +1263,9 @@ class SupervisorV2Tests(unittest.TestCase):
             )
             monitor.loop_assessment = terminal_monitor.LoopAssessment(True, "repeated_expensive_command_without_progress", ("full-test-suite",), 3)
             activity = terminal_monitor.ProcessActivity(expensive_roots=(200,), direct_descendants=(200,), commands=("npm test",))
-            with mock.patch.object(terminal_monitor, "interrupt_process_tree", return_value=True) as interrupt:
+            with mock.patch.object(terminal_monitor, "interrupt_process_tree", return_value=True) as interrupt, mock.patch.object(
+                terminal_monitor, "process_is_running", return_value=False
+            ):
                 recovered, detail = monitor._recover_agent_loop([100], activity, "thinking")
             self.assertTrue(recovered)
             self.assertIn("interrupted=200", detail)
@@ -1244,22 +1273,102 @@ class SupervisorV2Tests(unittest.TestCase):
             self.assertEqual(len(backend.sent_payloads), 1)
             self.assertIn("Keep this agent session alive", backend.sent_payloads[0])
 
+    def test_loop_recovery_does_not_prompt_while_child_tree_is_alive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = MockBackend()
+            monitor = terminal_monitor.TerminalMonitor(
+                terminal_monitor.MonitorConfig(process="opencode", state_dir=directory, loop_interrupt_wait_seconds=0.0),
+                backend=backend,
+            )
+            monitor.loop_assessment = terminal_monitor.LoopAssessment(True, "repeated_expensive_command_without_progress", ("full-test-suite",), 3)
+            activity = terminal_monitor.ProcessActivity(expensive_roots=(200, 210), descendants=(200, 210), direct_descendants=(200, 210), commands=("npm test",))
+            with mock.patch.object(terminal_monitor, "interrupt_process_tree", return_value=True) as interrupt, mock.patch.object(
+                terminal_monitor, "process_is_running", return_value=True
+            ):
+                recovered, detail = monitor._recover_agent_loop([100], activity, "thinking")
+            self.assertFalse(recovered)
+            self.assertEqual(detail, "child_tree_did_not_stop")
+            self.assertEqual(backend.sent_payloads, [])
+            self.assertEqual(interrupt.call_count, 4)
+            self.assertTrue(all(call.args[0] == {100} for call in interrupt.call_args_list))
+
     def test_web_command_center_serves_dark_dashboard_and_live_events(self):
         with tempfile.TemporaryDirectory() as directory:
             status_path = pathlib.Path(directory, "status.json")
             log_path = pathlib.Path(directory, "monitor.log")
+            snapshot_path = pathlib.Path(directory, "terminal-snapshot.txt")
             status_path.write_text(json.dumps({"state": "thinking", "pids": [100]}), encoding="utf-8")
             log_path.write_text("START process=opencode\n", encoding="utf-8")
-            server = terminal_monitor.MonitorWebServer(str(status_path), str(log_path), port=0)
+            snapshot_path.write_text("token=<redacted>\nagent output", encoding="utf-8")
+            server = terminal_monitor.MonitorWebServer(str(status_path), str(log_path), port=0, snapshot_path=str(snapshot_path))
             url = server.start()
             try:
                 html = urllib.request.urlopen(url, timeout=2).read().decode()
                 events = json.loads(urllib.request.urlopen(url + "api/events", timeout=2).read())
+                terminal = json.loads(urllib.request.urlopen(url + "api/terminal", timeout=2).read())
             finally:
                 server.stop()
             self.assertIn("AGENT // CENTER", html)
             self.assertIn("#fe6e00", html)
+            self.assertIn("AGENT TERMINAL SNAPSHOT (REDACTED)", html)
+            self.assertIn("/api/terminal", html)
             self.assertEqual(events["lines"], ["START process=opencode"])
+            self.assertEqual(terminal["snapshot"], "token=<redacted>\nagent output")
+
+    def test_web_status_projection_does_not_expose_attempt_payload_or_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status_path = pathlib.Path(directory, "status.json")
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "state": "thinking",
+                        "attempts": [{"attempt_id": "a", "status": "queued", "payload": "api-key=secret-value"}],
+                        "activity": {"commands": ["npm test --token secret-value"]},
+                        "loop_guard": {"activity": {"commands": ["curl --token secret-value"]}},
+                        "policy_decisions": [{"timestamp": "now", "action": "send secret-value", "decision": "attention"}],
+                        "prohibitions": ["Do not publish to npm."],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            server = terminal_monitor.MonitorWebServer(str(status_path), str(pathlib.Path(directory, "monitor.log")), port=0)
+            url = server.start()
+            try:
+                payload = json.loads(urllib.request.urlopen(url + "api/status", timeout=2).read())
+            finally:
+                server.stop()
+        rendered = json.dumps(payload)
+        self.assertNotIn("secret-value", rendered)
+        self.assertNotIn("payload", payload["attempts"][0])
+        self.assertEqual(payload["attempts"][0]["payload_chars"], len("api-key=secret-value"))
+        self.assertEqual(payload["loop_guard"]["activity"]["commands"], ["<redacted>"])
+        self.assertNotIn("action", payload["policy_decisions"][0])
+
+    def test_web_status_rejects_non_object_json_without_server_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status_path = pathlib.Path(directory, "status.json")
+            status_path.write_text("[]", encoding="utf-8")
+            server = terminal_monitor.MonitorWebServer(str(status_path), str(pathlib.Path(directory, "monitor.log")), port=0)
+            url = server.start()
+            try:
+                payload = json.loads(urllib.request.urlopen(url + "api/status", timeout=2).read())
+            finally:
+                server.stop()
+        self.assertEqual(payload, {"state": "starting", "pids": []})
+
+    def test_web_port_validation_rejects_out_of_range_values(self):
+        with self.assertRaises(ValueError):
+            terminal_monitor.MonitorWebServer("/tmp/status.json", "/tmp/monitor.log", port=70000)
+        with self.assertRaises(ValueError):
+            terminal_monitor.config_from_args(terminal_monitor.build_parser().parse_args(["--web-port", "70000", "--once"]))
+
+    def test_log_rotation_keeps_event_log_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory, "monitor.log")
+            path.write_text("x" * 1100, encoding="utf-8")
+            terminal_monitor.append_log(str(path), "EVENT state=idle", max_bytes=1024)
+            self.assertTrue(path.with_name("monitor.log.1").exists())
+            self.assertIn("EVENT state=idle", path.read_text(encoding="utf-8"))
 
     def test_pr_state_machine_distinguishes_code_and_retryable_failures(self):
         machine = terminal_monitor.PullRequestStateMachine()
