@@ -17,6 +17,10 @@ Modern AI coding agents (such as **Claude Code**, **OpenCode**, **Aider**, **Goo
 
 ## 🏛️ Architecture & Design Principles
 
+The architecture is shown as a live, dark-theme SVG with animated signal paths,
+policy stops and evidence lanes: [open the animated architecture diagram](docs/architecture-diagram.svg).
+Its visual language follows the referenced [Archify Proof Lab gallery](https://tt-a1i.github.io/archify/gallery.html#proof-web-app): a dark live artifact, trace lanes, and explicit evidence surfaces.
+
 ### 1. Zero External Dependencies & Maximum Portability
 - Built entirely on the **Python 3 Standard Library**.
 - Runs immediately without requiring virtual environments, pip packages, or heavy external daemons.

@@ -22,31 +22,9 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
 
 > **State precedence:** explicit manual answers and safe permission prompts take priority. A question requires both a strong prompt and real selectable options, while an active child command counts as `thinking`. Completion is accepted only from output produced after the latest instruction, so an old “done” message cannot finish a newly assigned task.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           AI Agent Terminal Monitor                         │
-├──────────────────────────┬──────────────────────────┬───────────────────────┤
-│    Supported Backends    │   Built-in AI Profiles   │     Safety Guard      │
-│  • macOS Terminal.app    │  • Claude Code (claude)  │  • Destructive filter │
-│  • macOS iTerm2          │  • OpenCode (opencode)   │  • Permission policy  │
-│  • tmux (Linux/macOS)    │  • Aider (aider)         │  • Attention alerts   │
-│  • Headless / Auto       │  • Goose & Generic CLI   │  • Live answer hook   │
-└────────────┬─────────────┴────────────┬─────────────┴───────────┬───────────┘
-             │                          │                         │
-             ▼                          ▼                         ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                  Terminal History & State Classification                    │
-│   [Thinking...] ──► [Permission] ──► [Question/Menu] ──► [Idle] ──► [Done]  │
-│       │                                                            │        │
-│   [TUI Mode] (Plan ──Tab──► Build)                [Git Context Smart Nudge] │
-└──────────────────────────────────────┬──────────────────────────────────────┘
-                                       │
-                         Auto-Nudge / Control / Status JSON
-                                       ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           Target Agent CLI Tab                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+<a href="docs/architecture-diagram.svg"><img src="docs/architecture-diagram.svg" alt="Animated dark architecture of the AI Agent Terminal Monitor" width="100%"></a>
+
+<p><sub>Animated dark architecture · open the SVG for the full-resolution trace · respects reduced-motion preferences · visual direction inspired by the <a href="https://tt-a1i.github.io/archify/gallery.html#proof-web-app">Archify Proof Lab gallery</a>.</sub></p>
 
 ---
 
