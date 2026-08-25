@@ -2,6 +2,7 @@
 """Convenience supervisor script for running AI Agent Terminal Monitor in autonomous supervision mode."""
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
@@ -28,6 +29,10 @@ def main() -> int:
     parser = terminal_monitor.build_parser()
     parsed_args = parser.parse_args(args)
     config = terminal_monitor.config_from_args(parsed_args)
+    launch = [sys.executable, str(Path(__file__).resolve()), *args]
+    if "--state-dir" not in launch:
+        launch.extend(["--state-dir", config.state_dir])
+    config = replace(config, launch_command=tuple(launch))
     monitor = terminal_monitor.TerminalMonitor(config)
     return monitor.run()
 

@@ -277,6 +277,16 @@ class TerminalMonitorClassTests(unittest.TestCase):
         self.assertEqual(inspected["state"], "thinking")
         self.assertEqual(inspected["pids"], [12345])
 
+    def test_monitor_inspect_is_json_serializable_and_redacted(self):
+        backend = MockBackend(tab_response={"ok": True, "error": "", "hist": "token=secret-value\nworking..."})
+        config = terminal_monitor.MonitorConfig(process="opencode", continue_text="Go")
+        monitor = terminal_monitor.TerminalMonitor(config, backend=backend)
+        inspected = monitor.inspect()
+        json.dumps(inspected)
+        self.assertNotIn("secret-value", inspected["snapshot"])
+        self.assertIsInstance(inspected["activity"], dict)
+        self.assertIn("todo", inspected)
+
     def test_monitor_step_sends_payload_when_idle(self):
         with tempfile.TemporaryDirectory() as directory:
             backend = MockBackend(tab_response={"ok": True, "error": "", "hist": "Ready for next prompt."})
@@ -385,6 +395,21 @@ class TerminalMonitorClassTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(msg, "CANCELLED")
 
+    def test_monitor_run_writes_stopped_lifecycle_and_releases_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = terminal_monitor.MonitorConfig(
+                process="opencode",
+                once=True,
+                state_dir=directory,
+                status_json_path=str(pathlib.Path(directory, "status.json")),
+            )
+            monitor = terminal_monitor.TerminalMonitor(config, backend=MockBackend())
+            self.assertEqual(monitor.run(), 0)
+            status = json.loads(pathlib.Path(directory, "status.json").read_text(encoding="utf-8"))
+            self.assertFalse(status["running"])
+            self.assertEqual(status["lifecycle"], "stopped")
+            self.assertFalse(pathlib.Path(directory, "monitor.pid").exists())
+
     def test_monitor_step_attention_required(self):
         with tempfile.TemporaryDirectory() as directory:
             backend = MockBackend(tab_response={
@@ -430,6 +455,59 @@ class TmuxBackendTests(unittest.TestCase):
 
 
 class RobustnessTests(unittest.TestCase):
+    def test_json_safe_serializes_process_activity(self):
+        value = terminal_monitor.json_safe(terminal_monitor.ProcessActivity(active=True, descendants=(7,), commands=("pytest",)))
+        self.assertEqual(value, {"active": True, "descendants": [7], "commands": ["pytest"], "cpu_percent": 0.0, "oldest_seconds": 0.0, "git_changed": False})
+        json.dumps(value)
+
+    def test_redacts_credentials_from_inspection_text(self):
+        text = "token=super-secret-value Bearer abcdefghijklmnop ghp_abcdefghijklmnopqrstuvwxyz"
+        redacted = terminal_monitor.redact_sensitive(text)
+        self.assertNotIn("super-secret-value", redacted)
+        self.assertNotIn("abcdefghijklmnop", redacted)
+        self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz", redacted)
+        self.assertEqual(redacted.count("<redacted>"), 3)
+
+    def test_extract_todo_progress_deduplicates_panels(self):
+        progress = terminal_monitor.extract_todo_progress(
+            "Todo\n[•] Inspect internals\n[ ] Add tests\n[✓] Merge PR\nTodo\n[•] Inspect internals\n[ ] Add tests"
+        )
+        self.assertEqual(progress["total"], 3)
+        self.assertEqual(progress["completed"], 1)
+        self.assertEqual(progress["in_progress"], 1)
+        self.assertEqual(progress["pending"], 1)
+
+    def test_status_dashboard_contains_color_and_safety_summary(self):
+        output = terminal_monitor.render_status_dashboard(
+            {
+                "monitor_alive": True,
+                "state": "thinking",
+                "mode": "build",
+                "heartbeat": "2026-01-01T00:00:00Z",
+                "todo": {"total": 4, "completed": 2, "in_progress": 1, "pending": 1},
+                "task": {"detected_id": "task-4", "stage": "CI_PENDING"},
+                "git": {"branch": "codex/work", "head": "abcdef0123456789", "dirty": False, "open_prs": 1},
+                "npm_publish_allowed": False,
+                "ci_events": [{"category": "passed"}],
+                "activity": {"commands": ["npm test"]},
+            },
+            color=True,
+        )
+        self.assertIn("\033[", output)
+        self.assertIn("task-4", output)
+        self.assertIn("progress 2/4", output)
+        self.assertIn("BLOCKED", output)
+        self.assertIn("npm test", output)
+
+    def test_status_snapshot_marks_dead_monitor_stale(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pathlib.Path(directory, "status.json").write_text(
+                json.dumps({"running": True, "monitor_pid": 999999, "state": "thinking"}), encoding="utf-8"
+            )
+            snapshot = terminal_monitor.read_status_snapshot(directory)
+            self.assertFalse(snapshot["monitor_alive"])
+            self.assertTrue(snapshot["stale"])
+
     def test_run_osascript_timeout_returns_error(self):
         def raise_timeout(*args, **kwargs):
             raise subprocess.TimeoutExpired(cmd="osascript", timeout=15)
@@ -1074,6 +1152,21 @@ class SupervisorV2Tests(unittest.TestCase):
         restart = parser.parse_args(["restart-agent", "--continue-session"])
         self.assertTrue(restart.continue_session)
         self.assertEqual(parser.parse_args(["verify-final-state"]).command, "verify-final-state")
+        self.assertEqual(parser.parse_args(["status", "--no-color"]).command, "status")
+        self.assertTrue(parser.parse_args(["status", "--watch"]).watch)
+        self.assertEqual(parser.parse_args(["stop", "--reason", "operator"]).reason, "operator")
+        self.assertEqual(parser.parse_args(["resume"]).command, "resume")
+
+    def test_stop_monitor_does_not_signal_unverified_agent_pid(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(terminal_monitor, "pid_is_alive", return_value=False), mock.patch.object(
+            terminal_monitor, "_monitor_process_matches", return_value=False
+        ), mock.patch.object(terminal_monitor.os, "kill") as kill:
+            pathlib.Path(directory, "status.json").write_text(json.dumps({"running": True, "monitor_pid": 123}), encoding="utf-8")
+            result = terminal_monitor.stop_monitor(directory)
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["agent_untouched"])
+            kill.assert_not_called()
+            self.assertTrue(pathlib.Path(directory, "stop").exists())
 
 
 if __name__ == "__main__":
