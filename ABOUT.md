@@ -65,6 +65,7 @@ Different AI agents use distinct visual conventions in the terminal:
 - **Hard subprocess timeouts**: every `osascript`, `git`, `gh`, and `tmux` invocation runs with a hard timeout, so a modal dialog in the terminal or a hung network call can never freeze the monitor loop.
 - **Cached Git context**: repository snapshots (`git status`, `gh pr list`) are cached with a 30-second TTL per project directory, keeping high-frequency polling and live status JSON export cheap even on large repositories or slow networks.
 - **Input validation**: process names must match `[A-Za-z0-9_.-]+` and window-title filters reject control characters before being embedded into AppleScript literals or shell commands (defense-in-depth against injection).
+- **Stable Terminal.app targeting**: a custom tab title is preferred over the application suffix in the window name, preventing a generic `OpenCode` filter from selecting a neighboring agent session.
 - **Clean interruption**: `Ctrl+C` during the monitor loop logs the exit, writes `"running": false` to the status JSON, and returns exit code `130`.
 - **Signal-safe lifecycle**: `SIGTERM` is handled like a graceful stop, with
   a final heartbeat, lifecycle reason, and a PID lock that prevents duplicate
@@ -90,6 +91,9 @@ Different AI agents use distinct visual conventions in the terminal:
 - **Useful task progress**: the monitor extracts and deduplicates common TUI
   todo markers, reports completed/in-progress/pending counts, and exposes a
   best-effort current task identifier without changing durable task identity.
+  When a terminal overlays a stale Todo pane over the conversation, an
+  affirmative summary such as `35/35 COMPLETE` is treated as authoritative;
+  question text is never treated as completion evidence.
 - **Safe inspection**: `--once` returns JSON-safe dataclasses, bounds terminal
   history, and masks common tokens, API keys, passwords, Bearer credentials, and
   GitHub tokens before writing inspection or attention artifacts.

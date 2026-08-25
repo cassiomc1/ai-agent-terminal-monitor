@@ -1372,6 +1372,21 @@ def applescript_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def applescript_terminal_title_condition(title: str | None) -> str:
+    """Prefer a tab's custom title before falling back to its window name.
+
+    Terminal.app appends the application name to every window name.  A broad
+    filter such as ``OpenCode`` therefore matched an unrelated OpenCode tab
+    whose custom title was ``OC | ...``.  Only tabs without a custom title may
+    use the window-name fallback.
+    """
+    checked_title = validate_title_filter(title)
+    if not checked_title:
+        return "set titleOK to true"
+    wanted = applescript_escape(checked_title)
+    return f'set titleOK to ((ttitle contains "{wanted}") or (ttitle is "" and wname contains "{wanted}"))'
+
+
 OSASCRIPT_TIMEOUT_SECONDS = 15.0
 COMMAND_TIMEOUT_SECONDS = 30.0
 
@@ -1513,11 +1528,7 @@ class TerminalAppBackend(BaseTerminalBackend):
     def get_tab(self, process: str, title: str | None = None) -> dict[str, str | bool]:
         process = validate_process_name(process)
         process_literal = applescript_escape(process)
-        checked_title = validate_title_filter(title)
-        title_check = "set titleOK to true"
-        if checked_title:
-            wanted = applescript_escape(checked_title)
-            title_check = f'set titleOK to ((ttitle contains "{wanted}") or (wname contains "{wanted}"))'
+        title_check = applescript_terminal_title_condition(title)
         script = f'''
 tell application "Terminal"
   repeat with w from 1 to count of windows
@@ -1545,11 +1556,7 @@ end tell
 
     def send(self, process: str, title: str | None, payload: str) -> tuple[bool, str]:
         process_literal = applescript_escape(validate_process_name(process))
-        checked_title = validate_title_filter(title)
-        title_check = "set titleOK to true"
-        if checked_title:
-            wanted = applescript_escape(checked_title)
-            title_check = f'set titleOK to ((ttitle contains "{wanted}") or (wname contains "{wanted}"))'
+        title_check = applescript_terminal_title_condition(title)
         escaped_payload = applescript_escape(re.sub(r"\s+", " ", payload).strip())
         script = f'''
 tell application "Terminal"
@@ -1586,11 +1593,7 @@ end tell
             else:
                 return self.send(process, title, key)
 
-        checked_title = validate_title_filter(title)
-        title_check = "set titleOK to true"
-        if checked_title:
-            wanted = applescript_escape(checked_title)
-            title_check = f'set titleOK to ((ttitle contains "{wanted}") or (wname contains "{wanted}"))'
+        title_check = applescript_terminal_title_condition(title)
         script = f'''
 tell application "Terminal"
   repeat with w from 1 to count of windows
@@ -1985,10 +1988,83 @@ def redact_sensitive(text: str) -> str:
 
 
 TODO_ITEM_PATTERN = re.compile(r"(?P<marker>\[(?:\s|x|X|•|·|✓|✔|~|-)\])\s*(?P<label>.+?)\s*$")
+TODO_COMPLETION_RATIO_PATTERN = re.compile(
+    r"(?<!\d)(?P<completed>\d+)\s*/\s*(?P<total>\d+)"
+    r"(?:\s*(?:tasks?|tarefas?))?\s*"
+    r"(?P<status>complete(?:d)?|conclu[ií]d[ao]s?|feitas?|finished|done)\b",
+    re.IGNORECASE,
+)
+TODO_ALL_COMPLETE_PATTERN = re.compile(
+    r"\b(?:all\s+(?:of\s+the\s+)?tasks?|todas?(?:\s+as)?\s+tarefas?|todos?(?:\s+os)?\s+tasks?)\b"
+    r".{0,80}\b(?:complete(?:d)?|done|conclu[ií]d[ao]s?|feitas?)\b",
+    re.IGNORECASE,
+)
+TODO_NO_PENDING_PATTERN = re.compile(
+    r"\b(?:no\s+(?:pending|remaining)\s+tasks?|nenhuma?\s+pendente(?:s)?|não\s+há\s+(?:tarefas?\s+)?pendente(?:s)?)\b",
+    re.IGNORECASE,
+)
+TODO_FINAL_COMPLETE_PATTERN = re.compile(
+    r"\b(?:estado\s+final|final\s+state)\b.{0,160}\b(?:complete|completed|conclu[ií]d[ao]s?|feitas?|finished|done)\b",
+    re.IGNORECASE,
+)
+
+
+def _explicit_todo_completion(history: str, marker_total: int) -> dict[str, Any] | None:
+    """Prefer an agent's explicit final task summary over a stale TUI todo pane.
+
+    OpenCode renders the conversation and its Todo side pane on the same
+    terminal history line.  After an agent reports a completed ForgeLoop plan,
+    the side pane can still contain the old ``[ ]`` markers, so counting every
+    marker would regress from a verified ``35/35 COMPLETE`` result to a stale
+    ``0/9`` view.  Only affirmative, non-question lines are accepted here; a
+    question such as ``todas as tarefas foram feitas?`` must not close work.
+    """
+    lines = [re.sub(r"\s+", " ", line).strip(" │┃") for line in str(history).splitlines()]
+    for line in reversed(lines[-200:]):
+        if not line or "?" in line:
+            continue
+
+        ratio = TODO_COMPLETION_RATIO_PATTERN.search(line)
+        if ratio:
+            completed = int(ratio.group("completed"))
+            total = int(ratio.group("total"))
+            if total > 0 and completed == total:
+                return {
+                    "total": total,
+                    "completed": total,
+                    "in_progress": 0,
+                    "pending": 0,
+                    "items": [],
+                    "source": "explicit_summary",
+                    "evidence": redact_sensitive(line)[:240],
+                }
+
+        if marker_total == 0 and TODO_FINAL_COMPLETE_PATTERN.search(line):
+            return {
+                "total": 1,
+                "completed": 1,
+                "in_progress": 0,
+                "pending": 0,
+                "items": [],
+                "source": "explicit_summary",
+                "evidence": redact_sensitive(line)[:240],
+            }
+
+        if (TODO_ALL_COMPLETE_PATTERN.search(line) or TODO_NO_PENDING_PATTERN.search(line)) and marker_total:
+            return {
+                "total": marker_total,
+                "completed": marker_total,
+                "in_progress": 0,
+                "pending": 0,
+                "items": [],
+                "source": "explicit_summary",
+                "evidence": redact_sensitive(line)[:240],
+            }
+    return None
 
 
 def extract_todo_progress(history: str) -> dict[str, Any]:
-    """Extract a deduplicated, best-effort task panel summary from TUI history."""
+    """Extract task progress, preferring a current explicit summary to TUI markers."""
     items: dict[str, dict[str, str]] = {}
     for line in str(history).splitlines():
         match = TODO_ITEM_PATTERN.search(line)
@@ -2011,7 +2087,10 @@ def extract_todo_progress(history: str) -> dict[str, Any]:
         "in_progress": sum(item["state"] == "in_progress" for item in ordered),
         "pending": sum(item["state"] == "pending" for item in ordered),
     }
-    return {**counts, "items": ordered}
+    explicit = _explicit_todo_completion(history, counts["total"])
+    if explicit:
+        return explicit
+    return {**counts, "items": ordered, "source": "tui_markers", "evidence": ""}
 
 
 def infer_current_task_id(history: str) -> str:
@@ -2263,15 +2342,22 @@ def classify_state(
 
     if prof.matches_permission(tail):
         return "permission"
+    # A real child command still owns the prompt; otherwise questions and
+    # menus remain actionable even when Terminal.app reports the tab busy.
+    if prof.matches_question(tail) and (not activity or not activity.active or not (activity.commands or activity.descendants)):
+        return "question"
+
+    active_child = bool(activity and (activity.commands or activity.descendants))
+    completion_history = session_tracker.current_segment(history) if session_tracker and session_tracker.interaction_history else history
+    completion = bool(_explicit_todo_completion(completion_history, marker_total=0))
+    if session_tracker:
+        completion = completion or session_tracker.matches_current_completion(history, prof.completion_patterns)
+    else:
+        completion = completion or prof.matches_completion(tail)
+    if completion and not active_child and not (activity and activity.git_changed):
+        return "completed"
     if activity and activity.active:
         return "thinking"
-    if prof.matches_question(tail):
-        return "question"
-    if session_tracker:
-        if session_tracker.matches_current_completion(history, prof.completion_patterns):
-            return "completed"
-    elif prof.matches_completion(tail):
-        return "completed"
     if prof.matches_thinking(tail):
         return "thinking"
     return "idle"
@@ -2780,13 +2866,15 @@ class TerminalMonitor:
         self.last_heartbeat = now_iso()
         if activity.commands:
             self.last_command = activity.commands[0]
-        self.todo_progress = extract_todo_progress(history)
+        todo_history = self.session_tracker.current_segment(history) if self.session_tracker.interaction_history else history
+        if todo_history.strip():
+            self.todo_progress = extract_todo_progress(todo_history)
         self.detected_task_id = infer_current_task_id(history)
         self.last_action = f"observe:{state}"
         safe_snapshot, snapshot_truncated = redact_snapshot(snapshot)
         safe_tab = dict(tab)
         safe_tab["hist"], _ = redact_snapshot(str(tab.get("hist", "")))
-        todo = extract_todo_progress(history)
+        todo = self.todo_progress
         detected_task_id = infer_current_task_id(history)
         return {
             "ok": True,
@@ -2835,7 +2923,9 @@ class TerminalMonitor:
         self.last_heartbeat = now_iso()
         if activity.commands:
             self.last_command = activity.commands[0]
-        self.todo_progress = extract_todo_progress(history)
+        todo_history = self.session_tracker.current_segment(history) if self.session_tracker.interaction_history else history
+        if todo_history.strip():
+            self.todo_progress = extract_todo_progress(todo_history)
         self.detected_task_id = infer_current_task_id(history)
         self.last_action = f"observe:{state}"
 

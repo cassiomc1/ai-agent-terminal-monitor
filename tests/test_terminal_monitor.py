@@ -476,6 +476,43 @@ class RobustnessTests(unittest.TestCase):
         self.assertEqual(progress["completed"], 1)
         self.assertEqual(progress["in_progress"], 1)
         self.assertEqual(progress["pending"], 1)
+        self.assertEqual(progress["source"], "tui_markers")
+
+    def test_extract_todo_progress_prefers_explicit_completion_over_stale_tui_panel(self):
+        history = (
+            "[•] Study recovery/auth internals\n"
+            "[ ] Create ForgeLoop task + contract\n"
+            "Sim. Estado verificado agora:\n"
+            "- Tarefas ForgeLoop: 35/35 COMPLETE (fechamento validado pelo protocolo, nenhuma pendente)\n"
+            "- PRs: todos mesclados (#89–#96), nenhum aberto\n"
+            "[ ] Close fix task via canonical pipeline (COMPLETE)\n"
+        )
+        progress = terminal_monitor.extract_todo_progress(history)
+        self.assertEqual(progress["total"], 35)
+        self.assertEqual(progress["completed"], 35)
+        self.assertEqual(progress["in_progress"], 0)
+        self.assertEqual(progress["pending"], 0)
+        self.assertEqual(progress["items"], [])
+        self.assertEqual(progress["source"], "explicit_summary")
+
+    def test_extract_todo_progress_ignores_question_as_completion(self):
+        progress = terminal_monitor.extract_todo_progress("todas as tarefas foram feitas?\n[ ] Verify the next task")
+        self.assertEqual(progress["total"], 1)
+        self.assertEqual(progress["completed"], 0)
+        self.assertEqual(progress["pending"], 1)
+        self.assertEqual(progress["source"], "tui_markers")
+
+    def test_extract_todo_progress_accepts_final_task_summary_without_markers(self):
+        progress = terminal_monitor.extract_todo_progress("Estado final: ForgeLoop task diagnostics-gain-stall-alignment COMPLETE (VALID)")
+        self.assertEqual(progress["total"], 1)
+        self.assertEqual(progress["completed"], 1)
+        self.assertEqual(progress["pending"], 0)
+        self.assertEqual(progress["source"], "explicit_summary")
+
+    def test_completion_summary_overrides_terminal_busy_without_child_command(self):
+        history = "Tarefas ForgeLoop: 35/35 COMPLETE (nenhuma pendente)"
+        activity = terminal_monitor.ProcessActivity(active=True)
+        self.assertEqual(terminal_monitor.classify_state(history, terminal_monitor.get_profile("opencode"), activity=activity), "completed")
 
     def test_status_dashboard_contains_color_and_safety_summary(self):
         output = terminal_monitor.render_status_dashboard(
@@ -534,6 +571,12 @@ class RobustnessTests(unittest.TestCase):
         self.assertIsNone(terminal_monitor.validate_title_filter(None))
         self.assertIsNone(terminal_monitor.validate_title_filter("   "))
         self.assertEqual(terminal_monitor.validate_title_filter(" worker "), "worker")
+
+    def test_terminal_title_condition_prefers_custom_title(self):
+        condition = terminal_monitor.applescript_terminal_title_condition("OpenCode")
+        self.assertIn('ttitle contains "OpenCode"', condition)
+        self.assertIn('ttitle is "" and wname contains "OpenCode"', condition)
+        self.assertEqual(terminal_monitor.applescript_terminal_title_condition(None), "set titleOK to true")
 
     def test_git_status_cache_respects_ttl(self):
         calls = []
