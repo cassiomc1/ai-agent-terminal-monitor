@@ -60,6 +60,7 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
   - *Clean feature branch:* Prompts agent to run full verification, push branch and create PR.
   - *Open PRs:* Prompts agent to verify CI checks and merge into `main`.
 - 🏁 **Completion Engine & Stop Conditions**: Detects when all plan tasks are 100% completed and merged, gracefully stopping the supervisor and firing completion events.
+- 🧾 **Task Summary Reconciliation**: Prefers an affirmative agent summary such as `35/35 COMPLETE` over stale checklist markers left by an overlaid TUI Todo pane, while rejecting question-shaped text as completion evidence.
 - 🧭 **Session Generations**: Separates terminal scrollback from the current interaction and rejects stale completion evidence after new work is assigned.
 - ⚙️ **Real Process Activity**: Observes descendant commands, command age and CPU data, preventing a quiet terminal from being treated as stalled while tests or builds are still running.
 - 🧾 **Idempotent Attempt Ledger**: Persists `queued → sent → accepted → completed` (or `ignored`) events with IDs, timestamps, prompts, and observed states so queued continuations survive restarts without being duplicated blindly.
@@ -70,6 +71,7 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
 - 🔍 **Refined Question vs Table Disambiguation**: Excludes Markdown/Unicode summary tables and code blocks from option parsing, eliminating false-positive dialog loops.
 - 📊 **Real-time Status JSON Export**: Continuously exports live structured JSON (`status.json`) with PIDs, state, mode, git details, uptime, and send counts for IDE or dashboard integrations.
 - 🧭 **Branch and Worktree Safety**: Reports expected branch, protected-branch dirtiness, attempt history, CI evidence, policy decisions, and pauses supervised work when repository safety is violated.
+- 🎯 **Stable Tab Targeting**: Prefers an exact custom Terminal.app tab title before the application suffix in a window name, avoiding cross-talk between neighboring OpenCode sessions.
 - 📝 **Structured Final Reports**: Writes `final-report.json` with verification evidence, CI classifications, continuation attempts, policy decisions, the explicit npm prohibition, and the npm-publication invariant.
 - 🖥️ **Universal Terminal Backends**:
   - `terminal`: Native macOS Terminal.app via AppleScript.
@@ -336,7 +338,9 @@ Whenever a state directory exists, `TerminalMonitor` atomically maintains `<stat
     "completed": 3,
     "in_progress": 1,
     "pending": 2,
-    "items": [{"label": "Run tests", "state": "in_progress"}]
+    "items": [{"label": "Run tests", "state": "in_progress"}],
+    "source": "tui_markers",
+    "evidence": ""
   },
   "last_action": "observe:thinking",
   "last_command": "python3 -m unittest discover -s tests",
@@ -373,6 +377,11 @@ Whenever a state directory exists, `TerminalMonitor` atomically maintains `<stat
   "timestamp": "2026-08-23T19:45:00Z"
 }
 ```
+
+The `todo.source` field is `tui_markers` for checklist parsing or
+`explicit_summary` when an affirmative agent report supersedes stale overlaid
+markers; `todo.evidence` contains the bounded, redacted summary line used for
+that decision.
 
 `status` renders this data as a colored dashboard. `--json` returns the
 combined live and durable state for integrations. Terminal history exposed by
