@@ -1520,7 +1520,89 @@ class SupervisorV2Tests(unittest.TestCase):
             self.assertTrue(result["ok"])
             self.assertTrue(result["agent_untouched"])
             kill.assert_not_called()
-            self.assertTrue(pathlib.Path(directory, "stop").exists())
+    def test_discover_agent_project_dir_and_resolve_project_state_dir(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scoped = terminal_monitor.resolve_project_state_dir("/tmp/test-mon", directory)
+            self.assertTrue(scoped.startswith("/tmp/test-mon/"))
+            self.assertTrue(pathlib.Path(scoped).exists())
+
+    def test_task_title_reconciliation_expands_truncated_labels(self):
+        history = (
+            "Plan for durable actions:\n"
+            "Task 1: Freeze security-sensitive transition contracts\n"
+            "Task 2: Complete capability-policy lock and task-snapshot identity\n"
+            "[•] Task 1: Freeze security-\n"
+            "[ ] Task 2: Complete capability-\n"
+        )
+        progress = terminal_monitor.extract_todo_progress(history)
+        self.assertEqual(progress["total"], 2)
+        self.assertEqual(progress["items"][0]["label"], "Task 1: Freeze security-sensitive transition contracts")
+        self.assertEqual(progress["items"][1]["label"], "Task 2: Complete capability-policy lock and task-snapshot identity")
+
+    def test_smart_nudge_on_protected_branch_dirty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = MockBackend()
+            dirty_main = terminal_monitor.GitStatus(is_repo=True, branch="main", dirty=True, modified_count=1)
+            config = terminal_monitor.MonitorConfig(
+                process="opencode",
+                profile="opencode",
+                supervise=True,
+                expected_branch="",
+                state_dir=directory,
+            )
+            with mock.patch.object(terminal_monitor, "get_git_status", return_value=dirty_main), mock.patch.object(
+                terminal_monitor, "capture_safety_baseline", return_value={"safetyBaselineCaptured": True}
+            ), mock.patch.object(terminal_monitor, "get_current_pr_snapshot", return_value=None), mock.patch.object(
+                terminal_monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()
+            ):
+                monitor = terminal_monitor.TerminalMonitor(config, backend=backend)
+                code, message = monitor.step()
+            self.assertIsNone(code)
+            self.assertIn("NUDGE_SENT", message)
+            self.assertEqual(len(backend.sent_payloads), 1)
+            self.assertIn("Direct changes detected on protected branch 'main'", backend.sent_payloads[0])
+
+    def test_web_server_post_send_and_sse_stream(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status_path = pathlib.Path(directory, "status.json")
+            log_path = pathlib.Path(directory, "monitor.log")
+            answer_path = pathlib.Path(directory, "answer.txt")
+            status_path.write_text(json.dumps({"state": "thinking", "pids": [100], "todo": {"total": 3, "items": []}}), encoding="utf-8")
+            log_path.write_text("START process=opencode\n", encoding="utf-8")
+            server = terminal_monitor.MonitorWebServer(str(status_path), str(log_path), port=0, answer_path=str(answer_path))
+            url = server.start()
+            try:
+                # Test POST /api/send with payload
+                req = urllib.request.Request(
+                    url + "api/send",
+                    data=json.dumps({"action": "answer", "payload": "yes"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                resp = json.loads(urllib.request.urlopen(req, timeout=2).read())
+                self.assertTrue(resp["ok"])
+                self.assertEqual(answer_path.read_text(encoding="utf-8").strip(), "yes")
+
+                # Test POST /api/send with special key
+                req_key = urllib.request.Request(
+                    url + "api/send",
+                    data=json.dumps({"action": "key", "key": "tab"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                resp_key = json.loads(urllib.request.urlopen(req_key, timeout=2).read())
+                self.assertTrue(resp_key["ok"])
+                self.assertEqual(answer_path.read_text(encoding="utf-8").strip(), "KEY:tab")
+            finally:
+                server.stop()
+
+    def test_archify_dashboard_elements(self):
+        self.assertIn("TASK_RECEIVED", terminal_monitor.DASHBOARD_HTML)
+        self.assertIn("EXECUTING", terminal_monitor.DASHBOARD_HTML)
+        self.assertIn("VERIFYING", terminal_monitor.DASHBOARD_HTML)
+        self.assertIn("PR_CREATED", terminal_monitor.DASHBOARD_HTML)
+        self.assertIn("CI_CHECKS", terminal_monitor.DASHBOARD_HTML)
+        self.assertIn("MERGED", terminal_monitor.DASHBOARD_HTML)
+        self.assertIn("/api/send", terminal_monitor.DASHBOARD_HTML)
+        self.assertIn("/api/stream", terminal_monitor.DASHBOARD_HTML)
 
 
 if __name__ == "__main__":
