@@ -123,7 +123,23 @@ def _atomic_json_write(path: str | Path, data: dict[str, Any]) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(json_safe(data), indent=2, sort_keys=True), encoding="utf-8")
+    with contextlib.suppress(OSError):
+        os.chmod(temporary, 0o600)
     os.replace(temporary, target)
+    with contextlib.suppress(OSError):
+        os.chmod(target, 0o600)
+
+
+def _atomic_text_write(path: str | Path, text: str) -> None:
+    target = Path(path).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    temporary.write_text(text, encoding="utf-8")
+    with contextlib.suppress(OSError):
+        os.chmod(temporary, 0o600)
+    os.replace(temporary, target)
+    with contextlib.suppress(OSError):
+        os.chmod(target, 0o600)
 
 
 @dataclass(frozen=True)
@@ -282,14 +298,17 @@ class LoopAssessment:
 
 
 EXPENSIVE_COMMAND_PATTERNS: tuple[tuple[str, str], ...] = (
-    ("full-test-suite", r"\b(?:npm\s+test|node\s+scripts/run-tests\.js|pytest(?:\s|$)|python\d*\s+-m\s+unittest)\b"),
+    (
+        "full-test-suite",
+        r"\b(?:npm|pnpm|yarn)\s+(?:run\s+)?test(?:[:\w.-]*)?\b|\b(?:node|bun|deno)\s+(?:\./)?scripts/run-tests\.js\b|\bpython\d*\s+-m\s+(?:unittest|pytest)\b|\bpytest(?:\s|$)|\bcargo\s+test(?:\s|$)|\bgo\s+test(?:\s|$)",
+    ),
     ("ci-watch", r"\bgh\s+(?:pr\s+checks|run\s+watch)\b"),
-    ("build", r"\b(?:npm|pnpm|yarn)\s+run\s+build\b|\bcargo\s+build\b"),
+    ("build", r"\b(?:npm|pnpm|yarn)\s+(?:run\s+)?build\b|\bcargo\s+build\b"),
 )
 
 GIT_HISTORY_REWRITE_PATTERNS: tuple[str, ...] = (
     r"\bgit\s+filter-branch\b",
-    r"\bgit\s+rebase\b",
+    r"\bgit\s+rebase\b(?!\s+--(?:abort|continue|skip)\b)",
     r"\bgit\s+reset\s+--(?:soft|mixed|hard|keep|merge)\b",
     r"\bgit\s+commit\b[^\n]*(?:--amend|-c\s+HEAD|-C\s+HEAD)",
     r"\bgit\s+update-ref\s+refs/heads/",
@@ -491,6 +510,7 @@ def interrupt_process_tree(
     parent_of: Callable[[int], int | None],
     children_of: Callable[[int], list[int]],
     signaler: Callable[[int, int], Any] = os.kill,
+    sig: int = signal.SIGINT,
 ) -> bool:
     """Interrupt a verified descendant tree, deepest child first."""
     if child_pid in root_pids or child_pid <= 1:
@@ -522,10 +542,17 @@ def interrupt_process_tree(
         ordered.append(pid)
 
     visit(child_pid)
+    signalled = False
+    failed = False
     for pid in ordered:
-        with contextlib.suppress(ProcessLookupError):
-            signaler(pid, signal.SIGINT)
-    return True
+        try:
+            signaler(pid, sig)
+            signalled = True
+        except ProcessLookupError:
+            continue
+        except OSError:
+            failed = True
+    return bool(ordered) and (signalled or not failed) and not failed
 
 
 def _children_pids(parent_pid: int) -> list[int]:
@@ -1056,7 +1083,7 @@ def wait_for_ci_event(project_dir: str, pr_number: int, *, timeout_seconds: floa
     """Use GitHub's watch stream for CI changes instead of status polling."""
     command = ["gh", "pr", "checks", str(pr_number), "--watch", "--interval", "5"]
     try:
-        subprocess.run(
+        result = subprocess.run(
             command,
             cwd=project_dir,
             capture_output=True,
@@ -1064,7 +1091,7 @@ def wait_for_ci_event(project_dir: str, pr_number: int, *, timeout_seconds: floa
             check=False,
             timeout=max(1.0, timeout_seconds),
         )
-        return True
+        return result.returncode == 0
     except (subprocess.TimeoutExpired, OSError):
         return False
 
@@ -1510,6 +1537,7 @@ class MonitorConfig:
     web_ui: bool = True
     web_port: int = 8765
     web_open_browser: bool = True
+    loop_interrupt_wait_seconds: float = 2.0
     launch_command: tuple[str, ...] = ()
 
 
@@ -1523,6 +1551,14 @@ def validate_process_name(process: str) -> str:
     if not clean or not re.match(r"^[A-Za-z0-9_.-]+$", clean):
         raise ValueError(f"Invalid process name: {process!r}")
     return clean
+
+
+def validate_web_port(port: int) -> int:
+    """Validate a localhost TCP port; zero requests an ephemeral port."""
+    value = int(port)
+    if not 0 <= value <= 65535:
+        raise ValueError(f"Invalid web port: {port!r}; expected 0..65535")
+    return value
 
 
 def validate_title_filter(title: str | None) -> str | None:
@@ -2304,6 +2340,15 @@ def pid_is_alive(pid: int | str | None) -> bool:
         return False
 
 
+def process_is_running(pid: int | str | None) -> bool:
+    """Treat exited and zombie descendants as stopped for recovery purposes."""
+    value = int(pid or 0) if str(pid or "0").lstrip("-").isdigit() else 0
+    if value <= 0 or not pid_is_alive(value):
+        return False
+    code, output, _ = run_command(["ps", "-p", str(value), "-o", "stat="])
+    return not (code == 0 and output.strip().upper().startswith("Z"))
+
+
 ANSI_CODES = {
     "reset": "\033[0m",
     "bold": "\033[1m",
@@ -2587,11 +2632,85 @@ def decide_question(history: str, profile: AgentProfile | None = None) -> str | 
     return options[0][0] if len(options) == 1 else None
 
 
-def append_log(path: str, message: str) -> None:
-    """Append a timestamped log line to file."""
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "a", encoding="utf-8") as handle:
+def append_log(path: str, message: str, *, max_bytes: int = 2_000_000) -> None:
+    """Append a timestamped log line and retain a bounded one-file archive."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if target.exists() and target.stat().st_size >= max(1024, int(max_bytes)):
+            archive = target.with_name(f"{target.name}.1")
+            os.replace(target, archive)
+            with contextlib.suppress(OSError):
+                os.chmod(archive, 0o600)
+    except OSError:
+        pass
+    with open(target, "a", encoding="utf-8") as handle:
         handle.write(f"{now_iso()} {message}\n")
+    with contextlib.suppress(OSError):
+        os.chmod(target, 0o600)
+
+
+def _public_attempt(record: dict[str, Any]) -> dict[str, Any]:
+    """Return an attempt projection safe for local dashboard consumers."""
+    public = {
+        key: record.get(key)
+        for key in ("attempt_id", "status", "timestamp", "reason", "observed_state")
+        if record.get(key) is not None
+    }
+    if "payload" in record:
+        public["payload_chars"] = len(str(record.get("payload") or ""))
+    return public
+
+
+def _redacted_commands(value: Any) -> list[str]:
+    """Preserve command counts while keeping command text out of HTTP status."""
+    if isinstance(value, (list, tuple)):
+        return ["<redacted>" for _item in value]
+    return []
+
+
+def _public_activity(value: Any) -> dict[str, Any] | Any:
+    """Project process activity without exposing arbitrary child command text."""
+    if not isinstance(value, dict):
+        return value
+    activity = dict(value)
+    activity["commands"] = _redacted_commands(activity.get("commands"))
+    return activity
+
+
+def _public_status(data: dict[str, Any]) -> dict[str, Any]:
+    """Remove prompts and sensitive operational text before serving status over HTTP."""
+    safe = dict(data)
+    attempts = data.get("attempts", [])
+    safe["attempts"] = [_public_attempt(item) for item in attempts if isinstance(item, dict)] if isinstance(attempts, list) else []
+    safe.pop("last_prompt", None)
+    prohibitions = data.get("prohibitions", [])
+    safe["prohibitions"] = ["<configured>" for _item in prohibitions] if isinstance(prohibitions, (list, tuple)) else []
+    safe["last_command"] = "<redacted>" if data.get("last_command") else ""
+    safe["activity"] = _public_activity(safe.get("activity"))
+    loop_guard = safe.get("loop_guard")
+    if isinstance(loop_guard, dict):
+        loop_guard = dict(loop_guard)
+        loop_guard["activity"] = _public_activity(loop_guard.get("activity"))
+        safe["loop_guard"] = loop_guard
+    decisions = data.get("policy_decisions")
+    if isinstance(decisions, list):
+        safe["policy_decisions"] = [
+            {
+                key: item.get(key)
+                for key in ("timestamp", "decision")
+                if item.get(key) is not None
+            }
+            for item in decisions
+            if isinstance(item, dict)
+        ]
+    return safe
+
+
+def _public_event_line(line: str) -> str:
+    """Redact free-form prompt payloads from the dashboard event stream."""
+    redacted = redact_sensitive(line)
+    return re.sub(r"\b(?:payload|prompt)=.*$", lambda match: match.group(0).split("=", 1)[0] + "=<redacted>", redacted, flags=re.IGNORECASE)
 
 
 DASHBOARD_HTML = """<!doctype html>
@@ -2605,14 +2724,30 @@ function tone(s){s=s.toUpperCase();if(/SUCCESS|COMPLETED|GREEN|MERGED/.test(s))r
 async function tick(){try{const [sr,er]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/events',{cache:'no-store'})]);const s=await sr.json(),e=await er.json();state.textContent=s.state||'starting';process.textContent=(s.process||'agent')+' · '+((s.pids||[]).length)+' pid';const t=s.todo||{};progress.textContent=(t.completed||0)+' / '+(t.total||0);branch.textContent=(s.git||{}).branch||'—';log.innerHTML=(e.lines||[]).map(x=>'<div class="line '+tone(x)+'">'+esc(x)+'</div>').join('')||'<span class="empty">Waiting for monitor events…</span>';log.scrollTop=log.scrollHeight;connection.textContent='LIVE'}catch(e){connection.textContent='RECONNECTING'}}setInterval(tick,1000);tick();
 </script></body></html>"""
 
+# Keep the static console easy to review while adding the redacted terminal
+# snapshot as a first-class live surface for operators.
+DASHBOARD_HTML = DASHBOARD_HTML.replace(
+    '<section class="terminal"><div class="terminal-head"><span>LIVE OPERATIONAL LOG</span><span class="dots">● ● ●</span></div><div class="log" id="log"><span class="empty">Waiting for monitor events…</span></div></section>',
+    '<section class="terminal"><div class="terminal-head"><span>LIVE OPERATIONAL LOG</span><span class="dots">● ● ●</span></div><div class="log" id="log"><span class="empty">Waiting for monitor events…</span></div></section><section class="terminal snapshot-terminal" style="margin-top:14px;height:260px;min-height:160px"><div class="terminal-head"><span>AGENT TERMINAL SNAPSHOT (REDACTED)</span><span class="dots">◉</span></div><pre class="log" id="terminal"><span class="empty">Waiting for terminal output…</span></pre></section>',
+)
+DASHBOARD_HTML = DASHBOARD_HTML.replace(
+    "const [sr,er]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/events',{cache:'no-store'})]);const s=await sr.json(),e=await er.json();",
+    "const [sr,er,tr]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/events',{cache:'no-store'}),fetch('/api/terminal',{cache:'no-store'})]);const s=await sr.json(),e=await er.json(),terminalData=await tr.json();",
+)
+DASHBOARD_HTML = DASHBOARD_HTML.replace(
+    "log.scrollTop=log.scrollHeight;connection.textContent='LIVE'",
+    "log.scrollTop=log.scrollHeight;terminal.textContent=terminalData.snapshot||'Waiting for terminal output…';connection.textContent='LIVE'",
+)
+
 
 class MonitorWebServer:
     """Local read-only dashboard serving status and the bounded event log."""
 
-    def __init__(self, status_path: str, log_path: str, port: int = 8765) -> None:
+    def __init__(self, status_path: str, log_path: str, port: int = 8765, snapshot_path: str = "") -> None:
         self.status_path = status_path
         self.log_path = log_path
-        self.port = port
+        self.snapshot_path = snapshot_path
+        self.port = validate_web_port(port)
         self.httpd: ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
 
@@ -2625,17 +2760,25 @@ class MonitorWebServer:
                     self._reply(200, "text/html; charset=utf-8", DASHBOARD_HTML.encode())
                 elif self.path == "/api/status":
                     try:
-                        payload = Path(owner.status_path).read_bytes()
-                        json.loads(payload)
-                    except (OSError, ValueError, json.JSONDecodeError):
+                        status = json.loads(Path(owner.status_path).read_text(encoding="utf-8"))
+                        if not isinstance(status, dict):
+                            raise ValueError("status must be a JSON object")
+                        payload = json.dumps(_public_status(status), sort_keys=True).encode()
+                    except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError):
                         payload = b'{"state":"starting","pids":[]}'
                     self._reply(200, "application/json", payload)
                 elif self.path == "/api/events":
                     try:
-                        lines = Path(owner.log_path).read_text(encoding="utf-8").splitlines()[-400:]
-                    except OSError:
+                        lines = [_public_event_line(line) for line in Path(owner.log_path).read_text(encoding="utf-8").splitlines()[-400:]]
+                    except (OSError, UnicodeError):
                         lines = []
                     self._reply(200, "application/json", json.dumps({"lines": lines}).encode())
+                elif self.path == "/api/terminal":
+                    try:
+                        snapshot = Path(owner.snapshot_path).read_text(encoding="utf-8") if owner.snapshot_path else ""
+                    except (OSError, UnicodeError):
+                        snapshot = ""
+                    self._reply(200, "application/json", json.dumps({"snapshot": snapshot}).encode())
                 else:
                     self._reply(404, "application/json", b'{"error":"not found"}')
 
@@ -2775,6 +2918,7 @@ def generate_starter_config(format_type: str = "json") -> str:
                 "web_ui": True,
                 "web_port": 8765,
                 "web_open_browser": True,
+                "loop_interrupt_wait_seconds": 2.0,
                 "unsafe_phrases": list(UNSAFE_PHRASES),
                 "custom_profiles": {
                     "my-agent": {
@@ -2820,6 +2964,7 @@ allow_history_rewrite = false
 web_ui = true
 web_port = 8765
 web_open_browser = true
+loop_interrupt_wait_seconds = 2.0
 
 unsafe_phrases = ["bypass", "delete", "rm -rf", "reset --hard"]
 
@@ -2870,6 +3015,7 @@ class TerminalMonitor:
         self.monitor_lock_path = os.path.join(self.state_dir, "monitor.pid")
         self.monitor_meta_path = os.path.join(self.state_dir, "monitor.json")
         self.status_json_path = config.status_json_path or os.path.join(self.state_dir, "status.json")
+        self.terminal_snapshot_path = os.path.join(self.state_dir, "terminal-snapshot.txt")
         self.task_state_path = os.path.join(self.state_dir, "task-state.json")
         self.report_path = config.report_path or os.path.join(self.state_dir, "final-report.json")
         stored_state = TaskState.load(self.task_state_path)
@@ -2925,6 +3071,7 @@ class TerminalMonitor:
         self.detected_task_id = ""
         self.web_server: MonitorWebServer | None = None
         self.web_url = ""
+        self.last_safe_snapshot = ""
         self._shutdown_requested = False
         self._shutdown_reason = ""
         self._previous_signal_handlers: dict[int, Any] = {}
@@ -3064,8 +3211,20 @@ class TerminalMonitor:
         latest = self.attempt_ledger.latest(self.task_state.last_attempt_id or None)
         if not latest or latest.get("status") != "queued" or latest.get("detail") != "terminal reports message queued":
             return None
-        started = float(latest.get("monotonic", time.monotonic()))
-        age = max(0.0, time.monotonic() - started)
+        started_value = latest.get("monotonic")
+        age = 0.0
+        try:
+            started = float(started_value)
+            monotonic_now = time.monotonic()
+            if started <= monotonic_now:
+                age = max(0.0, monotonic_now - started)
+            else:
+                raise ValueError("persisted monotonic clock is from a newer boot")
+        except (TypeError, ValueError):
+            timestamp = str(latest.get("timestamp", ""))
+            with contextlib.suppress(ValueError):
+                created = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                age = max(0.0, (datetime.now(timezone.utc) - created).total_seconds())
         if age < max(0.0, self.config.queued_attempt_seconds):
             return None
         return {"attempt_id": latest.get("attempt_id"), "age_seconds": round(age, 1), "detail": latest.get("detail")}
@@ -3082,6 +3241,21 @@ class TerminalMonitor:
         ]
         if not interrupted:
             return False, "no_verified_expensive_child"
+        protected_roots = set(root_pids)
+        descendants = [pid for pid in dict.fromkeys((*activity.descendants, *targets)) if pid not in protected_roots]
+        deadline = time.monotonic() + max(0.0, self.config.loop_interrupt_wait_seconds)
+        while any(process_is_running(pid) for pid in descendants) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if any(process_is_running(pid) for pid in descendants):
+            for target in targets:
+                interrupt_process_tree(set(root_pids), target, parent_of=_parent_pid, children_of=_children_pids, sig=signal.SIGTERM)
+            deadline = time.monotonic() + max(0.0, self.config.loop_interrupt_wait_seconds)
+            while any(process_is_running(pid) for pid in descendants) and time.monotonic() < deadline:
+                time.sleep(0.05)
+        if any(process_is_running(pid) for pid in descendants):
+            return False, "child_tree_did_not_stop"
+        if self.sends >= self.config.max_sends:
+            return False, "max_sends_reached"
         reason = self.loop_assessment.reason
         evidence = ", ".join(self.loop_assessment.evidence) or "repeated command"
         instruction = (
@@ -3102,6 +3276,11 @@ class TerminalMonitor:
         self.last_action = "loop_recovery:accepted"
         return True, f"interrupted={','.join(str(pid) for pid in interrupted)}"
 
+    def _write_terminal_snapshot(self, snapshot: str) -> None:
+        self.last_safe_snapshot = snapshot
+        with contextlib.suppress(OSError):
+            _atomic_text_write(self.terminal_snapshot_path, snapshot)
+
     def _effective_threshold(self, state: str) -> float:
         """Idle seconds to wait before acting; actionable prompts act faster."""
         if self.config.idle_seconds == 0.0:
@@ -3116,7 +3295,8 @@ class TerminalMonitor:
         if not self.status_json_path:
             return
         self.last_heartbeat = now_iso()
-        git_status = get_git_status(self.config.project_dir, ttl_seconds=0.0)
+        # Status export is polled frequently; avoid a GitHub query on every tick.
+        git_status = get_git_status(self.config.project_dir, ttl_seconds=5.0)
         data: dict[str, Any] = {
             "schema_version": 2,
             "running": True,
@@ -3236,6 +3416,7 @@ class TerminalMonitor:
         history = str(tab.get("hist", ""))
         snapshot = normalize_snapshot(history)
         safe_snapshot, _ = redact_snapshot(snapshot)
+        self._write_terminal_snapshot(safe_snapshot)
         digest = hashlib.sha256(snapshot.encode("utf-8", "replace")).hexdigest()[:16]
         activity = self._process_activity(pids, bool(tab.get("busy")))
         state = classify_state(history, self.profile, activity=activity, session_tracker=self.session_tracker)
@@ -3594,17 +3775,26 @@ class TerminalMonitor:
             self.log("EXIT code=2 msg=MONITOR_ALREADY_RUNNING")
             return 2
         self.log(f"START process={self.config.process} profile={self.profile.name} backend={self.backend.name()}")
-        if self.config.web_ui and not self.config.once:
-            try:
-                self.web_server = MonitorWebServer(self.status_json_path, self.log_path, self.config.web_port)
-                self.web_url = self.web_server.start()
-                self.log(f"WEB_UI url={self.web_url}")
-                if self.config.web_open_browser:
-                    webbrowser.open(self.web_url)
-            except OSError as exc:
-                self.log(f"WEB_UI_FAILED error={redact_sensitive(str(exc))}")
         self._install_shutdown_handlers()
         try:
+            if self.config.web_ui and not self.config.once:
+                try:
+                    self.web_server = MonitorWebServer(
+                        self.status_json_path,
+                        self.log_path,
+                        self.config.web_port,
+                        self.terminal_snapshot_path,
+                    )
+                    self.web_url = self.web_server.start()
+                    self.log(f"WEB_UI url={self.web_url}")
+                    if self.config.web_open_browser:
+                        with contextlib.suppress(Exception):
+                            webbrowser.open(self.web_url)
+                except (OSError, ValueError, OverflowError) as exc:
+                    self.log(f"WEB_UI_FAILED error={redact_sensitive(str(exc))}")
+                    if self.web_server:
+                        self.web_server.stop()
+                    self.web_server = None
             while True:
                 if self._shutdown_requested:
                     reason = self._shutdown_reason or "shutdown"
@@ -3784,6 +3974,7 @@ def _add_monitor_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-web-ui", action="store_true", help="Disable the local live web command center")
     parser.add_argument("--web-port", type=int, default=None, help="Preferred localhost port for the live web command center")
     parser.add_argument("--no-web-open", action="store_true", help="Start the web command center without opening a browser")
+    parser.add_argument("--loop-interrupt-wait-seconds", type=float, default=None, help="Seconds to wait for a loop child tree to stop")
     parser.add_argument("--once", action="store_true", default=False, help="Inspect status once and exit")
     parser.add_argument("--dry-run", action="store_true", default=False, help="Simulate actions without sending keystrokes")
 
@@ -3874,8 +4065,9 @@ def config_from_args(args: argparse.Namespace) -> MonitorConfig:
         queued_attempt_seconds=max(0.0, float(_val(getattr(args, "queued_attempt_seconds", None), "queued_attempt_seconds", 45.0))),
         allow_history_rewrite=bool(_val(getattr(args, "allow_history_rewrite", None), "allow_history_rewrite", False)),
         web_ui=not getattr(args, "no_web_ui", False) and bool(file_cfg.get("web_ui", True)),
-        web_port=max(0, int(_val(getattr(args, "web_port", None), "web_port", 8765))),
+        web_port=validate_web_port(int(_val(getattr(args, "web_port", None), "web_port", 8765))),
         web_open_browser=not getattr(args, "no_web_open", False) and bool(file_cfg.get("web_open_browser", True)),
+        loop_interrupt_wait_seconds=max(0.0, float(_val(getattr(args, "loop_interrupt_wait_seconds", None), "loop_interrupt_wait_seconds", 2.0))),
     )
 
 

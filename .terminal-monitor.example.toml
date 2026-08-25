@@ -23,6 +23,14 @@ expected_branch = ""
 protected_branches = ["main", "master"]
 report_path = "/tmp/terminal-monitor/final-report.json"
 attempt_history_limit = 100
+loop_guard = true
+loop_repeat_limit = 3
+queued_attempt_seconds = 45.0
+allow_history_rewrite = false
+loop_interrupt_wait_seconds = 2.0
+web_ui = true
+web_port = 8765
+web_open_browser = true
 
 unsafe_phrases = [
   "bypass",

@@ -74,8 +74,8 @@ Different AI agents use distinct visual conventions in the terminal:
 - **Attempt and restart journal**: every automated continuation is persisted with an ID and lifecycle status, while restart events retain the saved session and last prompt context.
 - **Queue-aware delivery**: visible `QUEUED` output remains pending instead of being mistaken for acceptance; duplicate sends stop and a stale queue becomes an attention event.
 - **Loop containment**: duplicate expensive process roots, repeated test/build episodes without Git or task progress, and Git history rewrites pause supervision. Verified child interruption signals the complete descendant tree deepest-first so wrappers do not leave orphan processes behind.
-- **Session-preserving recovery**: repeated test/build loops are recovered by interrupting verified expensive children only and sending a diagnostic prompt into the existing session; the monitored root PID is never a recovery target.
-- **Local command center**: continuous monitoring automatically serves and opens a localhost-only dark dashboard with color-coded live events, process/task/Git summaries, and a compact operations-console visual language.
+- **Session-preserving recovery**: repeated test/build loops are recovered by interrupting verified expensive children only, waiting for the entire child tree to stop, escalating to `SIGTERM` when necessary, and sending a diagnostic prompt into the existing session only after the stop is confirmed; the monitored root PID is never a recovery target.
+- **Local command center**: continuous monitoring automatically serves and opens a localhost-only dark dashboard with color-coded live events, a bounded redacted terminal snapshot, safe status projections, bounded rotating logs, process/task/Git summaries, and a compact operations-console visual language.
 - **External-check distinction**: rate limits (`429`), timeouts, and network failures are recorded as retryable external evidence rather than being confused with code regressions.
 
 ### 11. Merge and Repository Safety
