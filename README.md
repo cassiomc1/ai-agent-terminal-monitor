@@ -55,7 +55,7 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
 - ⏱️ **Per-Task Timing & Velocity Tracking**: Automatically tracks `started_at`, `completed_at`, `duration_seconds` for every plan task and computes overall plan velocity and remaining completion ETA.
 - 🧪 **Live Test Progress Extractor**: Automatically captures test suite executions (`✔ passed`, `✖ failed`, totals) in `activity.test_progress` and displays a real-time progress bar in the web console.
 - 🔔 **Desktop Notifications & Webhooks**: Supports native desktop alerts (`osascript` / `notify-send`) and asynchronous HTTP webhook dispatch (`--webhook-url <url>`) for `ATTENTION_REQUIRED`, `PR_CREATED`, and `COMPLETED`.
-- 🔀 **Multi-Agent Session Multiplexing**: Automatically scans active supervisor sessions across `/tmp/terminal-monitor/*/status.json` via `GET /api/instances` with a fast instance switcher in the web console header.
+- 🔀 **Multi-Agent Session Multiplexing**: Automatically scans active supervisor sessions across the monitor state root (`/tmp/terminal-monitor/*/status.json` by default, honoring a custom `--state-dir`) via `GET /api/instances` with a fast instance switcher in the web console header.
 - 🧭 **Branch and Worktree Safety & Auto-Resolution**: Automatically derives project-isolated state directories in `/tmp/terminal-monitor/<project-slug-hash>/`, auto-adopts created feature branches (`BRANCH_TRACK`), and safely pauses when direct changes hit protected branches.
 - 🎯 **Stable Tab Targeting**: Prefers an exact custom Terminal.app tab title before the application suffix in a window name, avoiding cross-talk between neighboring OpenCode sessions.
 - 📝 **Structured Final Reports**: Writes `final-report.json` with verification evidence, CI classifications, continuation attempts, policy decisions, the explicit npm prohibition, and the npm-publication invariant.
@@ -185,6 +185,9 @@ The HTTP surface supports real-time Server-Sent Events (SSE) streaming and manua
 | `/api/status` | `GET` | Safe projection of state, Git, task progress, CI stage and attempt status |
 | `/api/events` | `GET` | Last 400 event lines with credentials and free-form payloads redacted |
 | `/api/terminal` | `GET` | Last bounded terminal snapshot after credential masking |
+
+`POST /api/send` rejects bodies larger than 64 KiB with HTTP `413`, so a
+misbehaving browser tab cannot push unbounded data into the answer channel.
 
 #### 🎛️ Operator Quick Actions & Task Plan View
 - **Architecture Stage Pipeline:** Visual indicator tracking progress across `TASK_RECEIVED → EXECUTING → VERIFYING → PR_CREATED → CI_CHECKS → MERGED`.
@@ -443,6 +446,11 @@ failure requiring a fix.
 
 ## Migration notes
 
+- `terminal_monitor.py --version` prints the running release (currently `1.1.0`,
+  matching `pyproject.toml`).
+- `PullRequestStateMachine` now keeps its stage and last-seen PR number per
+  instance; embedding multiple monitors in one process no longer shares PR
+  lifecycle state between them.
 - Existing configurations remain valid.
 - `status.json` is now created by default inside `state_dir`; remove consumers that assumed it existed only with `--status-json`.
 - `npm_publish_allowed` defaults to `false`. Enabling publication requires the explicit `--allow-npm-publish` flag or configuration value.

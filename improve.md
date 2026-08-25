@@ -108,3 +108,20 @@ revisão do command center foram implementados:
 - comandos `stop`, `status` e `resume` que nunca sinalizam o processo do
   agente;
 - testes de regressão e documentação no README/ABOUT para o novo ciclo de vida.
+
+## Implementação da rodada de revisão (v1.1.0)
+
+- Corrigido bug real: `PullRequestStateMachine` guardava `stage` e
+  `seen_pr_number` como atributos de classe, compartilhando o ciclo de vida do
+  PR entre todas as instâncias no mesmo processo (SDK com múltiplos monitores e
+  suíte de testes). Agora o estado é por instância, restaurável a partir do
+  estágio persistido.
+- O endpoint `/api/instances` do command center não depende mais do caminho
+  fixo `/tmp/terminal-monitor`: o servidor recebe a raiz de estado do monitor
+  (`--state-dir` customizado passa a ser descoberto pelo seletor de instâncias).
+- `POST /api/send` rejeita corpos acima de 64 KiB com HTTP `413`, impedindo que
+  uma aba mal comportada despeje dados ilimitados no canal de respostas.
+- Novo flag `--version` alinhado ao `pyproject.toml` (1.1.0).
+- Testes de regressão cobrindo: isolamento entre instâncias da máquina de
+  estados, restauração de estágio persistido, `/api/instances` com raiz de
+  estado customizada, rejeição 413 e saída de `--version`.

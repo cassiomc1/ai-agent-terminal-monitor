@@ -27,7 +27,7 @@ known-first-party = ["terminal_monitor"]
 
 [project]
 name = "ai-agent-terminal-monitor"
-version = "1.0.0"
+version = "1.1.0"
 description = "Universal, autonomous watcher and safe continuation driver for any AI coding agent CLI"
 readme = "README.md"
 requires-python = ">=3.10"
