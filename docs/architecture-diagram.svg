@@ -1,0 +1,211 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 1280 720" role="img" aria-labelledby="title desc">
+  <title id="title">AI Agent Terminal Monitor — animated dark architecture</title>
+  <desc id="desc">Animated architecture diagram showing terminal backends flowing through process and history collection, state classification, policy and loop guards, safe actions, the agent session, and redacted evidence surfaces.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#080b12"/>
+      <stop offset="0.58" stop-color="#0c1019"/>
+      <stop offset="1" stop-color="#130e0b"/>
+    </linearGradient>
+    <radialGradient id="halo-orange" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#fe6e00" stop-opacity="0.2"/>
+      <stop offset="1" stop-color="#fe6e00" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="halo-blue" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#3b82f6" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#3b82f6" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#000" flood-opacity="0.42"/>
+    </filter>
+    <filter id="soft-glow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="5" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <style>
+      .bg-grid{fill:none;stroke:#ffffff;stroke-opacity:.045;stroke-width:1}
+      .eyebrow{fill:#fe6e00;font:700 11px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:2.4px}
+      .title{fill:#f8fafc;font:800 28px ui-sans-serif,system-ui,sans-serif;letter-spacing:-.5px}
+      .subtitle{fill:#94a3b8;font:500 12px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.8px}
+      .section{fill:#64748b;font:700 10px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:2px}
+      .section-line{stroke:#334155;stroke-width:1;stroke-dasharray:2 7}
+      .panel{fill:#101722;fill-opacity:.92;stroke:#263447;stroke-width:1}
+      .node{fill:#0e1622;fill-opacity:.96;stroke:#34465b;stroke-width:1.4;filter:url(#shadow)}
+      .node-title{fill:#f8fafc;font:750 15px ui-sans-serif,system-ui,sans-serif}
+      .node-copy{fill:#94a3b8;font:500 11px ui-monospace,SFMono-Regular,Menlo,monospace}
+      .node-tag{fill:#64748b;font:700 9px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:1.2px}
+      .accent-orange{stroke:#fe6e00}.accent-blue{stroke:#3b82f6}.accent-green{stroke:#00c758}.accent-red{stroke:#fb4b55}
+      .edge{fill:none;stroke-width:1.7;stroke-linecap:round;stroke-dasharray:7 9;animation:flow 2.8s linear infinite}
+      .edge-soft{fill:none;stroke:#475569;stroke-opacity:.65;stroke-width:1.2;stroke-dasharray:3 8;animation:flow 5s linear infinite}
+      .packet{filter:url(#soft-glow)}
+      .status-dot{animation:pulse 2.6s ease-in-out infinite}
+      .node-pulse{animation:nodeGlow 3.8s ease-in-out infinite}
+      .delay-1{animation-delay:.45s}.delay-2{animation-delay:.9s}.delay-3{animation-delay:1.35s}.delay-4{animation-delay:1.8s}
+      .chip{fill:#0f1b19;stroke:#1c6650;stroke-width:1}
+      .chip-text{fill:#50e3a4;font:700 10px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:1.3px}
+      .legend{fill:#64748b;font:600 10px ui-monospace,SFMono-Regular,Menlo,monospace}
+      @keyframes flow{to{stroke-dashoffset:-64}}
+      @keyframes pulse{0%,100%{opacity:.45;transform:scale(1)}50%{opacity:1;transform:scale(1.35)}}
+      @keyframes nodeGlow{0%,100%{filter:url(#shadow)}50%{filter:url(#soft-glow)}}
+      @media (prefers-reduced-motion:reduce){.edge,.edge-soft,.status-dot,.node-pulse{animation:none}.packet{display:none}}
+    </style>
+  </defs>
+
+  <rect width="1280" height="720" rx="18" fill="url(#bg)"/>
+  <circle cx="360" cy="340" r="300" fill="url(#halo-blue)"/>
+  <circle cx="980" cy="340" r="300" fill="url(#halo-orange)"/>
+  <g opacity=".7">
+    <path class="bg-grid" d="M0 90H1280M0 150H1280M0 210H1280M0 270H1280M0 330H1280M0 390H1280M0 450H1280M0 510H1280M0 570H1280M0 630H1280"/>
+    <path class="bg-grid" d="M80 0V720M160 0V720M240 0V720M320 0V720M400 0V720M480 0V720M560 0V720M640 0V720M720 0V720M800 0V720M880 0V720M960 0V720M1040 0V720M1120 0V720M1200 0V720"/>
+  </g>
+
+  <g transform="translate(56 48)">
+    <circle class="status-dot" cx="7" cy="7" r="5" fill="#fe6e00"/>
+    <text class="eyebrow" x="24" y="11">LIVE ARCHITECTURE / SAFE BY DEFAULT</text>
+    <text class="title" x="0" y="52">AI Agent Terminal Monitor</text>
+    <text class="subtitle" x="0" y="76">observe  ·  classify  ·  protect  ·  recover  ·  prove</text>
+  </g>
+  <g transform="translate(1002 54)">
+    <rect class="chip" width="222" height="30" rx="15"/>
+    <circle class="status-dot" cx="18" cy="15" r="4" fill="#50e3a4"/>
+    <text class="chip-text" x="31" y="19">ANIMATED / LOCAL / REDACTED</text>
+  </g>
+
+  <text class="section" x="56" y="145">INGEST</text>
+  <path class="section-line" d="M112 141H275"/>
+  <text class="section" x="330" y="145">SIGNALS</text>
+  <path class="section-line" d="M397 141H552"/>
+  <text class="section" x="610" y="145">DECISION</text>
+  <path class="section-line" d="M688 141H830"/>
+  <text class="section" x="884" y="145">SESSION</text>
+  <path class="section-line" d="M952 141H1040"/>
+  <text class="section" x="1088" y="145">EVIDENCE</text>
+
+  <!-- Animated edges are deliberately behind nodes so packets feel like a live trace. -->
+  <g>
+    <path class="edge accent-blue" d="M232 242C268 242 278 308 330 308"/>
+    <path class="edge accent-blue delay-1" d="M232 352C268 352 278 340 330 340"/>
+    <path class="edge accent-blue delay-2" d="M232 462C268 462 278 372 330 372"/>
+    <path class="edge accent-blue delay-3" d="M232 572C268 572 278 404 330 404"/>
+    <path class="edge accent-blue" d="M520 350C552 350 570 350 610 350"/>
+    <path class="edge accent-orange" d="M800 350C828 350 842 278 872 278"/>
+    <path class="edge accent-red delay-1" d="M872 320C838 320 830 420 800 420"/>
+    <path class="edge accent-orange delay-2" d="M978 342C978 366 978 378 978 410"/>
+    <path class="edge accent-green delay-3" d="M1068 278C1090 278 1090 278 1100 278"/>
+    <path class="edge accent-green delay-1" d="M1068 450C1090 450 1090 450 1100 450"/>
+    <path class="edge-soft" d="M520 430C670 560 870 575 1100 575"/>
+    <path class="edge-soft" d="M1190 330C1225 330 1230 165 1030 165"/>
+  </g>
+
+  <!-- Moving packets provide a visual trace even when the diagram is embedded as an image. -->
+  <g class="packet" fill="#60a5fa">
+    <circle r="4"><animateMotion dur="2.8s" repeatCount="indefinite" path="M232 242C268 242 278 308 330 308"/></circle>
+    <circle r="4" fill="#fe6e00"><animateMotion dur="2.8s" begin=".7s" repeatCount="indefinite" path="M520 350C552 350 570 350 610 350"/></circle>
+    <circle r="4" fill="#fb4b55"><animateMotion dur="3.2s" begin="1.1s" repeatCount="indefinite" path="M872 320C838 320 830 420 800 420"/></circle>
+    <circle r="4" fill="#50e3a4"><animateMotion dur="3.4s" begin=".9s" repeatCount="indefinite" path="M1068 450C1090 450 1090 450 1100 450"/></circle>
+  </g>
+
+  <!-- Ingest -->
+  <g class="node-pulse">
+    <rect class="node" x="56" y="198" width="176" height="88" rx="12"/>
+    <circle cx="78" cy="224" r="5" fill="#3b82f6"/>
+    <text class="node-tag" x="94" y="228">BACKEND / 01</text>
+    <text class="node-title" x="76" y="254">Terminal.app</text>
+    <text class="node-copy" x="76" y="273">AppleScript capture</text>
+  </g>
+  <g class="node-pulse delay-1">
+    <rect class="node" x="56" y="308" width="176" height="88" rx="12"/>
+    <circle cx="78" cy="334" r="5" fill="#3b82f6"/>
+    <text class="node-tag" x="94" y="338">BACKEND / 02</text>
+    <text class="node-title" x="76" y="364">iTerm2</text>
+    <text class="node-copy" x="76" y="383">session capture</text>
+  </g>
+  <g class="node-pulse delay-2">
+    <rect class="node" x="56" y="418" width="176" height="88" rx="12"/>
+    <circle cx="78" cy="444" r="5" fill="#3b82f6"/>
+    <text class="node-tag" x="94" y="448">BACKEND / 03</text>
+    <text class="node-title" x="76" y="474">tmux</text>
+    <text class="node-copy" x="76" y="493">remote-safe pane I/O</text>
+  </g>
+  <g class="node-pulse delay-3">
+    <rect class="node" x="56" y="528" width="176" height="88" rx="12"/>
+    <circle cx="78" cy="554" r="5" fill="#3b82f6"/>
+    <text class="node-tag" x="94" y="558">BACKEND / 04</text>
+    <text class="node-title" x="76" y="584">Headless / auto</text>
+    <text class="node-copy" x="76" y="603">portable resolver</text>
+  </g>
+
+  <!-- Signals -->
+  <g class="node-pulse delay-1">
+    <rect class="node" x="330" y="276" width="190" height="148" rx="14"/>
+    <rect x="330" y="276" width="5" height="148" rx="2" fill="#3b82f6"/>
+    <text class="node-tag" x="352" y="304">SIGNAL BUS</text>
+    <text class="node-title" x="352" y="333">Collect</text>
+    <text class="node-copy" x="352" y="358">history + process tree</text>
+    <text class="node-copy" x="352" y="378">Git + task progress</text>
+    <text class="node-copy" x="352" y="398">redact / normalize</text>
+  </g>
+  <g class="node-pulse delay-2">
+    <rect class="node" x="610" y="276" width="190" height="148" rx="14"/>
+    <rect x="610" y="276" width="5" height="148" rx="2" fill="#fe6e00"/>
+    <text class="node-tag" x="632" y="304">STATE ENGINE</text>
+    <text class="node-title" x="632" y="333">Classify</text>
+    <text class="node-copy" x="632" y="358">thinking / permission</text>
+    <text class="node-copy" x="632" y="378">question / idle / done</text>
+    <text class="node-copy" x="632" y="398">mode + completion</text>
+  </g>
+
+  <!-- Decision and target session -->
+  <g class="node-pulse delay-3">
+    <rect class="node" x="872" y="210" width="196" height="132" rx="14"/>
+    <rect x="872" y="210" width="5" height="132" rx="2" fill="#fb4b55"/>
+    <text class="node-tag" x="894" y="238">FAIL-CLOSED GATE</text>
+    <text class="node-title" x="894" y="267">Policy + loop guard</text>
+    <text class="node-copy" x="894" y="292">unsafe → attention</text>
+    <text class="node-copy" x="894" y="312">repeat → child-only stop</text>
+    <text class="node-copy" x="894" y="332">no root PID signals</text>
+  </g>
+  <g class="node-pulse delay-4">
+    <rect class="node" x="872" y="410" width="196" height="132" rx="14"/>
+    <rect x="872" y="410" width="5" height="132" rx="2" fill="#fe6e00"/>
+    <text class="node-tag" x="894" y="438">EXISTING SESSION</text>
+    <text class="node-title" x="894" y="467">Target agent CLI</text>
+    <text class="node-copy" x="894" y="492">safe prompt / key</text>
+    <text class="node-copy" x="894" y="512">OpenCode · Claude · Aider</text>
+    <text class="node-copy" x="894" y="532">session stays alive</text>
+  </g>
+
+  <!-- Evidence -->
+  <g>
+    <rect class="panel" x="1100" y="210" width="124" height="132" rx="14"/>
+    <circle class="status-dot" cx="1122" cy="238" r="5" fill="#50e3a4"/>
+    <text class="node-tag" x="1138" y="241">LIVE</text>
+    <text class="node-title" x="1118" y="270">Web UI</text>
+    <text class="node-copy" x="1118" y="294">status</text>
+    <text class="node-copy" x="1118" y="312">events</text>
+    <text class="node-copy" x="1118" y="330">snapshot</text>
+  </g>
+  <g>
+    <rect class="panel" x="1100" y="382" width="124" height="132" rx="14"/>
+    <circle class="status-dot delay-2" cx="1122" cy="410" r="5" fill="#50e3a4"/>
+    <text class="node-tag" x="1138" y="413">DURABLE</text>
+    <text class="node-title" x="1118" y="442">Ledger</text>
+    <text class="node-copy" x="1118" y="466">attempts</text>
+    <text class="node-copy" x="1118" y="484">CI evidence</text>
+    <text class="node-copy" x="1118" y="502">final report</text>
+  </g>
+  <g>
+    <rect class="panel" x="1100" y="554" width="124" height="82" rx="14"/>
+    <circle class="status-dot delay-1" cx="1122" cy="582" r="5" fill="#50e3a4"/>
+    <text class="node-tag" x="1138" y="585">REDACTED</text>
+    <text class="node-title" x="1118" y="614">Terminal feed</text>
+  </g>
+
+  <g transform="translate(56 670)">
+    <circle cx="6" cy="0" r="4" fill="#3b82f6"/><text class="legend" x="18" y="4">capture</text>
+    <circle cx="94" cy="0" r="4" fill="#fe6e00"/><text class="legend" x="106" y="4">decision</text>
+    <circle cx="188" cy="0" r="4" fill="#fb4b55"/><text class="legend" x="200" y="4">safety stop</text>
+    <circle cx="306" cy="0" r="4" fill="#50e3a4"/><text class="legend" x="318" y="4">evidence</text>
+    <text class="legend" x="1090" y="4">v1 · local monitor</text>
+  </g>
+</svg>
