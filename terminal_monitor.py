@@ -3188,14 +3188,14 @@ class MonitorWebServer:
                                     status_obj = json.loads(status_raw) if status_raw.strip() else {}
                                     events_lines = []
                                     if owner.log_path and os.path.exists(owner.log_path):
-                                        events_lines = [_public_event_line(l) for l in Path(owner.log_path).read_text(encoding="utf-8").splitlines()[-400:]]
+                                        events_lines = [_public_event_line(entry) for entry in Path(owner.log_path).read_text(encoding="utf-8").splitlines()[-400:]]
                                     term_snap = Path(owner.snapshot_path).read_text(encoding="utf-8") if owner.snapshot_path and os.path.exists(owner.snapshot_path) else ""
                                     combined = {
                                         "status": _public_status(status_obj),
                                         "events": {"lines": events_lines},
                                         "terminal": {"snapshot": term_snap},
                                     }
-                                    self.wfile.write(f"data: {json.dumps(combined)}\n\n".encode("utf-8"))
+                                    self.wfile.write(f"data: {json.dumps(combined)}\n\n".encode())
                                     self.wfile.flush()
                                 else:
                                     self.wfile.write(b": ping\n\n")
