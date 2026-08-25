@@ -1608,9 +1608,17 @@ class SupervisorV2Tests(unittest.TestCase):
 
 
     def test_send_desktop_notification_and_webhook(self):
-        with mock.patch("subprocess.Popen") as mock_popen:
+        # Force the macOS branch so the assertion does not depend on
+        # notify-send being installed on Linux CI runners.
+        with mock.patch("subprocess.Popen") as mock_popen, mock.patch("sys.platform", "darwin"):
             ok = terminal_monitor.send_desktop_notification("Test Alert", "Sample message")
             self.assertTrue(ok)
+            mock_popen.assert_called()
+
+        with mock.patch("subprocess.Popen") as mock_popen, mock.patch(
+            "sys.platform", "linux"
+        ), mock.patch("shutil.which", return_value="/usr/bin/notify-send"):
+            self.assertTrue(terminal_monitor.send_desktop_notification("Test Alert", "Sample message"))
             mock_popen.assert_called()
 
         with mock.patch("urllib.request.urlopen"):
@@ -1738,9 +1746,12 @@ class SupervisorV2Tests(unittest.TestCase):
                     data=json.dumps({"action": "answer", "payload": "x" * (terminal_monitor.WEB_POST_BODY_LIMIT_BYTES + 1)}).encode(),
                     headers={"Content-Type": "application/json"},
                 )
-                with self.assertRaises(urllib.error.HTTPError) as ctx:
-                    urllib.request.urlopen(req, timeout=2).read()
-                self.assertEqual(ctx.exception.code, 413)
+                try:
+                    urllib.request.urlopen(req, timeout=2)
+                    self.fail("expected HTTPError")
+                except urllib.error.HTTPError as exc:
+                    self.assertEqual(exc.code, 413)
+                    exc.close()
                 self.assertFalse(answer_path.exists())
             finally:
                 server.stop()
