@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.request
 from unittest import mock
 
 MODULE_PATH = pathlib.Path(__file__).parents[1] / "terminal_monitor.py"
@@ -457,7 +458,17 @@ class TmuxBackendTests(unittest.TestCase):
 class RobustnessTests(unittest.TestCase):
     def test_json_safe_serializes_process_activity(self):
         value = terminal_monitor.json_safe(terminal_monitor.ProcessActivity(active=True, descendants=(7,), commands=("pytest",)))
-        self.assertEqual(value, {"active": True, "descendants": [7], "commands": ["pytest"], "cpu_percent": 0.0, "oldest_seconds": 0.0, "git_changed": False})
+        self.assertEqual(value, {
+            "active": True,
+            "descendants": [7],
+            "direct_descendants": [],
+            "commands": ["pytest"],
+            "cpu_percent": 0.0,
+            "oldest_seconds": 0.0,
+            "git_changed": False,
+            "duplicate_commands": [],
+            "expensive_roots": [],
+        })
         json.dumps(value)
 
     def test_redacts_credentials_from_inspection_text(self):
@@ -904,6 +915,92 @@ class SupervisorV2Tests(unittest.TestCase):
             statuses = [item["status"] for item in monitor.task_state.attempts]
         self.assertIn("completed", statuses)
 
+    def test_queued_ui_marker_does_not_complete_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = MockBackend(tab_response={"ok": True, "error": "", "hist": "Ready for next task."})
+            monitor = terminal_monitor.TerminalMonitor(
+                terminal_monitor.MonitorConfig(
+                    process="opencode",
+                    profile="opencode",
+                    continue_text="Continue safely",
+                    idle_seconds=0.0,
+                    cooldown_seconds=0.0,
+                    smart_nudges=False,
+                    state_dir=directory,
+                ),
+                backend=backend,
+            )
+            monitor.step()
+            backend.tab_response["hist"] = "Ready for next task.\nContinue safely\nQUEUED"
+            monitor.step()
+            latest = monitor.attempt_ledger.latest(monitor.task_state.last_attempt_id)
+        self.assertEqual(latest["status"], "queued")
+        self.assertEqual(latest["detail"], "terminal reports message queued")
+
+    def test_stale_queued_attempt_requires_attention(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = MockBackend(tab_response={"ok": True, "error": "", "hist": "Ready.\nContinue safely\nQUEUED"})
+            monitor = terminal_monitor.TerminalMonitor(
+                terminal_monitor.MonitorConfig(
+                    process="opencode",
+                    profile="opencode",
+                    state_dir=directory,
+                    supervise=True,
+                    queued_attempt_seconds=1.0,
+                ),
+                backend=backend,
+            )
+            attempt_id = monitor._queue_attempt("manual", "Continue safely", "thinking")
+            monitor._transition_attempt(attempt_id, "sent", observed_state="thinking")
+            monitor._transition_attempt(attempt_id, "accepted", observed_state="thinking")
+            monitor._transition_attempt(attempt_id, "queued", detail="terminal reports message queued", observed_state="thinking")
+            monitor.attempt_ledger.records[-1]["monotonic"] = 1.0
+            with mock.patch.object(terminal_monitor.time, "monotonic", return_value=10.0), mock.patch.object(
+                terminal_monitor, "get_git_status", return_value=terminal_monitor.GitStatus()
+            ), mock.patch.object(terminal_monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()):
+                code, message = monitor.step()
+        self.assertEqual(code, 3)
+        self.assertIn("queued_attempt_stale", message)
+
+    def test_loop_guard_detects_repeated_full_suite_without_progress(self):
+        guard = terminal_monitor.AgentLoopGuard(repeat_limit=3)
+        assessment = None
+        for _ in range(3):
+            assessment = guard.observe(
+                snapshot_digest="same",
+                progress_fingerprint="3/18",
+                git_fingerprint="tree-a",
+                head="abc",
+                commands=("npm test",),
+            )
+        self.assertTrue(assessment.detected)
+        self.assertEqual(assessment.reason, "repeated_expensive_command_without_progress")
+
+    def test_loop_guard_resets_when_git_or_task_progress_changes(self):
+        guard = terminal_monitor.AgentLoopGuard(repeat_limit=2)
+        guard.observe("same", "3/18", "tree-a", "abc", ("npm test",))
+        assessment = guard.observe("same", "4/18", "tree-b", "def", ("npm test",))
+        self.assertFalse(assessment.detected)
+
+    def test_history_rewrite_commands_require_attention_by_default(self):
+        for command in (
+            "git reset --soft origin/main",
+            "git filter-branch --msg-filter cat",
+            "git rebase -i origin/main",
+            "git update-ref refs/heads/main deadbeef",
+        ):
+            assessment = terminal_monitor.assess_agent_commands((command,))
+            self.assertTrue(assessment.detected, command)
+            self.assertEqual(assessment.reason, "git_history_rewrite")
+
+    def test_duplicate_expensive_direct_commands_are_detected(self):
+        assessment = terminal_monitor.assess_agent_commands(
+            ("npm test", "node scripts/run-tests.js"),
+            duplicate_commands=("full-test-suite",),
+        )
+        self.assertTrue(assessment.detected)
+        self.assertEqual(assessment.reason, "duplicate_expensive_commands")
+
     def test_manual_npm_publication_answer_is_blocked(self):
         with tempfile.TemporaryDirectory() as directory:
             pathlib.Path(directory, "answer.txt").write_text("npm publish\n", encoding="utf-8")
@@ -990,6 +1087,17 @@ class SupervisorV2Tests(unittest.TestCase):
         with mock.patch.object(terminal_monitor, "run_command", return_value=(0, ps_output, "")):
             activity = terminal_monitor.collect_process_activity([100])
         self.assertTrue(activity.active)
+
+    def test_process_activity_reports_duplicate_direct_test_roots(self):
+        ps_output = "\n".join([
+            "200 100 00:10 0.0 npm test",
+            "201 100 00:09 0.0 npm test",
+            "210 200 00:08 0.0 node scripts/run-tests.js",
+        ])
+        with mock.patch.object(terminal_monitor, "run_command", return_value=(0, ps_output, "")):
+            activity = terminal_monitor.collect_process_activity([100])
+        self.assertEqual(activity.direct_descendants, (200, 201))
+        self.assertEqual(activity.duplicate_commands, ("full-test-suite",))
 
     def test_weak_question_text_without_options_is_idle(self):
         self.assertEqual(terminal_monitor.classify_state("Question coverage improved in tests."), "idle")
@@ -1097,6 +1205,61 @@ class SupervisorV2Tests(unittest.TestCase):
         self.assertFalse(terminal_monitor.interrupt_child({100}, 300, parent_of=parents.get, signaler=lambda pid, sig: signalled.append(pid)))
         self.assertTrue(terminal_monitor.interrupt_child({100}, 200, parent_of=parents.get, signaler=lambda pid, sig: signalled.append(pid)))
         self.assertEqual(signalled, [200])
+
+    def test_interrupt_process_tree_signals_descendants_deepest_first(self):
+        signalled = []
+        parents = {200: 100, 210: 200, 220: 210, 300: 999}
+        children = {200: [210], 210: [220], 220: []}
+        result = terminal_monitor.interrupt_process_tree(
+            {100},
+            200,
+            parent_of=parents.get,
+            children_of=lambda pid: children.get(pid, []),
+            signaler=lambda pid, sig: signalled.append((pid, sig)),
+        )
+        self.assertTrue(result)
+        self.assertEqual([pid for pid, _sig in signalled], [220, 210, 200])
+
+    def test_interrupt_process_tree_refuses_unrelated_or_root_process(self):
+        signalled = []
+        parents = {300: 999}
+        self.assertFalse(terminal_monitor.interrupt_process_tree({100}, 100, parent_of=parents.get, children_of=lambda _pid: [], signaler=lambda *args: signalled.append(args)))
+        self.assertFalse(terminal_monitor.interrupt_process_tree({100}, 300, parent_of=parents.get, children_of=lambda _pid: [], signaler=lambda *args: signalled.append(args)))
+        self.assertEqual(signalled, [])
+
+    def test_loop_recovery_interrupts_only_expensive_child_and_keeps_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = MockBackend()
+            monitor = terminal_monitor.TerminalMonitor(
+                terminal_monitor.MonitorConfig(process="opencode", state_dir=directory),
+                backend=backend,
+            )
+            monitor.loop_assessment = terminal_monitor.LoopAssessment(True, "repeated_expensive_command_without_progress", ("full-test-suite",), 3)
+            activity = terminal_monitor.ProcessActivity(expensive_roots=(200,), direct_descendants=(200,), commands=("npm test",))
+            with mock.patch.object(terminal_monitor, "interrupt_process_tree", return_value=True) as interrupt:
+                recovered, detail = monitor._recover_agent_loop([100], activity, "thinking")
+            self.assertTrue(recovered)
+            self.assertIn("interrupted=200", detail)
+            self.assertEqual(interrupt.call_args.args[:2], ({100}, 200))
+            self.assertEqual(len(backend.sent_payloads), 1)
+            self.assertIn("Keep this agent session alive", backend.sent_payloads[0])
+
+    def test_web_command_center_serves_dark_dashboard_and_live_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status_path = pathlib.Path(directory, "status.json")
+            log_path = pathlib.Path(directory, "monitor.log")
+            status_path.write_text(json.dumps({"state": "thinking", "pids": [100]}), encoding="utf-8")
+            log_path.write_text("START process=opencode\n", encoding="utf-8")
+            server = terminal_monitor.MonitorWebServer(str(status_path), str(log_path), port=0)
+            url = server.start()
+            try:
+                html = urllib.request.urlopen(url, timeout=2).read().decode()
+                events = json.loads(urllib.request.urlopen(url + "api/events", timeout=2).read())
+            finally:
+                server.stop()
+            self.assertIn("AGENT // CENTER", html)
+            self.assertIn("#fe6e00", html)
+            self.assertEqual(events["lines"], ["START process=opencode"])
 
     def test_pr_state_machine_distinguishes_code_and_retryable_failures(self):
         machine = terminal_monitor.PullRequestStateMachine()

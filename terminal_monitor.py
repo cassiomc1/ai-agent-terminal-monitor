@@ -18,10 +18,13 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
+import webbrowser
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -231,6 +234,7 @@ class AttemptLedger:
             "attempt_id": attempt_id,
             "status": status,
             "timestamp": now_iso(),
+            "monotonic": time.monotonic(),
         }
         record.update({key: value for key, value in details.items() if value is not None})
         self.records.append(record)
@@ -258,10 +262,106 @@ class ProcessActivity:
 
     active: bool = False
     descendants: tuple[int, ...] = ()
+    direct_descendants: tuple[int, ...] = ()
     commands: tuple[str, ...] = ()
     cpu_percent: float = 0.0
     oldest_seconds: float = 0.0
     git_changed: bool = False
+    duplicate_commands: tuple[str, ...] = ()
+    expensive_roots: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class LoopAssessment:
+    """Fail-closed assessment for repeated or dangerous monitored-agent behavior."""
+
+    detected: bool = False
+    reason: str = ""
+    evidence: tuple[str, ...] = ()
+    occurrences: int = 0
+
+
+EXPENSIVE_COMMAND_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("full-test-suite", r"\b(?:npm\s+test|node\s+scripts/run-tests\.js|pytest(?:\s|$)|python\d*\s+-m\s+unittest)\b"),
+    ("ci-watch", r"\bgh\s+(?:pr\s+checks|run\s+watch)\b"),
+    ("build", r"\b(?:npm|pnpm|yarn)\s+run\s+build\b|\bcargo\s+build\b"),
+)
+
+GIT_HISTORY_REWRITE_PATTERNS: tuple[str, ...] = (
+    r"\bgit\s+filter-branch\b",
+    r"\bgit\s+rebase\b",
+    r"\bgit\s+reset\s+--(?:soft|mixed|hard|keep|merge)\b",
+    r"\bgit\s+commit\b[^\n]*(?:--amend|-c\s+HEAD|-C\s+HEAD)",
+    r"\bgit\s+update-ref\s+refs/heads/",
+)
+
+
+def canonical_expensive_command(command: str) -> str:
+    normalized = re.sub(r"\s+", " ", command).strip()
+    for label, pattern in EXPENSIVE_COMMAND_PATTERNS:
+        if re.search(pattern, normalized, re.IGNORECASE):
+            return label
+    return ""
+
+
+def assess_agent_commands(
+    commands: tuple[str, ...] | list[str],
+    *,
+    duplicate_commands: tuple[str, ...] | list[str] = (),
+    allow_history_rewrite: bool = False,
+) -> LoopAssessment:
+    """Detect dangerous history rewrites and duplicate expensive command roots."""
+    if duplicate_commands:
+        return LoopAssessment(True, "duplicate_expensive_commands", tuple(duplicate_commands), len(duplicate_commands))
+    if not allow_history_rewrite:
+        for command in commands:
+            if any(re.search(pattern, command, re.IGNORECASE) for pattern in GIT_HISTORY_REWRITE_PATTERNS):
+                return LoopAssessment(True, "git_history_rewrite", (redact_sensitive(command),), 1)
+    return LoopAssessment()
+
+
+@dataclass
+class AgentLoopGuard:
+    """Track expensive command episodes and require observable progress between reruns."""
+
+    repeat_limit: int = 3
+    _progress_key: str = ""
+    _episodes: list[str] = field(default_factory=list)
+    _last_episode: str = ""
+
+    def reset(self) -> None:
+        self._episodes.clear()
+        self._last_episode = ""
+
+    def observe(
+        self,
+        snapshot_digest: str,
+        progress_fingerprint: str,
+        git_fingerprint: str,
+        head: str,
+        commands: tuple[str, ...] | list[str],
+        *,
+        episode: str = "",
+    ) -> LoopAssessment:
+        progress_key = "|".join((progress_fingerprint, git_fingerprint, head))
+        if self._progress_key and progress_key != self._progress_key:
+            self._episodes.clear()
+            self._last_episode = ""
+        self._progress_key = progress_key
+        labels = sorted({label for command in commands if (label := canonical_expensive_command(command))})
+        if not labels:
+            self._last_episode = ""
+            return LoopAssessment()
+        episode_key = episode or f"{','.join(labels)}:{snapshot_digest}:{len(self._episodes)}"
+        if episode and episode_key == self._last_episode:
+            return LoopAssessment()
+        self._last_episode = episode_key
+        self._episodes.extend(labels)
+        for label in labels:
+            occurrences = self._episodes.count(label)
+            if occurrences >= max(2, int(self.repeat_limit)):
+                return LoopAssessment(True, "repeated_expensive_command_without_progress", (label,), occurrences)
+        return LoopAssessment()
 
 
 @dataclass
@@ -384,6 +484,62 @@ def interrupt_child(
     return False
 
 
+def interrupt_process_tree(
+    root_pids: set[int],
+    child_pid: int,
+    *,
+    parent_of: Callable[[int], int | None],
+    children_of: Callable[[int], list[int]],
+    signaler: Callable[[int, int], Any] = os.kill,
+) -> bool:
+    """Interrupt a verified descendant tree, deepest child first."""
+    if child_pid in root_pids or child_pid <= 1:
+        return False
+    current = child_pid
+    seen: set[int] = set()
+    verified = False
+    while current not in seen and current > 1:
+        seen.add(current)
+        parent = parent_of(current)
+        if parent is None:
+            break
+        if parent in root_pids:
+            verified = True
+            break
+        current = parent
+    if not verified:
+        return False
+
+    ordered: list[int] = []
+    visited: set[int] = set()
+
+    def visit(pid: int) -> None:
+        if pid in visited or pid in root_pids or pid <= 1:
+            return
+        visited.add(pid)
+        for descendant in children_of(pid):
+            visit(int(descendant))
+        ordered.append(pid)
+
+    visit(child_pid)
+    for pid in ordered:
+        with contextlib.suppress(ProcessLookupError):
+            signaler(pid, signal.SIGINT)
+    return True
+
+
+def _children_pids(parent_pid: int) -> list[int]:
+    code, output, _ = run_command(["ps", "-axo", "pid=,ppid="])
+    if code != 0:
+        return []
+    children: list[int] = []
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and all(part.isdigit() for part in parts) and int(parts[1]) == parent_pid:
+            children.append(int(parts[0]))
+    return children
+
+
 def _elapsed_seconds(value: str) -> float:
     """Convert ps elapsed form ([[dd-]hh:]mm:)ss into seconds."""
     try:
@@ -421,7 +577,11 @@ def collect_process_activity(root_pids: list[int]) -> ProcessActivity:
         children = [pid for pid, row in rows.items() if row[0] == parent and pid not in descendants]
         descendants.extend(children)
         pending.update(children)
+    direct_descendants = tuple(pid for pid in descendants if pid in rows and rows[pid][0] in roots)
     commands = tuple(rows[pid][3] for pid in descendants if pid in rows)
+    direct_labels = [canonical_expensive_command(rows[pid][3]) for pid in direct_descendants]
+    duplicate_commands = tuple(sorted(label for label in set(direct_labels) if label and direct_labels.count(label) > 1))
+    expensive_roots = tuple(pid for pid in direct_descendants if canonical_expensive_command(rows[pid][3]))
     cpu = sum(rows[pid][2] for pid in descendants if pid in rows)
     oldest = max((_elapsed_seconds(rows[pid][1]) for pid in descendants if pid in rows), default=0.0)
     meaningful = any(
@@ -430,7 +590,16 @@ def collect_process_activity(root_pids: list[int]) -> ProcessActivity:
     )
     recently_started = any(_elapsed_seconds(rows[pid][1]) <= 5.0 for pid in descendants if pid in rows)
     active = bool(descendants) and (cpu >= 0.1 or meaningful or recently_started)
-    return ProcessActivity(active=active, descendants=tuple(descendants), commands=commands, cpu_percent=cpu, oldest_seconds=oldest)
+    return ProcessActivity(
+        active=active,
+        descendants=tuple(descendants),
+        direct_descendants=direct_descendants,
+        commands=commands,
+        cpu_percent=cpu,
+        oldest_seconds=oldest,
+        duplicate_commands=duplicate_commands,
+        expensive_roots=expensive_roots,
+    )
 
 
 RETRYABLE_CHECK_CONCLUSIONS = {"cancelled", "timed_out", "stale", "startup_failure", "action_required", "network_failure", "infrastructure_failure"}
@@ -1334,6 +1503,13 @@ class MonitorConfig:
     protected_branches: tuple[str, ...] = ("main", "master")
     report_path: str | None = None
     attempt_history_limit: int = 100
+    loop_guard: bool = True
+    loop_repeat_limit: int = 3
+    queued_attempt_seconds: float = 45.0
+    allow_history_rewrite: bool = False
+    web_ui: bool = True
+    web_port: int = 8765
+    web_open_browser: bool = True
     launch_command: tuple[str, ...] = ()
 
 
@@ -2418,6 +2594,81 @@ def append_log(path: str, message: str) -> None:
         handle.write(f"{now_iso()} {message}\n")
 
 
+DASHBOARD_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent Command Center</title><style>
+:root{color-scheme:dark;--orange:#fe6e00;--bg:#0b0908;--panel:rgba(25,22,20,.82);--line:rgba(255,255,255,.12);--text:#fafaf9;--muted:#b9b3ac;--green:#00c758;--yellow:#edb200;--red:#fb2c36;--blue:#3080ff}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 85% 0,rgba(254,110,0,.13),transparent 34%),var(--bg);color:var(--text);font:14px ui-sans-serif,system-ui,sans-serif;min-height:100vh}.shell{display:grid;grid-template-columns:230px 1fr;min-height:100vh}.side{padding:26px 20px;border-right:1px solid var(--line);background:rgba(0,0,0,.7);backdrop-filter:blur(18px)}.brand{font-weight:800;letter-spacing:.11em}.brand b{color:var(--orange)}.nav{margin-top:38px;color:var(--muted);line-height:2.8}.nav .active{color:#fff;border-left:2px solid var(--orange);padding-left:12px}.main{padding:28px;min-width:0}.top{display:flex;justify-content:space-between;align-items:end;margin-bottom:20px}.eyebrow{font:700 11px ui-monospace,monospace;color:var(--orange);letter-spacing:.15em}.top h1{font-size:27px;margin:6px 0 0}.live{font:700 11px ui-monospace,monospace;color:var(--green)}.live:before{content:'●';margin-right:7px}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}.card,.terminal{border:1px solid var(--line);background:var(--panel);backdrop-filter:blur(16px);border-radius:8px}.card{padding:15px}.label{font:700 10px ui-monospace,monospace;color:var(--muted);letter-spacing:.12em}.value{font-size:18px;font-weight:750;margin-top:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.accent{color:var(--orange)}.terminal{height:calc(100vh - 180px);min-height:430px;display:flex;flex-direction:column}.terminal-head{padding:12px 15px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;font:700 11px ui-monospace,monospace}.dots{color:var(--orange);letter-spacing:4px}.log{padding:16px;overflow:auto;white-space:pre-wrap;word-break:break-word;font:13px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace;flex:1}.line{color:var(--muted)}.line.info{color:var(--blue)}.line.ok{color:var(--green)}.line.warn{color:var(--yellow)}.line.bad{color:var(--red)}.line.action{color:var(--orange)}.empty{color:#797067}@media(max-width:850px){.shell{grid-template-columns:1fr}.side{display:none}.cards{grid-template-columns:repeat(2,1fr)}.main{padding:18px}.terminal{height:calc(100vh - 230px)}}
+</style></head><body><div class="shell"><aside class="side"><div class="brand"><b>◉</b> AGENT // CENTER</div><div class="nav"><div class="active">Live Operations</div><div>Process Activity</div><div>Safety Events</div><div>Attempt Ledger</div></div></aside><main class="main"><div class="top"><div><div class="eyebrow">AUTONOMOUS OPERATIONS CONSOLE</div><h1>Terminal Monitor</h1></div><div class="live" id="connection">LIVE</div></div><section class="cards"><div class="card"><div class="label">AGENT STATE</div><div class="value accent" id="state">—</div></div><div class="card"><div class="label">PROCESS</div><div class="value" id="process">—</div></div><div class="card"><div class="label">TASK PROGRESS</div><div class="value" id="progress">—</div></div><div class="card"><div class="label">GIT BRANCH</div><div class="value" id="branch">—</div></div></section><section class="terminal"><div class="terminal-head"><span>LIVE OPERATIONAL LOG</span><span class="dots">● ● ●</span></div><div class="log" id="log"><span class="empty">Waiting for monitor events…</span></div></section></main></div><script>
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function tone(s){s=s.toUpperCase();if(/SUCCESS|COMPLETED|GREEN|MERGED/.test(s))return'ok';if(/ATTENTION|PAUSE|WARN|QUEUED/.test(s))return'warn';if(/FAILED|ERROR|BLOCKED|REFUSED/.test(s))return'bad';if(/SEND|MODE|START|INTERRUPT|RECOVER/.test(s))return'action';return'info'}
+async function tick(){try{const [sr,er]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/events',{cache:'no-store'})]);const s=await sr.json(),e=await er.json();state.textContent=s.state||'starting';process.textContent=(s.process||'agent')+' · '+((s.pids||[]).length)+' pid';const t=s.todo||{};progress.textContent=(t.completed||0)+' / '+(t.total||0);branch.textContent=(s.git||{}).branch||'—';log.innerHTML=(e.lines||[]).map(x=>'<div class="line '+tone(x)+'">'+esc(x)+'</div>').join('')||'<span class="empty">Waiting for monitor events…</span>';log.scrollTop=log.scrollHeight;connection.textContent='LIVE'}catch(e){connection.textContent='RECONNECTING'}}setInterval(tick,1000);tick();
+</script></body></html>"""
+
+
+class MonitorWebServer:
+    """Local read-only dashboard serving status and the bounded event log."""
+
+    def __init__(self, status_path: str, log_path: str, port: int = 8765) -> None:
+        self.status_path = status_path
+        self.log_path = log_path
+        self.port = port
+        self.httpd: ThreadingHTTPServer | None = None
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> str:
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/":
+                    self._reply(200, "text/html; charset=utf-8", DASHBOARD_HTML.encode())
+                elif self.path == "/api/status":
+                    try:
+                        payload = Path(owner.status_path).read_bytes()
+                        json.loads(payload)
+                    except (OSError, ValueError, json.JSONDecodeError):
+                        payload = b'{"state":"starting","pids":[]}'
+                    self._reply(200, "application/json", payload)
+                elif self.path == "/api/events":
+                    try:
+                        lines = Path(owner.log_path).read_text(encoding="utf-8").splitlines()[-400:]
+                    except OSError:
+                        lines = []
+                    self._reply(200, "application/json", json.dumps({"lines": lines}).encode())
+                else:
+                    self._reply(404, "application/json", b'{"error":"not found"}')
+
+            def _reply(self, status: int, content_type: str, payload: bytes) -> None:
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'")
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, _format: str, *_args: Any) -> None:
+                return
+
+        try:
+            self.httpd = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
+        except OSError:
+            self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = int(self.httpd.server_address[1])
+        self.thread = threading.Thread(target=self.httpd.serve_forever, name="terminal-monitor-web", daemon=True)
+        self.thread.start()
+        return f"http://127.0.0.1:{self.port}/"
+
+    def stop(self) -> None:
+        if self.httpd:
+            self.httpd.shutdown()
+            self.httpd.server_close()
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=2.0)
+
+
 def consume_manual_answer(path: str) -> str | None:
     """Read and delete a manual answer file if present."""
     try:
@@ -2517,6 +2768,13 @@ def generate_starter_config(format_type: str = "json") -> str:
                 "protected_branches": ["main", "master"],
                 "report_path": "",
                 "attempt_history_limit": 100,
+                "loop_guard": True,
+                "loop_repeat_limit": 3,
+                "queued_attempt_seconds": 45.0,
+                "allow_history_rewrite": False,
+                "web_ui": True,
+                "web_port": 8765,
+                "web_open_browser": True,
                 "unsafe_phrases": list(UNSAFE_PHRASES),
                 "custom_profiles": {
                     "my-agent": {
@@ -2555,6 +2813,13 @@ expected_branch = ""
 protected_branches = ["main", "master"]
 report_path = ""
 attempt_history_limit = 100
+loop_guard = true
+loop_repeat_limit = 3
+queued_attempt_seconds = 45.0
+allow_history_rewrite = false
+web_ui = true
+web_port = 8765
+web_open_browser = true
 
 unsafe_phrases = ["bypass", "delete", "rm -rf", "reset --hard"]
 
@@ -2638,6 +2903,8 @@ class TerminalMonitor:
         self.pr_machine = PullRequestStateMachine()
         self.pr_machine.stage = self.task_state.last_known_stage
         self.attempt_ledger = AttemptLedger(list(self.task_state.attempts), max_records=config.attempt_history_limit)
+        self.agent_loop_guard = AgentLoopGuard(config.loop_repeat_limit)
+        self.loop_assessment = LoopAssessment()
 
         # Internal state tracking
         self.last_digest = ""
@@ -2653,8 +2920,11 @@ class TerminalMonitor:
         self.last_heartbeat = self.monitor_started_at
         self.last_action = "initialized"
         self.last_command = ""
+        self.last_event_signature = ""
         self.todo_progress: dict[str, Any] = {"total": 0, "completed": 0, "in_progress": 0, "pending": 0, "items": []}
         self.detected_task_id = ""
+        self.web_server: MonitorWebServer | None = None
+        self.web_url = ""
         self._shutdown_requested = False
         self._shutdown_reason = ""
         self._previous_signal_handlers: dict[int, Any] = {}
@@ -2774,13 +3044,63 @@ class TerminalMonitor:
         if not attempt_id or self.attempt_ledger.latest(attempt_id or None) is None:
             return
         latest = self.attempt_ledger.latest(attempt_id)
-        if latest and latest.get("status") == "accepted" and self.session_tracker.current_segment(history).strip():
+        segment = self.session_tracker.current_segment(history).strip()
+        if latest and latest.get("status") in {"accepted", "sent"} and re.search(r"(?im)^\s*QUEUED\s*$", segment):
+            self._transition_attempt(
+                attempt_id,
+                "queued",
+                detail="terminal reports message queued",
+                observed_state=observed_state,
+            )
+        elif latest and latest.get("status") == "accepted" and segment:
             self._transition_attempt(
                 attempt_id,
                 "completed",
                 detail="post-send terminal output observed",
                 observed_state=observed_state,
             )
+
+    def _stale_queued_attempt(self) -> dict[str, Any] | None:
+        latest = self.attempt_ledger.latest(self.task_state.last_attempt_id or None)
+        if not latest or latest.get("status") != "queued" or latest.get("detail") != "terminal reports message queued":
+            return None
+        started = float(latest.get("monotonic", time.monotonic()))
+        age = max(0.0, time.monotonic() - started)
+        if age < max(0.0, self.config.queued_attempt_seconds):
+            return None
+        return {"attempt_id": latest.get("attempt_id"), "age_seconds": round(age, 1), "detail": latest.get("detail")}
+
+    def _recover_agent_loop(self, root_pids: list[int], activity: ProcessActivity, observed_state: str) -> tuple[bool, str]:
+        """Stop only expensive descendant trees and guide the existing agent session."""
+        targets = tuple(pid for pid in activity.expensive_roots if pid not in set(root_pids))
+        if not targets:
+            return False, "no_verified_expensive_child"
+        interrupted = [
+            pid
+            for pid in targets
+            if interrupt_process_tree(set(root_pids), pid, parent_of=_parent_pid, children_of=_children_pids)
+        ]
+        if not interrupted:
+            return False, "no_verified_expensive_child"
+        reason = self.loop_assessment.reason
+        evidence = ", ".join(self.loop_assessment.evidence) or "repeated command"
+        instruction = (
+            f"The monitor detected {reason} ({evidence}) and interrupted only the duplicated/stuck child command tree. "
+            "Keep this agent session alive. Diagnose the cause, use targeted checks first, and do not relaunch the same full suite until Git or task progress changes."
+        )
+        payload = self.policy.compose(instruction, self.task_state.last_known_stage)
+        attempt_id = self._queue_attempt("loop_recovery", payload, observed_state)
+        ok, detail = self.backend.send(self.config.process, self.config.title, payload)
+        self._transition_attempt(attempt_id, "sent", detail=detail, observed_state=observed_state)
+        self._transition_attempt(attempt_id, "accepted" if ok else "ignored", detail=detail, observed_state=observed_state)
+        if not ok:
+            return False, "recovery_prompt_failed"
+        self.agent_loop_guard.reset()
+        self.last_send = time.monotonic()
+        self.last_change = time.monotonic()
+        self.sends += 1
+        self.last_action = "loop_recovery:accepted"
+        return True, f"interrupted={','.join(str(pid) for pid in interrupted)}"
 
     def _effective_threshold(self, state: str) -> float:
         """Idle seconds to wait before acting; actionable prompts act faster."""
@@ -2825,6 +3145,7 @@ class TerminalMonitor:
                 "last_commit": git_status.last_commit,
             },
             "timestamp": now_iso(),
+            "web_url": self.web_url,
             "todo": self.todo_progress,
             "history": {"available": True, "redacted": True, "max_chars": 6000},
         }
@@ -2939,6 +3260,19 @@ class TerminalMonitor:
                 self.on_state_change(self.current_state, state)
             self.current_state = state
 
+        queued_attempt = self._stale_queued_attempt()
+        if queued_attempt:
+            if self.config.supervise:
+                self._record_policy_decision(str(queued_attempt.get("attempt_id", "")), "attention", "queued_attempt_stale")
+                Path(self.attention_path).write_text(json.dumps(queued_attempt, indent=2) + "\n" + safe_snapshot + "\n", encoding="utf-8")
+                self.log(f"PAUSE kind=queued_attempt_stale age={queued_attempt['age_seconds']}")
+                self.export_status_json(pids, "queued_attempt_stale", {"queued_attempt": queued_attempt})
+                return 3, f"ATTENTION_REQUIRED kind=queued_attempt_stale file={self.attention_path}"
+            return None, "WAITING_QUEUED_ATTEMPT"
+        latest_attempt = self.attempt_ledger.latest(self.task_state.last_attempt_id or None)
+        if latest_attempt and latest_attempt.get("status") == "queued" and latest_attempt.get("detail") == "terminal reports message queued":
+            return None, "WAITING_QUEUED_ATTEMPT"
+
         if self.config.supervise:
             reference = str(self.task_state.pr.get("number") or self.task_state.branch or "")
             pr_snapshot = get_current_pr_snapshot(self.config.project_dir, reference)
@@ -2965,6 +3299,24 @@ class TerminalMonitor:
                 self.task_state.save(self.task_state_path)
 
         git_status = get_git_status(self.config.project_dir)
+        event_signature = "|".join(
+            (
+                state,
+                str(mode or ""),
+                ",".join(str(pid) for pid in pids),
+                ",".join(str(pid) for pid in activity.descendants),
+                str(self.todo_progress.get("completed", 0)),
+                str(self.todo_progress.get("total", 0)),
+                git_status.head,
+                ",".join(activity.duplicate_commands),
+            )
+        )
+        if event_signature != self.last_event_signature:
+            self.last_event_signature = event_signature
+            self.log(
+                f"EVENT state={state} mode={mode or 'unknown'} roots={len(pids)} children={len(activity.descendants)} "
+                f"task={self.todo_progress.get('completed', 0)}/{self.todo_progress.get('total', 0)} git={git_status.head[:8] or 'none'}"
+            )
         repository_safety = evaluate_repository_safety(
             git_status,
             expected_branch=self.task_state.expected_branch,
@@ -2983,15 +3335,60 @@ class TerminalMonitor:
             self.export_status_json(pids, "branch_safety", {"repository_safety": repository_safety})
             return 3, f"ATTENTION_REQUIRED kind=repository_safety reason={reason} file={self.attention_path}"
 
+        immediate_assessment = assess_agent_commands(
+            activity.commands,
+            duplicate_commands=activity.duplicate_commands,
+            allow_history_rewrite=self.config.allow_history_rewrite,
+        )
+        progress_fingerprint = f"{self.todo_progress.get('completed', 0)}/{self.todo_progress.get('total', 0)}"
+        git_fingerprint = hashlib.sha256(
+            f"{git_status.head}|{git_status.branch}|{git_status.modified_files}|{git_status.untracked_count}".encode("utf-8", "replace")
+        ).hexdigest()[:16]
+        repeated_assessment = self.agent_loop_guard.observe(
+            digest,
+            progress_fingerprint,
+            git_fingerprint,
+            git_status.head,
+            activity.commands,
+            episode=",".join(str(pid) for pid in activity.direct_descendants),
+        )
+        self.loop_assessment = immediate_assessment if immediate_assessment.detected else repeated_assessment
+        if self.config.supervise and self.config.loop_guard and self.loop_assessment.detected:
+            reason = self.loop_assessment.reason
+            attention = {
+                "kind": "agent_loop",
+                "reason": reason,
+                "evidence": list(self.loop_assessment.evidence),
+                "occurrences": self.loop_assessment.occurrences,
+                "activity": json_safe(activity),
+            }
+            self._record_policy_decision("agent_process_activity", "attention", reason)
+            if reason in {"duplicate_expensive_commands", "repeated_expensive_command_without_progress"}:
+                recovered, recovery_detail = self._recover_agent_loop(pids, activity, state)
+                attention["recovery"] = {"ok": recovered, "detail": recovery_detail, "root_pids_protected": list(pids)}
+                if recovered:
+                    Path(self.attention_path).write_text(json.dumps(attention, indent=2) + "\n", encoding="utf-8")
+                    self.log(f"RECOVER kind=agent_loop reason={reason} {recovery_detail}")
+                    self.export_status_json(pids, "loop_recovered", {"loop_guard": attention})
+                    return None, f"LOOP_RECOVERED reason={reason} {recovery_detail}"
+            Path(self.attention_path).write_text(json.dumps(attention, indent=2) + "\n" + safe_snapshot + "\n", encoding="utf-8")
+            self.log(f"PAUSE kind=agent_loop reason={reason}")
+            self.export_status_json(pids, "agent_loop", {"loop_guard": attention})
+            return 3, f"ATTENTION_REQUIRED kind=agent_loop reason={reason} file={self.attention_path}"
+
         self.export_status_json(pids, state, {
             "activity": {
                 "active": activity.active,
                 "descendants": list(activity.descendants),
+                "direct_descendants": list(activity.direct_descendants),
                 "commands": list(activity.commands),
                 "cpu_percent": activity.cpu_percent,
                 "oldest_seconds": activity.oldest_seconds,
                 "git_changed": activity.git_changed,
+                "duplicate_commands": list(activity.duplicate_commands),
+                "expensive_roots": list(activity.expensive_roots),
             },
+            "loop_guard": json_safe(self.loop_assessment),
             "task": {
                 "task_id": self.task_state.task_id,
                 "stage": self.task_state.last_known_stage,
@@ -3197,6 +3594,15 @@ class TerminalMonitor:
             self.log("EXIT code=2 msg=MONITOR_ALREADY_RUNNING")
             return 2
         self.log(f"START process={self.config.process} profile={self.profile.name} backend={self.backend.name()}")
+        if self.config.web_ui and not self.config.once:
+            try:
+                self.web_server = MonitorWebServer(self.status_json_path, self.log_path, self.config.web_port)
+                self.web_url = self.web_server.start()
+                self.log(f"WEB_UI url={self.web_url}")
+                if self.config.web_open_browser:
+                    webbrowser.open(self.web_url)
+            except OSError as exc:
+                self.log(f"WEB_UI_FAILED error={redact_sensitive(str(exc))}")
         self._install_shutdown_handlers()
         try:
             while True:
@@ -3230,6 +3636,8 @@ class TerminalMonitor:
             self._stop_status("SIGINT")
             return 130
         finally:
+            if self.web_server:
+                self.web_server.stop()
             self._restore_shutdown_handlers()
             if self._lock_claimed:
                 self._release_monitor_lock(self._lifecycle if self._lifecycle != "running" else "stopped")
@@ -3369,6 +3777,13 @@ def _add_monitor_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--protected-branch", action="append", dest="protected_branches", help="Branch that must never be dirty during supervision")
     parser.add_argument("--report-path", default=None, help="Path for the structured final report JSON")
     parser.add_argument("--attempt-history-limit", type=int, default=None, help="Maximum persisted attempt/decision records")
+    parser.add_argument("--no-loop-guard", action="store_true", help="Disable monitored-agent loop protection")
+    parser.add_argument("--loop-repeat-limit", type=int, default=None, help="Repeated expensive command episodes allowed without progress")
+    parser.add_argument("--queued-attempt-seconds", type=float, default=None, help="Seconds before a visibly queued message requires attention")
+    parser.add_argument("--allow-history-rewrite", action="store_true", default=None, help="Allow monitored Git history-rewrite commands")
+    parser.add_argument("--no-web-ui", action="store_true", help="Disable the local live web command center")
+    parser.add_argument("--web-port", type=int, default=None, help="Preferred localhost port for the live web command center")
+    parser.add_argument("--no-web-open", action="store_true", help="Start the web command center without opening a browser")
     parser.add_argument("--once", action="store_true", default=False, help="Inspect status once and exit")
     parser.add_argument("--dry-run", action="store_true", default=False, help="Simulate actions without sending keystrokes")
 
@@ -3454,6 +3869,13 @@ def config_from_args(args: argparse.Namespace) -> MonitorConfig:
         protected_branches=tuple(_string_values(_val(getattr(args, "protected_branches", None), "protected_branches", ["main", "master"]))),
         report_path=str(_val(getattr(args, "report_path", None), "report_path", "")) or None,
         attempt_history_limit=max(1, int(_val(getattr(args, "attempt_history_limit", None), "attempt_history_limit", 100))),
+        loop_guard=not getattr(args, "no_loop_guard", False) and bool(file_cfg.get("loop_guard", True)),
+        loop_repeat_limit=max(2, int(_val(getattr(args, "loop_repeat_limit", None), "loop_repeat_limit", 3))),
+        queued_attempt_seconds=max(0.0, float(_val(getattr(args, "queued_attempt_seconds", None), "queued_attempt_seconds", 45.0))),
+        allow_history_rewrite=bool(_val(getattr(args, "allow_history_rewrite", None), "allow_history_rewrite", False)),
+        web_ui=not getattr(args, "no_web_ui", False) and bool(file_cfg.get("web_ui", True)),
+        web_port=max(0, int(_val(getattr(args, "web_port", None), "web_port", 8765))),
+        web_open_browser=not getattr(args, "no_web_open", False) and bool(file_cfg.get("web_open_browser", True)),
     )
 
 
@@ -3540,8 +3962,8 @@ def main() -> int:
     if args.command == "interrupt-child":
         backend = get_backend(config.backend)
         roots = set(backend.get_pids(config.process))
-        ok = interrupt_child(roots, args.pid, parent_of=_parent_pid)
-        print("INTERRUPTED_CHILD" if ok else "REFUSED_NOT_VERIFIED_DESCENDANT")
+        ok = interrupt_process_tree(roots, args.pid, parent_of=_parent_pid, children_of=_children_pids)
+        print("INTERRUPTED_TREE" if ok else "REFUSED_NOT_VERIFIED_DESCENDANT")
         return 0 if ok else 2
 
     if args.command == "restart-agent":
