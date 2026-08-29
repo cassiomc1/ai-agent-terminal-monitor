@@ -55,7 +55,7 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
 - ⏱️ **Per-Task Timing & Velocity Tracking**: Automatically tracks `started_at`, `completed_at`, `duration_seconds` for every plan task and computes overall plan velocity and remaining completion ETA.
 - 🧪 **Live Test Progress Extractor**: Automatically captures test suite executions (`✔ passed`, `✖ failed`, totals) in `activity.test_progress` and displays a real-time progress bar in the web console.
 - 🔔 **Desktop Notifications & Webhooks**: Supports native desktop alerts (`osascript` / `notify-send`) and asynchronous HTTP webhook dispatch (`--webhook-url <url>`) for `ATTENTION_REQUIRED`, `PR_CREATED`, and `COMPLETED`.
-- 🔀 **Multi-Agent Session Multiplexing**: Automatically scans active supervisor sessions across the monitor state root (`/tmp/terminal-monitor/*/status.json` by default, honoring a custom `--state-dir`) via `GET /api/instances` with a fast instance switcher in the web console header.
+- 🔀 **Multi-Agent Session Multiplexing**: Automatically scans active supervisor sessions across the monitor state root (`~/.cache/terminal-monitor/*/status.json` by default, honoring a custom `--state-dir`) via `GET /api/instances` with a fast instance switcher in the web console header.
 - 🧭 **Branch and Worktree Safety & Auto-Resolution**: Automatically derives project-isolated state directories in `/tmp/terminal-monitor/<project-slug-hash>/`, auto-adopts created feature branches (`BRANCH_TRACK`), and safely pauses when direct changes hit protected branches.
 - 🎯 **Stable Tab Targeting**: Prefers an exact custom Terminal.app tab title before the application suffix in a window name, avoiding cross-talk between neighboring OpenCode sessions.
 - 📝 **Structured Final Reports**: Writes `final-report.json` with verification evidence, CI classifications, continuation attempts, policy decisions, the explicit npm prohibition, and the npm-publication invariant.
@@ -69,7 +69,7 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
 - 🔐 **Input Validation**: Process names and window-title filters are validated/sanitized before being embedded into AppleScript or shell commands.
 - 📁 **Hierarchical Project Configuration**: Reads project settings from `.terminal-monitor.json` or `.terminal-monitor.toml` in your repository root, or globally from `~/.config/terminal-monitor/`. Unsafe phrases from CLI flags (`--unsafe-phrase`) are merged with the ones from the config file instead of replacing them.
 - 🗂️ **Cached Git Context**: Repository status is cached with a 30-second TTL and short-lived status-export refreshes, keeping the polling loop cheap even with live status JSON export enabled.
-- ✍️ **Live Human-in-the-Loop Override**: Write a message into `/tmp/terminal-monitor/answer.txt` — it is consumed, dispatched, and cleaned up automatically.
+- ✍️ **Live Human-in-the-Loop Override**: Write a message into `<state-dir>/answer.txt` — it is consumed, dispatched, and cleaned up automatically.
 - 🐍 **Python SDK & OOP API**: Clean object-oriented library API (`TerminalMonitor`, `MonitorConfig`, `AgentProfile`) with lifecycle hooks (`on_state_change`, `on_mode_change`, `on_send`, `on_attention`, `on_complete`, `on_tick`).
 - ⚡ **Zero External Dependencies**: Pure Python standard library. No pip installation required.
 
@@ -189,6 +189,22 @@ The HTTP surface supports real-time Server-Sent Events (SSE) streaming and manua
 `POST /api/send` rejects bodies larger than 64 KiB with HTTP `413`, so a
 misbehaving browser tab cannot push unbounded data into the answer channel.
 
+#### 🔐 Web Command Center Security
+- **Session token authentication:** every API call requires the per-server token
+  (`X-Monitor-Token` header, or `?token=` for the SSE stream). The token is
+  generated at server start with `secrets.token_urlsafe(32)`, embedded in the
+  served dashboard page, and compared in constant time. Requests without a
+  valid token receive `403`, so any local process — or a malicious webpage —
+  can no longer inject prompts into the supervised agent.
+- **DNS-rebinding defense:** the `Host` header must be a loopback name
+  (`127.0.0.1`, `localhost`, `[::1]`); rebinding hosts are rejected with `403`.
+- **Hardened CSP:** the dashboard script ships with a per-response CSP nonce
+  instead of `script-src 'unsafe-inline'`, and styles are served from `/app.css`.
+- **Private state directories:** state directories are created with `0o700`,
+  the answer channel (`answer.txt`) is never group/world writable, and the
+  monitor fails closed when a pre-created state directory is owned by another
+  user.
+
 #### 🎛️ Operator Quick Actions & Task Plan View
 - **Architecture Stage Pipeline:** Visual indicator tracking progress across `TASK_RECEIVED → EXECUTING → VERIFYING → PR_CREATED → CI_CHECKS → MERGED`.
 - **Interactive Task Showcase:** Displays all detected tasks with state badges (`DONE`, `ACTIVE`, `TODO`), search filter, and category pills (`ALL`, `ACTIVE`, `PENDING`, `DONE`).
@@ -202,7 +218,7 @@ when it reaches the 2 MiB bound. The terminal snapshot is written to
 bound.
 
 #### 🗂️ Project-Level State Isolation & Working Directory Discovery
-- **State Isolation:** Automatically scopes monitor state and logs per project directory in `/tmp/terminal-monitor/<project-name>-<hash>/`, preventing cross-project state pollution.
+- **State Isolation:** Automatically scopes monitor state and logs per project directory in `<state-root>/<project-name>-<hash>/` (default root: `~/.cache/terminal-monitor`, per-user by construction; the historical `/tmp/terminal-monitor` is still honored when passed explicitly), preventing cross-project state pollution.
 - **Process Working Directory Discovery:** When `--project-dir` is unspecified, automatically detects the agent process `cwd` via `lsof` / `/proc`.
 - **Smart Protected Branch Nudge:** When direct changes occur on `main` before a feature branch is created, automatically prompts the agent to branch before halting.
 - **Task Title Reconciliation:** Reconciles truncated TUI checklist labels (e.g. `[ ] Task 1: Freeze security-`) with full plan descriptions found in the terminal history.
@@ -292,6 +308,14 @@ python3 terminal_monitor.py init --format toml -o .terminal-monitor.toml
 ---
 
 ## 🐍 Python SDK API
+
+The supported SDK surface is defined by `terminal_monitor.__all__`
+(`TerminalMonitor`, `MonitorConfig`, `AgentProfile`, `get_profile`,
+`list_profiles`, `build_parser`, `config_from_args`, `main`, and the pure
+helpers it lists) and follows SemVer. Other top-level names are internal and
+may change without notice; internal helpers keep the leading-underscore
+convention.
+
 
 You can embed `TerminalMonitor` directly into your Python tools, test suites, or custom agent frameworks:
 
@@ -446,6 +470,35 @@ failure requiring a fix.
 
 ## Migration notes
 
+- **State directory default:** the default root moved from the world-shared
+  `/tmp/terminal-monitor` to the per-user `~/.cache/terminal-monitor`; explicit
+  `--state-dir` values keep working and every state directory is created with
+  `0o700` permissions.
+- **Web command center authentication:** API calls now require the session
+  token; fetch the dashboard from `/` and reuse the embedded token (the bundled
+  UI does this automatically). Custom integrations must send
+  `X-Monitor-Token` (or `?token=` for the SSE stream) and use a loopback
+  `Host` header.
+- **Package layout:** the implementation lives in the `terminal_monitor`
+  package; `python3 terminal_monitor.py` remains a thin shim for one release
+  and the version is single-sourced from `terminal_monitor.__version__`.
+- **PR state machine:** restore a persisted stage via
+  `PullRequestStateMachine.restore(stage, pr_number)`; assigning `stage`
+  directly is no longer possible (read-only property).
+- **Timestamps:** `now_iso()` emits millisecond-precision UTC timestamps, so
+  attempt-ledger transitions are orderable by timestamp alone.
+- **Tunable windows:** the fast prompt threshold and the protected-branch nudge
+  window are now `MonitorConfig` fields (`--prompt-fast-threshold-seconds`,
+  `--protected-branch-nudge-window-seconds`).
+- **Completion detection:** the todo-completion regexes are profile fields
+  (`todo_ratio_pattern`, `todo_all_complete_pattern`,
+  `todo_no_pending_pattern`, `todo_final_complete_pattern`) and can be
+  overridden per custom profile in the config file for other languages.
+- **Debug channel:** set `--debug-log <path>` (or `TERMINAL_MONITOR_DEBUG=1`)
+  to record deliberately suppressed exceptions (webhooks, notifications,
+  instance parsing) instead of failing open silently.
+- `terminal_monitor.py --version` prints the running release (currently `1.1.0`,
+  matching `pyproject.toml`).
 - `terminal_monitor.py --version` prints the running release (currently `1.1.0`,
   matching `pyproject.toml`).
 - `PullRequestStateMachine` now keeps its stage and last-seen PR number per
@@ -488,12 +541,42 @@ Run the complete built-in unit test suite (zero external test dependencies):
 python3 -m unittest discover -s tests -v
 ```
 
-Lint checks (used by CI) run via [ruff](https://docs.astral.sh/ruff/):
+Lint (pinned in CI), static types, and coverage:
 
 ```bash
-pip install ruff
-ruff check terminal_monitor.py supervisor.py tests/
+pip install "ruff==0.16.*" mypy coverage
+ruff check .
+mypy terminal_monitor/
+coverage run --source=terminal_monitor -m unittest discover -s tests
+coverage report --fail-under=75
 ```
+
+### Package layout
+
+The single-file implementation is now a package; `python3 terminal_monitor.py`
+still works through a thin compatibility shim (one release cycle), but prefer
+`python3 -m terminal_monitor` or the installed `terminal-monitor` script:
+
+```
+terminal_monitor/
+├── safety.py      # safety rules, redaction, PolicyEnvelope
+├── state.py       # TaskState, AttemptLedger, atomic writes, logging
+├── backends.py    # Terminal.app / iTerm2 / tmux backends
+├── processes.py   # process inspection, interruption, loop guard
+├── github.py      # PR state machine, merge gate, final verification
+├── profiles.py    # AgentProfile + built-in profiles
+├── config.py      # MonitorConfig + JSON/TOML config loading
+├── gitinfo.py     # git status cache, discovery, smart nudges
+├── classify.py    # state classification, todos, question parsing
+├── status.py      # ANSI dashboard, status snapshot, public projections
+├── web.py         # web command center (auth, CSP, SSE)
+├── monitor.py     # TerminalMonitor engine
+├── cli.py         # argument parsing and entrypoint
+└── supervise.py   # packaged autonomous-supervision entry point
+```
+
+A `terminal-monitor-supervise` console script (equivalent to `supervisor.py`)
+is installed with the package.
 
 ---
 

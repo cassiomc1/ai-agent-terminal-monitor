@@ -1,20 +1,20 @@
-import importlib.util
+import importlib
 import json
 import pathlib
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from unittest import mock
 
-MODULE_PATH = pathlib.Path(__file__).parents[1] / "terminal_monitor.py"
-SPEC = importlib.util.spec_from_file_location("terminal_monitor", MODULE_PATH)
-terminal_monitor = importlib.util.module_from_spec(SPEC)
-sys.modules["terminal_monitor"] = terminal_monitor
-SPEC.loader.exec_module(terminal_monitor)
+REPO_ROOT = pathlib.Path(__file__).parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+terminal_monitor = importlib.import_module("terminal_monitor")
 
 
 class MockBackend(terminal_monitor.BaseTerminalBackend):
@@ -41,6 +41,18 @@ class MockBackend(terminal_monitor.BaseTerminalBackend):
 
     def get_pids(self, process: str) -> list[int]:
         return self.pids
+
+
+def web_json(server, path, *, method="GET", data=None, token=True, headers=None, timeout=5):
+    """Authenticated urllib helper for MonitorWebServer tests."""
+    if not path.startswith("/"):
+        path = "/" + path
+    url = f"http://127.0.0.1:{server.port}{path}"
+    final_headers = dict(headers or {})
+    if token:
+        final_headers["X-Monitor-Token"] = server.token
+    req = urllib.request.Request(url, data=data, headers=final_headers, method=method)
+    return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
 
 
 class MonitorBehaviorTests(unittest.TestCase):
@@ -445,7 +457,7 @@ class TmuxBackendTests(unittest.TestCase):
         )
         backend = terminal_monitor.TmuxBackend()
         with mock.patch("shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
-            terminal_monitor, "run_command", return_value=(0, panes, "")
+            terminal_monitor.backends, "run_command", return_value=(0, panes, "")
         ):
             self.assertEqual(backend._find_target("opencode"), "session:0.1")
             self.assertEqual(backend._find_target("vim", title="main"), "session:0.0")
@@ -627,15 +639,14 @@ class RobustnessTests(unittest.TestCase):
 
     def test_git_status_cache_respects_ttl(self):
         calls = []
-        fake_status = terminal_monitor.GitStatus(is_repo=True, branch="cached-branch")
 
         def fake_uncached(repo_dir="."):
             calls.append(repo_dir)
-            return fake_status
+            return ("cached-branch", "", False, 0, 0, (), "")
 
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
-            terminal_monitor, "_get_git_status_uncached", side_effect=fake_uncached
-        ):
+            terminal_monitor.gitinfo, "_get_local_git_fields", side_effect=fake_uncached
+        ), mock.patch.object(terminal_monitor.gitinfo, "_get_open_pr_count", return_value=0):
             first = terminal_monitor.get_git_status(directory, ttl_seconds=60.0)
             second = terminal_monitor.get_git_status(directory, ttl_seconds=60.0)
             self.assertEqual(len(calls), 1)
@@ -643,6 +654,28 @@ class RobustnessTests(unittest.TestCase):
             refreshed = terminal_monitor.get_git_status(directory, ttl_seconds=0.0)
             self.assertEqual(len(calls), 2)
             self.assertEqual(refreshed.branch, "cached-branch")
+
+    def test_open_pr_count_uses_independent_longer_cache(self):
+        gh_calls = []
+
+        def fake_run_command(cmd, cwd=None):
+            if cmd[:2] == ["gh", "pr"]:
+                gh_calls.append(tuple(cmd))
+                return (0, json.dumps([{"number": 1}, {"number": 2}, {"number": 3}]), "")
+            return (0, "", "")
+
+        # ttl_seconds=0.0 forces the local git refresh every call, but the
+        # network-backed open-PR count must keep its own longer cache.
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            terminal_monitor.gitinfo, "_get_local_git_fields", return_value=("main", "a" * 40, False, 0, 0, (), "")
+        ), mock.patch("shutil.which", return_value="/usr/bin/gh"), mock.patch.object(
+            terminal_monitor.gitinfo, "run_command", side_effect=fake_run_command
+        ):
+            first = terminal_monitor.get_git_status(directory, ttl_seconds=0.0)
+            second = terminal_monitor.get_git_status(directory, ttl_seconds=0.0)
+            self.assertEqual(len(gh_calls), 1)
+            self.assertEqual(first.open_prs_count, 3)
+            self.assertEqual(second.open_prs_count, 3)
 
 
     def test_unsafe_phrases_merge_file_and_cli(self):
@@ -740,7 +773,7 @@ class SupervisorV2Tests(unittest.TestCase):
             "statusCheckRollup": [{"name": "tests", "conclusion": "success"}],
         }
         with mock.patch.object(
-            terminal_monitor,
+            terminal_monitor.github,
             "run_command",
             return_value=(0, json.dumps(pr), ""),
         ) as run:
@@ -750,7 +783,7 @@ class SupervisorV2Tests(unittest.TestCase):
 
         pr["headRefOid"] = "b" * 40
         with mock.patch.object(
-            terminal_monitor,
+            terminal_monitor.github,
             "run_command",
             return_value=(0, json.dumps(pr), ""),
         ):
@@ -767,7 +800,7 @@ class SupervisorV2Tests(unittest.TestCase):
             "statusCheckRollup": [{"name": "tests", "conclusion": "success"}],
         }
         with mock.patch.object(
-            terminal_monitor,
+            terminal_monitor.github,
             "run_command",
             side_effect=[(0, json.dumps(pr), ""), (0, "merged", "")],
         ) as run:
@@ -780,7 +813,7 @@ class SupervisorV2Tests(unittest.TestCase):
     def test_merge_gate_treats_already_merged_pr_as_completed(self):
         head = "d" * 40
         pr = {"number": 9, "state": "MERGED", "headRefOid": head, "statusCheckRollup": []}
-        with mock.patch.object(terminal_monitor, "run_command", return_value=(0, json.dumps(pr), "")):
+        with mock.patch.object(terminal_monitor.github, "run_command", return_value=(0, json.dumps(pr), "")):
             result = terminal_monitor.merge_pull_request(".", 9, head)
         self.assertTrue(result["ok"])
         self.assertTrue(result["merged"])
@@ -793,19 +826,19 @@ class SupervisorV2Tests(unittest.TestCase):
                 {"name": "code-job", "conclusion": "failure", "detailsUrl": "https://github.com/x/actions/runs/222"},
             ]
         }
-        with mock.patch.object(terminal_monitor, "run_command", return_value=(0, "", "")) as run:
+        with mock.patch.object(terminal_monitor.github, "run_command", return_value=(0, "", "")) as run:
             retried = terminal_monitor.retry_infrastructure_checks(".", pr)
         self.assertEqual(retried, [111])
         self.assertEqual(run.call_args.args[0], ["gh", "run", "rerun", "111", "--failed"])
 
     def test_dry_run_merge_never_calls_github(self):
-        with mock.patch.object(terminal_monitor, "run_command") as run:
+        with mock.patch.object(terminal_monitor.github, "run_command") as run:
             result = terminal_monitor.merge_pull_request(".", 7, "a" * 40, dry_run=True)
         self.assertTrue(result["dry_run"])
         run.assert_not_called()
 
     def test_merge_gate_rejects_non_full_head_sha(self):
-        with mock.patch.object(terminal_monitor, "run_command") as run:
+        with mock.patch.object(terminal_monitor.github, "run_command") as run:
             result = terminal_monitor.verify_merge_gate(".", 7, "abc123")
         self.assertFalse(result["ok"])
         self.assertEqual(result["reason"], "invalid_expected_head")
@@ -992,8 +1025,8 @@ class SupervisorV2Tests(unittest.TestCase):
             monitor._transition_attempt(attempt_id, "queued", detail="terminal reports message queued", observed_state="thinking")
             monitor.attempt_ledger.records[-1]["monotonic"] = 1.0
             with mock.patch.object(terminal_monitor.time, "monotonic", return_value=10.0), mock.patch.object(
-                terminal_monitor, "get_git_status", return_value=terminal_monitor.GitStatus()
-            ), mock.patch.object(terminal_monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()):
+                terminal_monitor.monitor, "get_git_status", return_value=terminal_monitor.GitStatus()
+            ), mock.patch.object(terminal_monitor.monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()):
                 code, message = monitor.step()
         self.assertEqual(code, 3)
         self.assertIn("queued_attempt_stale", message)
@@ -1093,10 +1126,10 @@ class SupervisorV2Tests(unittest.TestCase):
                 expected_branch="codex/work",
                 state_dir=directory,
             )
-            with mock.patch.object(terminal_monitor, "get_git_status", return_value=dirty_main), mock.patch.object(
-                terminal_monitor, "capture_safety_baseline", return_value={"safetyBaselineCaptured": True}
-            ), mock.patch.object(terminal_monitor, "get_current_pr_snapshot", return_value=None), mock.patch.object(
-                terminal_monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()
+            with mock.patch.object(terminal_monitor.monitor, "get_git_status", return_value=dirty_main), mock.patch.object(
+                terminal_monitor.monitor, "capture_safety_baseline", return_value={"safetyBaselineCaptured": True}
+            ), mock.patch.object(terminal_monitor.monitor, "get_current_pr_snapshot", return_value=None), mock.patch.object(
+                terminal_monitor.monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()
             ):
                 monitor = terminal_monitor.TerminalMonitor(config, backend=backend)
                 code, message = monitor.step()
@@ -1114,10 +1147,10 @@ class SupervisorV2Tests(unittest.TestCase):
                 supervise=True,
                 state_dir=directory,
             )
-            with mock.patch.object(terminal_monitor, "get_git_status", side_effect=[feature, switched, switched]), mock.patch.object(
-                terminal_monitor, "capture_safety_baseline", return_value={"safetyBaselineCaptured": True}
-            ), mock.patch.object(terminal_monitor, "get_current_pr_snapshot", return_value=None), mock.patch.object(
-                terminal_monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()
+            with mock.patch.object(terminal_monitor.monitor, "get_git_status", side_effect=[feature, switched, switched]), mock.patch.object(
+                terminal_monitor.monitor, "capture_safety_baseline", return_value={"safetyBaselineCaptured": True}
+            ), mock.patch.object(terminal_monitor.monitor, "get_current_pr_snapshot", return_value=None), mock.patch.object(
+                terminal_monitor.monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()
             ):
                 monitor = terminal_monitor.TerminalMonitor(config, backend=backend)
                 code, message = monitor.step()
@@ -1140,14 +1173,14 @@ class SupervisorV2Tests(unittest.TestCase):
 
     def test_persistent_idle_helper_is_not_mistaken_for_active_command(self):
         ps_output = "200 100 02:00:00 0.0 typescript-language-server --stdio"
-        with mock.patch.object(terminal_monitor, "run_command", return_value=(0, ps_output, "")):
+        with mock.patch.object(terminal_monitor.processes, "run_command", return_value=(0, ps_output, "")):
             activity = terminal_monitor.collect_process_activity([100])
         self.assertFalse(activity.active)
         self.assertEqual(activity.descendants, (200,))
 
     def test_long_running_test_command_counts_as_activity_even_when_cpu_is_quiet(self):
         ps_output = "200 100 15:00 0.0 python3 -m unittest discover -s tests"
-        with mock.patch.object(terminal_monitor, "run_command", return_value=(0, ps_output, "")):
+        with mock.patch.object(terminal_monitor.processes, "run_command", return_value=(0, ps_output, "")):
             activity = terminal_monitor.collect_process_activity([100])
         self.assertTrue(activity.active)
 
@@ -1157,7 +1190,7 @@ class SupervisorV2Tests(unittest.TestCase):
             "201 100 00:09 0.0 npm test",
             "210 200 00:08 0.0 node scripts/run-tests.js",
         ])
-        with mock.patch.object(terminal_monitor, "run_command", return_value=(0, ps_output, "")):
+        with mock.patch.object(terminal_monitor.processes, "run_command", return_value=(0, ps_output, "")):
             activity = terminal_monitor.collect_process_activity([100])
         self.assertEqual(activity.direct_descendants, (200, 201))
         self.assertEqual(activity.duplicate_commands, ("full-test-suite",))
@@ -1192,10 +1225,10 @@ class SupervisorV2Tests(unittest.TestCase):
                 idle_seconds=999,
             )
             clean_git = terminal_monitor.GitStatus(is_repo=True, branch="codex/work")
-            with mock.patch.object(terminal_monitor, "capture_safety_baseline", return_value={"safetyBaselineCaptured": True}), mock.patch.object(
-                terminal_monitor, "get_current_pr_snapshot", return_value=None
-            ), mock.patch.object(terminal_monitor, "get_git_status", return_value=clean_git), mock.patch.object(
-                terminal_monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()
+            with mock.patch.object(terminal_monitor.monitor, "capture_safety_baseline", return_value={"safetyBaselineCaptured": True}), mock.patch.object(
+                terminal_monitor.monitor, "get_current_pr_snapshot", return_value=None
+            ), mock.patch.object(terminal_monitor.monitor, "get_git_status", return_value=clean_git), mock.patch.object(
+                terminal_monitor.monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()
             ):
                 monitor = terminal_monitor.TerminalMonitor(config, backend=backend)
                 code, message = monitor.step()
@@ -1299,8 +1332,8 @@ class SupervisorV2Tests(unittest.TestCase):
             )
             monitor.loop_assessment = terminal_monitor.LoopAssessment(True, "repeated_expensive_command_without_progress", ("full-test-suite",), 3)
             activity = terminal_monitor.ProcessActivity(expensive_roots=(200,), direct_descendants=(200,), commands=("npm test",))
-            with mock.patch.object(terminal_monitor, "interrupt_process_tree", return_value=True) as interrupt, mock.patch.object(
-                terminal_monitor, "process_is_running", return_value=False
+            with mock.patch.object(terminal_monitor.monitor, "interrupt_process_tree", return_value=True) as interrupt, mock.patch.object(
+                terminal_monitor.monitor, "process_is_running", return_value=False
             ):
                 recovered, detail = monitor._recover_agent_loop([100], activity, "thinking")
             self.assertTrue(recovered)
@@ -1318,8 +1351,8 @@ class SupervisorV2Tests(unittest.TestCase):
             )
             monitor.loop_assessment = terminal_monitor.LoopAssessment(True, "repeated_expensive_command_without_progress", ("full-test-suite",), 3)
             activity = terminal_monitor.ProcessActivity(expensive_roots=(200, 210), descendants=(200, 210), direct_descendants=(200, 210), commands=("npm test",))
-            with mock.patch.object(terminal_monitor, "interrupt_process_tree", return_value=True) as interrupt, mock.patch.object(
-                terminal_monitor, "process_is_running", return_value=True
+            with mock.patch.object(terminal_monitor.monitor, "interrupt_process_tree", return_value=True) as interrupt, mock.patch.object(
+                terminal_monitor.monitor, "process_is_running", return_value=True
             ):
                 recovered, detail = monitor._recover_agent_loop([100], activity, "thinking")
             self.assertFalse(recovered)
@@ -1340,12 +1373,15 @@ class SupervisorV2Tests(unittest.TestCase):
             url = server.start()
             try:
                 html = urllib.request.urlopen(url, timeout=2).read().decode()
-                events = json.loads(urllib.request.urlopen(url + "api/events", timeout=2).read())
-                terminal = json.loads(urllib.request.urlopen(url + "api/terminal", timeout=2).read())
+                css = urllib.request.urlopen(url + "app.css", timeout=2).read().decode()
+                events = web_json(server, "api/events", timeout=2)
+                terminal = web_json(server, "api/terminal", timeout=2)
             finally:
                 server.stop()
             self.assertIn("AGENT // CENTER", html)
-            self.assertIn("#fe6e00", html)
+            self.assertIn(server.token, html)
+            self.assertIn(server.csp_nonce, html)
+            self.assertIn("#fe6e00", css)
             self.assertIn("AGENT TERMINAL SNAPSHOT (REDACTED)", html)
             self.assertIn("/api/terminal", html)
             self.assertIn('data-view="process"', html)
@@ -1373,9 +1409,9 @@ class SupervisorV2Tests(unittest.TestCase):
                 encoding="utf-8",
             )
             server = terminal_monitor.MonitorWebServer(str(status_path), str(pathlib.Path(directory, "monitor.log")), port=0)
-            url = server.start()
+            server.start()
             try:
-                payload = json.loads(urllib.request.urlopen(url + "api/status", timeout=2).read())
+                payload = web_json(server, "api/status", timeout=2)
             finally:
                 server.stop()
         rendered = json.dumps(payload)
@@ -1390,9 +1426,9 @@ class SupervisorV2Tests(unittest.TestCase):
             status_path = pathlib.Path(directory, "status.json")
             status_path.write_text("[]", encoding="utf-8")
             server = terminal_monitor.MonitorWebServer(str(status_path), str(pathlib.Path(directory, "monitor.log")), port=0)
-            url = server.start()
+            server.start()
             try:
-                payload = json.loads(urllib.request.urlopen(url + "api/status", timeout=2).read())
+                payload = web_json(server, "api/status", timeout=2)
             finally:
                 server.stop()
         self.assertEqual(payload, {"state": "starting", "pids": []})
@@ -1452,7 +1488,7 @@ class SupervisorV2Tests(unittest.TestCase):
             ("git", "tag", "--list"): (0, "", ""),
             ("pgrep", "-af", "(?:^|/)(?:npm|pnpm|yarn)(?:\\s|$)"): (1, "", ""),
         }
-        with mock.patch.object(terminal_monitor, "run_command", side_effect=lambda cmd, cwd=None: commands.get(tuple(cmd), (1, "", ""))), mock.patch(
+        with mock.patch.object(terminal_monitor.github, "run_command", side_effect=lambda cmd, cwd=None: commands.get(tuple(cmd), (1, "", ""))), mock.patch(
             "shutil.which", return_value=None
         ):
             evidence = terminal_monitor.collect_final_evidence(".", state)
@@ -1473,7 +1509,7 @@ class SupervisorV2Tests(unittest.TestCase):
             ),
         }
         with mock.patch.object(
-            terminal_monitor,
+            terminal_monitor.github,
             "run_command",
             side_effect=lambda cmd, cwd=None: commands.get(tuple(cmd), (1, "", "")),
         ), mock.patch("shutil.which", return_value=None):
@@ -1514,8 +1550,8 @@ class SupervisorV2Tests(unittest.TestCase):
         self.assertEqual(parser.parse_args(["resume"]).command, "resume")
 
     def test_stop_monitor_does_not_signal_unverified_agent_pid(self):
-        with tempfile.TemporaryDirectory() as directory, mock.patch.object(terminal_monitor, "pid_is_alive", return_value=False), mock.patch.object(
-            terminal_monitor, "_monitor_process_matches", return_value=False
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(terminal_monitor.status, "pid_is_alive", return_value=False), mock.patch.object(
+            terminal_monitor.status, "_monitor_process_matches", return_value=False
         ), mock.patch.object(terminal_monitor.os, "kill") as kill:
             pathlib.Path(directory, "status.json").write_text(json.dumps({"running": True, "monitor_pid": 123}), encoding="utf-8")
             result = terminal_monitor.stop_monitor(directory)
@@ -1552,10 +1588,10 @@ class SupervisorV2Tests(unittest.TestCase):
                 expected_branch="",
                 state_dir=directory,
             )
-            with mock.patch.object(terminal_monitor, "get_git_status", return_value=dirty_main), mock.patch.object(
-                terminal_monitor, "capture_safety_baseline", return_value={"safetyBaselineCaptured": True}
-            ), mock.patch.object(terminal_monitor, "get_current_pr_snapshot", return_value=None), mock.patch.object(
-                terminal_monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()
+            with mock.patch.object(terminal_monitor.monitor, "get_git_status", return_value=dirty_main), mock.patch.object(
+                terminal_monitor.monitor, "capture_safety_baseline", return_value={"safetyBaselineCaptured": True}
+            ), mock.patch.object(terminal_monitor.monitor, "get_current_pr_snapshot", return_value=None), mock.patch.object(
+                terminal_monitor.monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()
             ):
                 monitor = terminal_monitor.TerminalMonitor(config, backend=backend)
                 code, message = monitor.step()
@@ -1578,7 +1614,7 @@ class SupervisorV2Tests(unittest.TestCase):
                 req = urllib.request.Request(
                     url + "api/send",
                     data=json.dumps({"action": "answer", "payload": "yes"}).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
+                    headers={"Content-Type": "application/json", "X-Monitor-Token": server.token},
                 )
                 resp = json.loads(urllib.request.urlopen(req, timeout=2).read())
                 self.assertTrue(resp["ok"])
@@ -1588,7 +1624,7 @@ class SupervisorV2Tests(unittest.TestCase):
                 req_key = urllib.request.Request(
                     url + "api/send",
                     data=json.dumps({"action": "key", "key": "tab"}).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
+                    headers={"Content-Type": "application/json", "X-Monitor-Token": server.token},
                 )
                 resp_key = json.loads(urllib.request.urlopen(req_key, timeout=2).read())
                 self.assertTrue(resp_key["ok"])
@@ -1680,10 +1716,9 @@ class SupervisorV2Tests(unittest.TestCase):
             status_path.write_text(json.dumps({"state": "thinking", "pids": [100]}), encoding="utf-8")
             log_path.write_text("START\n", encoding="utf-8")
             server = terminal_monitor.MonitorWebServer(str(status_path), str(log_path), port=0)
-            url = server.start()
+            server.start()
             try:
-                req = urllib.request.Request(url + "api/instances")
-                resp = json.loads(urllib.request.urlopen(req, timeout=2).read())
+                resp = web_json(server, "api/instances", timeout=2)
                 self.assertIn("instances", resp)
                 self.assertIsInstance(resp["instances"], list)
             finally:
@@ -1693,7 +1728,13 @@ class SupervisorV2Tests(unittest.TestCase):
         parser = terminal_monitor.build_parser()
         args = parser.parse_args(["status", "--project-dir", "/tmp/my-test-proj"])
         cfg = terminal_monitor.config_from_args(args)
-        self.assertIn("/tmp/terminal-monitor/my-test-proj-", cfg.state_dir)
+        expected_root = str(pathlib.Path.home() / ".cache" / "terminal-monitor")
+        self.assertTrue(
+            cfg.state_dir.startswith(expected_root + "/my-test-proj-"),
+            f"expected per-user scoped state dir, got {cfg.state_dir}",
+        )
+        self.assertTrue(pathlib.Path(cfg.state_dir).is_dir())
+        self.assertEqual(oct(pathlib.Path(cfg.state_dir).stat().st_mode & 0o777), "0o700")
 
     def test_pr_state_machine_instances_are_isolated(self):
         first = terminal_monitor.PullRequestStateMachine()
@@ -1706,9 +1747,17 @@ class SupervisorV2Tests(unittest.TestCase):
 
     def test_pr_state_machine_stage_restored_from_persisted_state(self):
         machine = terminal_monitor.PullRequestStateMachine()
-        machine.stage = "CI_GREEN"
-        machine.seen_pr_number = 9
+        machine.restore("CI_GREEN", 9)
         self.assertEqual(machine.advance({"number": 9, "state": "OPEN", "checks": [{"conclusion": "success"}]}), "CI_GREEN")
+
+    def test_pr_state_machine_restore_rejects_unknown_stage(self):
+        machine = terminal_monitor.PullRequestStateMachine()
+        with self.assertRaises(ValueError):
+            machine.restore("NOT_A_STAGE")
+        machine.restore("CI_PENDING")
+        self.assertEqual(machine.stage, "CI_PENDING")
+        with self.assertRaises(AttributeError):
+            machine.stage = "MERGED"  # type: ignore[misc]
 
     def test_web_server_instances_api_uses_configured_state_root(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1722,9 +1771,9 @@ class SupervisorV2Tests(unittest.TestCase):
             status_path = pathlib.Path(directory, "status.json")
             log_path = pathlib.Path(directory, "monitor.log")
             server = terminal_monitor.MonitorWebServer(str(status_path), str(log_path), port=0, state_root=str(root))
-            url = server.start()
+            server.start()
             try:
-                resp = json.loads(urllib.request.urlopen(url + "api/instances", timeout=2).read())
+                resp = web_json(server, "api/instances", timeout=2)
             finally:
                 server.stop()
             self.assertEqual(len(resp["instances"]), 1)
@@ -1744,7 +1793,7 @@ class SupervisorV2Tests(unittest.TestCase):
                 req = urllib.request.Request(
                     url + "api/send",
                     data=json.dumps({"action": "answer", "payload": "x" * (terminal_monitor.WEB_POST_BODY_LIMIT_BYTES + 1)}).encode(),
-                    headers={"Content-Type": "application/json"},
+                    headers={"Content-Type": "application/json", "X-Monitor-Token": server.token},
                 )
                 try:
                     urllib.request.urlopen(req, timeout=2)
@@ -1756,15 +1805,122 @@ class SupervisorV2Tests(unittest.TestCase):
             finally:
                 server.stop()
 
+    def test_web_server_requires_token_and_loopback_host(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status_path = pathlib.Path(directory, "status.json")
+            status_path.write_text(json.dumps({"state": "thinking", "pids": [100]}), encoding="utf-8")
+            server = terminal_monitor.MonitorWebServer(str(status_path), str(pathlib.Path(directory, "monitor.log")), port=0)
+            url = server.start()
+            try:
+                # Missing token -> 403 on every API route (GET and POST).
+                for path in ("api/status", "api/events", "api/terminal", "api/instances"):
+                    with self.assertRaises(urllib.error.HTTPError) as ctx:
+                        web_json(server, path, token=False, timeout=2)
+                    self.assertEqual(ctx.exception.code, 403, path)
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    web_json(server, "api/send", method="POST", data=b"{}", token=False, timeout=2)
+                self.assertEqual(ctx.exception.code, 403)
+                # Invalid token -> 403.
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    web_json(server, "api/status", token=False, headers={"X-Monitor-Token": "wrong-token"}, timeout=2)
+                self.assertEqual(ctx.exception.code, 403)
+                # DNS-rebinding Host header -> 403 even with a valid token.
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    web_json(server, "api/status", headers={"Host": "evil.example"}, timeout=2)
+                self.assertEqual(ctx.exception.code, 403)
+                # The dashboard page itself stays readable and embeds the token.
+                html = urllib.request.urlopen(url, timeout=2).read().decode()
+                self.assertIn(server.token, html)
+            finally:
+                server.stop()
+
+    def test_web_server_rejects_malformed_json_body(self):
+        with tempfile.TemporaryDirectory() as directory:
+            server = terminal_monitor.MonitorWebServer(
+                str(pathlib.Path(directory, "status.json")),
+                str(pathlib.Path(directory, "monitor.log")),
+                port=0,
+                answer_path=str(pathlib.Path(directory, "answer.txt")),
+            )
+            server.start()
+            try:
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    web_json(server, "api/send", method="POST", data=b"{not-json", timeout=2)
+                self.assertEqual(ctx.exception.code, 400)
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    web_json(server, "api/send", method="POST", data=b'["array"]', timeout=2)
+                self.assertEqual(ctx.exception.code, 400)
+                self.assertFalse(pathlib.Path(directory, "answer.txt").exists())
+            finally:
+                server.stop()
+
+    def test_web_server_path_traversal_returns_404(self):
+        with tempfile.TemporaryDirectory() as directory:
+            server = terminal_monitor.MonitorWebServer(
+                str(pathlib.Path(directory, "status.json")),
+                str(pathlib.Path(directory, "monitor.log")),
+                port=0,
+            )
+            server.start()
+            try:
+                for path in ("/../../etc/passwd", "/api/../../status.json", "/app.css/../../../secrets"):
+                    with self.assertRaises(urllib.error.HTTPError) as ctx:
+                        web_json(server, path, timeout=2)
+                    self.assertEqual(ctx.exception.code, 404, path)
+            finally:
+                server.stop()
+
+    def test_web_server_stream_supports_parallel_clients_with_reconnect_hint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status_path = pathlib.Path(directory, "status.json")
+            status_path.write_text(json.dumps({"state": "thinking", "pids": [100]}), encoding="utf-8")
+            log_path = pathlib.Path(directory, "monitor.log")
+            log_path.write_text("START process=opencode\n", encoding="utf-8")
+            server = terminal_monitor.MonitorWebServer(str(status_path), str(log_path), port=0)
+            server.start()
+            results: list[str] = []
+
+            def reader() -> None:
+                url = f"http://127.0.0.1:{server.port}/api/stream?token={urllib.parse.quote(server.token)}"
+                try:
+                    with urllib.request.urlopen(url, timeout=5) as resp:
+                        for line in resp:
+                            if line.startswith(b"data:"):
+                                results.append(line.decode("utf-8", "replace"))
+                                break
+                except Exception as exc:  # pragma: no cover - surfaced via assertion below
+                    results.append(f"ERROR {exc}")
+
+            try:
+                threads = [threading.Thread(target=reader) for _ in range(2)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(timeout=10)
+            finally:
+                server.stop()
+            self.assertEqual(len(results), 2)
+            for chunk in results:
+                self.assertTrue(chunk.startswith("data:"), chunk)
+                self.assertIn('"state": "thinking"', chunk)
+
     def test_version_flag_reports_package_version(self):
         result = subprocess.run(
-            [sys.executable, str(MODULE_PATH), "--version"],
+            [sys.executable, str(REPO_ROOT / "terminal_monitor.py"), "--version"],
             capture_output=True,
             text=True,
             check=False,
         )
         self.assertEqual(result.returncode, 0)
         self.assertIn(terminal_monitor.__version__, result.stdout)
+
+    def test_version_is_single_sourced_from_package(self):
+        # pyproject.toml must read the version dynamically from the package
+        # instead of duplicating it (regression guard against drift).
+        pyproject_text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn('dynamic = ["version"]', pyproject_text)
+        self.assertIn('attr = "terminal_monitor.__version__"', pyproject_text)
+        self.assertNotIn("\nversion = \"1.", pyproject_text)
 
 
 if __name__ == "__main__":
