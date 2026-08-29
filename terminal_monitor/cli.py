@@ -281,7 +281,7 @@ def main() -> int:
 
     config = config_from_args(args)
     if config.supervise:
-        launch = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
+        launch = [sys.executable, "-m", "terminal_monitor", *sys.argv[1:]]
         if "--state-dir" not in launch:
             launch.extend(["--state-dir", config.state_dir])
         if "--project-dir" not in launch and "-d" not in launch:

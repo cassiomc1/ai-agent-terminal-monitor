@@ -203,7 +203,12 @@ def resume_monitor(state_dir: str | Path, *, project_dir: str = ".") -> dict[str
     command = [str(item) for item in metadata.get("command", [])] if isinstance(metadata, dict) else []
     state_candidates = {str(state_path).lower(), str(state_path.resolve()).lower()}
     command_text = " ".join(command).lower()
-    trusted_entrypoint = "terminal_monitor.py" in command_text or "supervisor.py" in command_text
+    trusted_entrypoint = (
+        "terminal_monitor.py" in command_text
+        or "supervisor.py" in command_text
+        or "-m terminal_monitor" in command_text
+        or "terminal_monitor.supervise" in command_text
+    )
     if not command or not trusted_entrypoint or ("supervise" not in command_text and "--supervise" not in command_text) or not any(candidate in command_text for candidate in state_candidates):
         return {"ok": False, "action": "resume", "error": "refusing untrusted monitor launch metadata"}
     with contextlib.suppress(OSError):

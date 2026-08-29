@@ -327,6 +327,7 @@ class TerminalMonitor:
         try:
             descriptor = os.open(self.monitor_lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
+            # Stale-lock recovery: only reached when the lock already exists.
             try:
                 existing = json.loads(Path(self.monitor_lock_path).read_text(encoding="utf-8"))
                 existing_pid = existing.get("pid") if isinstance(existing, dict) else None
@@ -334,11 +335,13 @@ class TerminalMonitor:
                     return False
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 pass
-            try:
-                descriptor = os.open(self.monitor_lock_path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
-            except OSError as exc:
-                self.log(f"LOCK_FAILED error={redact_sensitive(str(exc))}")
-                return False
+            # Atomic replace so a concurrent claimer can never observe a
+            # half-written lock file.
+            _atomic_json_write(self.monitor_lock_path, {"pid": os.getpid(), "instance_id": self.monitor_instance_id, "started_at": self.monitor_started_at})
+            self._write_monitor_metadata("running")
+            self._lock_claimed = True
+            self._lifecycle = "running"
+            return True
         except OSError as exc:
             self.log(f"LOCK_FAILED error={redact_sensitive(str(exc))}")
             return False
