@@ -4,9 +4,11 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from unittest import mock
 
@@ -1407,7 +1409,7 @@ class SupervisorV2Tests(unittest.TestCase):
                 encoding="utf-8",
             )
             server = terminal_monitor.MonitorWebServer(str(status_path), str(pathlib.Path(directory, "monitor.log")), port=0)
-            url = server.start()
+            server.start()
             try:
                 payload = web_json(server, "api/status", timeout=2)
             finally:
@@ -1424,7 +1426,7 @@ class SupervisorV2Tests(unittest.TestCase):
             status_path = pathlib.Path(directory, "status.json")
             status_path.write_text("[]", encoding="utf-8")
             server = terminal_monitor.MonitorWebServer(str(status_path), str(pathlib.Path(directory, "monitor.log")), port=0)
-            url = server.start()
+            server.start()
             try:
                 payload = web_json(server, "api/status", timeout=2)
             finally:
@@ -1714,7 +1716,7 @@ class SupervisorV2Tests(unittest.TestCase):
             status_path.write_text(json.dumps({"state": "thinking", "pids": [100]}), encoding="utf-8")
             log_path.write_text("START\n", encoding="utf-8")
             server = terminal_monitor.MonitorWebServer(str(status_path), str(log_path), port=0)
-            url = server.start()
+            server.start()
             try:
                 resp = web_json(server, "api/instances", timeout=2)
                 self.assertIn("instances", resp)
@@ -1769,7 +1771,7 @@ class SupervisorV2Tests(unittest.TestCase):
             status_path = pathlib.Path(directory, "status.json")
             log_path = pathlib.Path(directory, "monitor.log")
             server = terminal_monitor.MonitorWebServer(str(status_path), str(log_path), port=0, state_root=str(root))
-            url = server.start()
+            server.start()
             try:
                 resp = web_json(server, "api/instances", timeout=2)
             finally:
@@ -1803,6 +1805,105 @@ class SupervisorV2Tests(unittest.TestCase):
             finally:
                 server.stop()
 
+    def test_web_server_requires_token_and_loopback_host(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status_path = pathlib.Path(directory, "status.json")
+            status_path.write_text(json.dumps({"state": "thinking", "pids": [100]}), encoding="utf-8")
+            server = terminal_monitor.MonitorWebServer(str(status_path), str(pathlib.Path(directory, "monitor.log")), port=0)
+            url = server.start()
+            try:
+                # Missing token -> 403 on every API route (GET and POST).
+                for path in ("api/status", "api/events", "api/terminal", "api/instances"):
+                    with self.assertRaises(urllib.error.HTTPError) as ctx:
+                        web_json(server, path, token=False, timeout=2)
+                    self.assertEqual(ctx.exception.code, 403, path)
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    web_json(server, "api/send", method="POST", data=b"{}", token=False, timeout=2)
+                self.assertEqual(ctx.exception.code, 403)
+                # Invalid token -> 403.
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    web_json(server, "api/status", token=False, headers={"X-Monitor-Token": "wrong-token"}, timeout=2)
+                self.assertEqual(ctx.exception.code, 403)
+                # DNS-rebinding Host header -> 403 even with a valid token.
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    web_json(server, "api/status", headers={"Host": "evil.example"}, timeout=2)
+                self.assertEqual(ctx.exception.code, 403)
+                # The dashboard page itself stays readable and embeds the token.
+                html = urllib.request.urlopen(url, timeout=2).read().decode()
+                self.assertIn(server.token, html)
+            finally:
+                server.stop()
+
+    def test_web_server_rejects_malformed_json_body(self):
+        with tempfile.TemporaryDirectory() as directory:
+            server = terminal_monitor.MonitorWebServer(
+                str(pathlib.Path(directory, "status.json")),
+                str(pathlib.Path(directory, "monitor.log")),
+                port=0,
+                answer_path=str(pathlib.Path(directory, "answer.txt")),
+            )
+            server.start()
+            try:
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    web_json(server, "api/send", method="POST", data=b"{not-json", timeout=2)
+                self.assertEqual(ctx.exception.code, 400)
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    web_json(server, "api/send", method="POST", data=b'["array"]', timeout=2)
+                self.assertEqual(ctx.exception.code, 400)
+                self.assertFalse(pathlib.Path(directory, "answer.txt").exists())
+            finally:
+                server.stop()
+
+    def test_web_server_path_traversal_returns_404(self):
+        with tempfile.TemporaryDirectory() as directory:
+            server = terminal_monitor.MonitorWebServer(
+                str(pathlib.Path(directory, "status.json")),
+                str(pathlib.Path(directory, "monitor.log")),
+                port=0,
+            )
+            server.start()
+            try:
+                for path in ("/../../etc/passwd", "/api/../../status.json", "/app.css/../../../secrets"):
+                    with self.assertRaises(urllib.error.HTTPError) as ctx:
+                        web_json(server, path, timeout=2)
+                    self.assertEqual(ctx.exception.code, 404, path)
+            finally:
+                server.stop()
+
+    def test_web_server_stream_supports_parallel_clients_with_reconnect_hint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status_path = pathlib.Path(directory, "status.json")
+            status_path.write_text(json.dumps({"state": "thinking", "pids": [100]}), encoding="utf-8")
+            log_path = pathlib.Path(directory, "monitor.log")
+            log_path.write_text("START process=opencode\n", encoding="utf-8")
+            server = terminal_monitor.MonitorWebServer(str(status_path), str(log_path), port=0)
+            server.start()
+            results: list[str] = []
+
+            def reader() -> None:
+                url = f"http://127.0.0.1:{server.port}/api/stream?token={urllib.parse.quote(server.token)}"
+                try:
+                    with urllib.request.urlopen(url, timeout=5) as resp:
+                        for line in resp:
+                            if line.startswith(b"data:"):
+                                results.append(line.decode("utf-8", "replace"))
+                                break
+                except Exception as exc:  # pragma: no cover - surfaced via assertion below
+                    results.append(f"ERROR {exc}")
+
+            try:
+                threads = [threading.Thread(target=reader) for _ in range(2)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(timeout=10)
+            finally:
+                server.stop()
+            self.assertEqual(len(results), 2)
+            for chunk in results:
+                self.assertTrue(chunk.startswith("data:"), chunk)
+                self.assertIn('"state": "thinking"', chunk)
+
     def test_version_flag_reports_package_version(self):
         result = subprocess.run(
             [sys.executable, str(REPO_ROOT / "terminal_monitor.py"), "--version"],
@@ -1812,6 +1913,14 @@ class SupervisorV2Tests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0)
         self.assertIn(terminal_monitor.__version__, result.stdout)
+
+    def test_version_is_single_sourced_from_package(self):
+        # pyproject.toml must read the version dynamically from the package
+        # instead of duplicating it (regression guard against drift).
+        pyproject_text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn('dynamic = ["version"]', pyproject_text)
+        self.assertIn('attr = "terminal_monitor.__version__"', pyproject_text)
+        self.assertNotIn("\nversion = \"1.", pyproject_text)
 
 
 if __name__ == "__main__":

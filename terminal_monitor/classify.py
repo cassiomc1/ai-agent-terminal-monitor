@@ -31,7 +31,7 @@ TODO_FINAL_COMPLETE_PATTERN = re.compile(
 )
 
 
-def _explicit_todo_completion(history: str, marker_total: int) -> dict[str, Any] | None:
+def _explicit_todo_completion(history: str, marker_total: int, profile: AgentProfile | None = None) -> dict[str, Any] | None:
     """Prefer an agent's explicit final task summary over a stale TUI todo pane.
 
     OpenCode renders the conversation and its Todo side pane on the same
@@ -41,12 +41,13 @@ def _explicit_todo_completion(history: str, marker_total: int) -> dict[str, Any]
     ``0/9`` view.  Only affirmative, non-question lines are accepted here; a
     question such as ``todas as tarefas foram feitas?`` must not close work.
     """
+    prof = profile or BUILTIN_PROFILES["opencode"]
     lines = [re.sub(r"\s+", " ", line).strip(" │┃") for line in str(history).splitlines()]
     for line in reversed(lines[-200:]):
         if not line or "?" in line:
             continue
 
-        ratio = TODO_COMPLETION_RATIO_PATTERN.search(line)
+        ratio = re.search(prof.todo_ratio_pattern, line, re.IGNORECASE)
         if ratio:
             completed = int(ratio.group("completed"))
             total = int(ratio.group("total"))
@@ -61,7 +62,7 @@ def _explicit_todo_completion(history: str, marker_total: int) -> dict[str, Any]
                     "evidence": redact_sensitive(line)[:240],
                 }
 
-        if marker_total == 0 and TODO_FINAL_COMPLETE_PATTERN.search(line):
+        if marker_total == 0 and re.search(prof.todo_final_complete_pattern, line, re.IGNORECASE):
             return {
                 "total": 1,
                 "completed": 1,
@@ -72,7 +73,7 @@ def _explicit_todo_completion(history: str, marker_total: int) -> dict[str, Any]
                 "evidence": redact_sensitive(line)[:240],
             }
 
-        if (TODO_ALL_COMPLETE_PATTERN.search(line) or TODO_NO_PENDING_PATTERN.search(line)) and marker_total:
+        if (re.search(prof.todo_all_complete_pattern, line, re.IGNORECASE) or re.search(prof.todo_no_pending_pattern, line, re.IGNORECASE)) and marker_total:
             return {
                 "total": marker_total,
                 "completed": marker_total,
@@ -119,7 +120,7 @@ def reconcile_task_labels(items: list[dict[str, str]], history: str) -> list[dic
     return reconciled
 
 
-def extract_todo_progress(history: str, *, session_history: str = "") -> dict[str, Any]:
+def extract_todo_progress(history: str, *, session_history: str = "", profile: AgentProfile | None = None) -> dict[str, Any]:
     """Extract task progress, preferring a current explicit summary to TUI markers."""
     raw_items = []
     priority = {"pending": 0, "in_progress": 1, "completed": 2}
@@ -170,7 +171,7 @@ def extract_todo_progress(history: str, *, session_history: str = "") -> dict[st
         "pending": sum(item["state"] == "pending" for item in ordered),
     }
     explicit_target = session_history if session_history else history
-    explicit = _explicit_todo_completion(explicit_target, counts["total"])
+    explicit = _explicit_todo_completion(explicit_target, counts["total"], profile)
     if explicit:
         return explicit
     return {**counts, "items": ordered, "source": "tui_markers", "evidence": ""}
@@ -218,7 +219,7 @@ def classify_state(
 
     active_child = bool(activity and (activity.commands or activity.descendants))
     completion_history = session_tracker.current_segment(history) if session_tracker and session_tracker.interaction_history else history
-    completion = bool(_explicit_todo_completion(completion_history, marker_total=0))
+    completion = bool(_explicit_todo_completion(completion_history, marker_total=0, profile=prof))
     if session_tracker:
         completion = completion or session_tracker.matches_current_completion(history, prof.completion_patterns)
     else:

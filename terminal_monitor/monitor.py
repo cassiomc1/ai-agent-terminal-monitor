@@ -10,7 +10,7 @@ import shutil
 import signal
 import time
 import webbrowser
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,6 +72,7 @@ from .state import (
     normalize_snapshot,
     now_iso,
 )
+from .types import TabResult
 from .web import MonitorWebServer
 
 # ---------------------------------------------------------------------------
@@ -96,7 +97,7 @@ class StepContext:
     """
 
     pids: list[int]
-    tab: dict[str, str | bool]
+    tab: TabResult
     history: str
     snapshot: str
     safe_snapshot: str
@@ -137,58 +138,9 @@ class TerminalMonitor:
             if discovered and get_git_status(discovered, ttl_seconds=0.0).is_repo:
                 self.config = replace(self.config, project_dir=discovered)
 
-        # Setup state paths with project-level isolation
-        if self.config.state_dir == DEFAULT_STATE_DIR:
-            self.state_dir = resolve_project_state_dir(self.config.state_dir, self.config.project_dir)
-        else:
-            self.state_dir = self.config.state_dir
-        ensure_private_dir(self.state_dir)
-        self.log_path = os.path.join(self.state_dir, "monitor.log")
-        self.attention_path = os.path.join(self.state_dir, "attention.txt")
-        self.answer_path = os.path.join(self.state_dir, "answer.txt")
-        self.stop_path = os.path.join(self.state_dir, "stop")
-        self.monitor_lock_path = os.path.join(self.state_dir, "monitor.pid")
-        self.monitor_meta_path = os.path.join(self.state_dir, "monitor.json")
-        self.status_json_path = config.status_json_path or os.path.join(self.state_dir, "status.json")
-        self.terminal_snapshot_path = os.path.join(self.state_dir, "terminal-snapshot.txt")
-        self.task_state_path = os.path.join(self.state_dir, "task-state.json")
-        self.report_path = config.report_path or os.path.join(self.state_dir, "final-report.json")
-        stored_state = TaskState.load(self.task_state_path)
-        current_git_status = get_git_status(self.config.project_dir, ttl_seconds=0.0)
-        detected_branch = current_git_status.branch or stored_state.branch
-        expected_branch = config.expected_branch or stored_state.expected_branch
-        if config.supervise and not expected_branch:
-            expected_branch = detected_branch
-        self.task_state = replace(
-            stored_state,
-            objective=config.objective or stored_state.objective,
-            prohibitions=tuple(config.prohibitions) or stored_state.prohibitions,
-            task_id=config.task_id or stored_state.task_id,
-            required_outcome=config.required_outcome or stored_state.required_outcome,
-            npm_publish_allowed=config.npm_publish_allowed,
-            session_id=config.session_id or stored_state.session_id,
-            branch=detected_branch,
-            expected_branch=expected_branch,
-            report_path=self.report_path,
-        )
-        if config.supervise and not self.task_state.pr.get("safetyBaselineCaptured"):
-            baseline = dict(self.task_state.pr)
-            baseline.update(capture_safety_baseline(self.config.project_dir))
-            self.task_state = replace(self.task_state, pr=baseline)
-        self.task_state.save(self.task_state_path)
-        self.session_tracker = SessionTracker(
-            interaction_history=self.task_state.interaction_marker,
-            generation=self.task_state.session_generation,
-        )
-        self.policy = PolicyEnvelope(self.task_state.objective, self.task_state.prohibitions)
-        self.pr_machine = PullRequestStateMachine()
-        try:
-            self.pr_machine.restore(self.task_state.last_known_stage, self.task_state.pr.get("number"))
-        except ValueError:
-            self.pr_machine.restore("TASK_RECEIVED")
-        self.attempt_ledger = AttemptLedger(list(self.task_state.attempts), max_records=config.attempt_history_limit)
-        self.agent_loop_guard = AgentLoopGuard(config.loop_repeat_limit)
-        self.loop_assessment = LoopAssessment()
+        self._init_paths()
+        self._init_task_state()
+        self._init_trackers()
 
         # Internal state tracking
         self.last_digest = ""
@@ -228,6 +180,67 @@ class TerminalMonitor:
         self.on_attention: Callable[[str, str], None] | None = None
         self.on_complete: Callable[[str], None] | None = None
         self.on_tick: Callable[[str, int], None] | None = None
+
+    def _init_paths(self) -> None:
+        """Resolve the state directory and every well-known state file path."""
+        # Setup state paths with project-level isolation
+        if self.config.state_dir == DEFAULT_STATE_DIR:
+            self.state_dir = resolve_project_state_dir(self.config.state_dir, self.config.project_dir)
+        else:
+            self.state_dir = self.config.state_dir
+        ensure_private_dir(self.state_dir)
+        self.log_path = os.path.join(self.state_dir, "monitor.log")
+        self.attention_path = os.path.join(self.state_dir, "attention.txt")
+        self.answer_path = os.path.join(self.state_dir, "answer.txt")
+        self.stop_path = os.path.join(self.state_dir, "stop")
+        self.monitor_lock_path = os.path.join(self.state_dir, "monitor.pid")
+        self.monitor_meta_path = os.path.join(self.state_dir, "monitor.json")
+        self.status_json_path = self.config.status_json_path or os.path.join(self.state_dir, "status.json")
+        self.terminal_snapshot_path = os.path.join(self.state_dir, "terminal-snapshot.txt")
+        self.task_state_path = os.path.join(self.state_dir, "task-state.json")
+        self.report_path = self.config.report_path or os.path.join(self.state_dir, "final-report.json")
+
+    def _init_task_state(self) -> None:
+        """Merge persisted task state with the configured policy and save it."""
+        stored_state = TaskState.load(self.task_state_path)
+        current_git_status = get_git_status(self.config.project_dir, ttl_seconds=0.0)
+        detected_branch = current_git_status.branch or stored_state.branch
+        expected_branch = self.config.expected_branch or stored_state.expected_branch
+        if self.config.supervise and not expected_branch:
+            expected_branch = detected_branch
+        self.task_state = replace(
+            stored_state,
+            objective=self.config.objective or stored_state.objective,
+            prohibitions=tuple(self.config.prohibitions) or stored_state.prohibitions,
+            task_id=self.config.task_id or stored_state.task_id,
+            required_outcome=self.config.required_outcome or stored_state.required_outcome,
+            npm_publish_allowed=self.config.npm_publish_allowed,
+            session_id=self.config.session_id or stored_state.session_id,
+            branch=detected_branch,
+            expected_branch=expected_branch,
+            report_path=self.report_path,
+        )
+        if self.config.supervise and not self.task_state.pr.get("safetyBaselineCaptured"):
+            baseline = dict(self.task_state.pr)
+            baseline.update(capture_safety_baseline(self.config.project_dir))
+            self.task_state = replace(self.task_state, pr=baseline)
+        self.task_state.save(self.task_state_path)
+
+    def _init_trackers(self) -> None:
+        """Instantiate session, policy, PR-stage, ledger, and loop-guard trackers."""
+        self.session_tracker = SessionTracker(
+            interaction_history=self.task_state.interaction_marker,
+            generation=self.task_state.session_generation,
+        )
+        self.policy = PolicyEnvelope(self.task_state.objective, self.task_state.prohibitions)
+        self.pr_machine = PullRequestStateMachine()
+        try:
+            self.pr_machine.restore(self.task_state.last_known_stage, self.task_state.pr.get("number"))
+        except ValueError:
+            self.pr_machine.restore("TASK_RECEIVED")
+        self.attempt_ledger = AttemptLedger(list(self.task_state.attempts), max_records=self.config.attempt_history_limit)
+        self.agent_loop_guard = AgentLoopGuard(self.config.loop_repeat_limit)
+        self.loop_assessment = LoopAssessment()
 
     def _update_task_timings(self, todo: dict[str, Any]) -> dict[str, Any]:
         """Track per-task start, completion, duration and plan velocity."""
@@ -396,7 +409,7 @@ class TerminalMonitor:
         self.task_state = replace(self.task_state, policy_decisions=tuple(decisions[-self.config.attempt_history_limit :]))
         self.task_state.save(self.task_state_path)
 
-    def _record_ci_events(self, classifications: list[dict[str, Any]]) -> None:
+    def _record_ci_events(self, classifications: Sequence[Mapping[str, Any]]) -> None:
         if not classifications:
             return
         events = [*self.task_state.ci_events]
@@ -436,7 +449,7 @@ class TerminalMonitor:
         started_value = latest.get("monotonic")
         age = 0.0
         try:
-            started = float(started_value)
+            started = float(started_value)  # type: ignore[arg-type]
             monotonic_now = time.monotonic()
             if started <= monotonic_now:
                 age = max(0.0, monotonic_now - started)
@@ -607,7 +620,7 @@ class TerminalMonitor:
             self.last_command = activity.commands[0]
         todo_history = self.session_tracker.current_segment(history) if self.session_tracker.interaction_history else history
         if history.strip():
-            self.todo_progress = extract_todo_progress(history, session_history=todo_history)
+            self.todo_progress = extract_todo_progress(history, session_history=todo_history, profile=self.profile)
         self.detected_task_id = infer_current_task_id(history)
         self.last_action = f"observe:{state}"
         safe_snapshot, snapshot_truncated = redact_snapshot(snapshot)
@@ -657,7 +670,7 @@ class TerminalMonitor:
                     found.append(log_file)
         return found
 
-    def _observe(self, pids: list[int], tab: dict[str, str | bool]) -> StepContext:
+    def _observe(self, pids: list[int], tab: TabResult) -> StepContext:
         """Capture tab, activity, classification, and test progress for this iteration."""
         history = str(tab.get("hist", ""))
         snapshot = normalize_snapshot(history)
@@ -673,7 +686,7 @@ class TerminalMonitor:
             self.last_command = activity.commands[0]
         todo_history = self.session_tracker.current_segment(history) if self.session_tracker.interaction_history else history
         if history.strip():
-            raw_todo = extract_todo_progress(history, session_history=todo_history)
+            raw_todo = extract_todo_progress(history, session_history=todo_history, profile=self.profile)
             self.todo_progress = self._update_task_timings(raw_todo)
         self.detected_task_id = infer_current_task_id(history)
         self.last_action = f"observe:{state}"
@@ -1205,7 +1218,7 @@ class TerminalMonitor:
         value = "|".join(files) + pids + git_activity_fingerprint(self.config.project_dir)
         return hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()
 
-    def _get_tab(self, pids: list[int]) -> dict[str, str | bool]:
+    def _get_tab(self, pids: list[int]) -> TabResult:
         identity = TerminalIdentity(
             project_path=str(Path(self.config.project_dir).resolve()),
             branch=self.task_state.branch or get_git_status(self.config.project_dir).branch,

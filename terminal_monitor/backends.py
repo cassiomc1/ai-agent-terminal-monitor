@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .safety import SPECIAL_KEY_CODES
+from .types import TabResult
 
 
 @dataclass(frozen=True)
@@ -137,7 +138,7 @@ def run_command(cmd: list[str], cwd: str | None = None) -> tuple[int, str, str]:
         return 1, "", str(exc)
 
 
-def parse_tab_output(raw: str) -> dict[str, str | bool]:
+def parse_tab_output(raw: str) -> TabResult:
     """Parse key-value output emitted by AppleScript tab queries."""
     if raw.strip() == "MISSING":
         return {"ok": False, "error": "matching Terminal tab not found"}
@@ -169,7 +170,7 @@ def parse_tab_output(raw: str) -> dict[str, str | bool]:
                 hist_lines.append(val)
 
     data["hist"] = "\n".join(hist_lines)
-    return data
+    return data  # type: ignore[return-value]
 
 
 class BaseTerminalBackend:
@@ -178,10 +179,10 @@ class BaseTerminalBackend:
     def name(self) -> str:
         raise NotImplementedError
 
-    def get_tab(self, process: str, title: str | None = None) -> dict[str, str | bool]:
+    def get_tab(self, process: str, title: str | None = None) -> TabResult:
         raise NotImplementedError
 
-    def get_tab_for_identity(self, process: str, identity: TerminalIdentity) -> dict[str, str | bool]:
+    def get_tab_for_identity(self, process: str, identity: TerminalIdentity) -> TabResult:
         """Resolve a tab using progressively broader stable identity hints."""
         hints = [
             identity.title,
@@ -198,7 +199,7 @@ class BaseTerminalBackend:
             tab = self.get_tab(process, normalized)
             if tab.get("ok"):
                 return tab
-        return {"ok": False, "error": "matching terminal identity not found"}
+        return TabResult(ok=False, error="matching terminal identity not found")
 
     def send(self, process: str, title: str | None, payload: str) -> tuple[bool, str]:
         raise NotImplementedError
@@ -229,7 +230,7 @@ class TerminalAppBackend(BaseTerminalBackend):
     def name(self) -> str:
         return "terminal"
 
-    def get_tab(self, process: str, title: str | None = None) -> dict[str, str | bool]:
+    def get_tab(self, process: str, title: str | None = None) -> TabResult:
         process = validate_process_name(process)
         process_literal = applescript_escape(process)
         title_check = applescript_terminal_title_condition(title)
@@ -329,7 +330,7 @@ class ITerm2Backend(BaseTerminalBackend):
     def name(self) -> str:
         return "iterm2"
 
-    def get_tab(self, process: str, title: str | None = None) -> dict[str, str | bool]:
+    def get_tab(self, process: str, title: str | None = None) -> TabResult:
         process_literal = applescript_escape(validate_process_name(process))
         checked_title = validate_title_filter(title)
         title_check = "set titleOK to true"
@@ -454,7 +455,7 @@ class TmuxBackend(BaseTerminalBackend):
                 return target
         return None
 
-    def get_tab(self, process: str, title: str | None = None) -> dict[str, str | bool]:
+    def get_tab(self, process: str, title: str | None = None) -> TabResult:
         target = self._find_target(process, title)
         if not target:
             return {"ok": False, "error": "matching tmux pane not found"}
@@ -535,7 +536,7 @@ def get_backend(backend_name: str = "auto") -> BaseTerminalBackend:
 
 
 # Backward-compatible function wrappers
-def terminal_tab(process: str, title: str | None = None) -> dict[str, str | bool]:
+def terminal_tab(process: str, title: str | None = None) -> TabResult:
     """Inspect terminal tab using the default Terminal.app backend."""
     return TerminalAppBackend().get_tab(process, title)
 

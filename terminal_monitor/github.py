@@ -17,6 +17,7 @@ from .backends import run_command
 from .config import MonitorConfig
 from .gitinfo import GitStatus
 from .state import StateFileError, TaskState, _atomic_json_write, now_iso
+from .types import CheckClassification, MergeGateResult
 
 RETRYABLE_CHECK_CONCLUSIONS = {"cancelled", "timed_out", "stale", "startup_failure", "action_required", "network_failure", "infrastructure_failure"}
 CODE_FAILURE_CONCLUSIONS = {"failure"}
@@ -37,7 +38,7 @@ EXTERNAL_FAILURE_MARKERS = (
     "temporary failure",
     "service unavailable",
 )
-def classify_check_result(check: dict[str, Any]) -> dict[str, Any]:
+def classify_check_result(check: dict[str, Any]) -> CheckClassification:
     """Classify one GitHub check without conflating code and network failures."""
     raw = str(check.get("conclusion") or check.get("state") or check.get("status") or "").lower().strip()
     evidence = " ".join(
@@ -56,13 +57,14 @@ def classify_check_result(check: dict[str, Any]) -> dict[str, Any]:
         category = "pending"
     else:
         category = "unknown"
-    return {
-        "category": category,
+    result: CheckClassification = {
+        "category": category,  # type: ignore[typeddict-item]
         "retryable": category in {"cancelled-infra", "failed-external"},
         "conclusion": raw,
         "evidence": evidence,
         "name": str(check.get("name") or check.get("context") or ""),
     }
+    return result
 class PullRequestStateMachine:
     """Map GitHub PR/check snapshots to an actionable supervision stage."""
 
@@ -332,7 +334,7 @@ def evaluate_repository_safety(
     }
 
 
-def verify_merge_gate(project_dir: str, pr_number: int, expected_head: str) -> dict[str, Any]:
+def verify_merge_gate(project_dir: str, pr_number: int, expected_head: str) -> MergeGateResult:
     """Re-query the PR and require green checks for the exact expected head."""
     if not re.fullmatch(r"[0-9a-f]{40}", expected_head or "", flags=re.IGNORECASE):
         return {
@@ -368,10 +370,10 @@ def verify_merge_gate(project_dir: str, pr_number: int, expected_head: str) -> d
     return {"ok": True, "reason": "green_exact_head", "head": actual_head, "checks": checks, "pr": pr}
 
 
-def merge_pull_request(project_dir: str, pr_number: int, expected_head: str, *, dry_run: bool = False) -> dict[str, Any]:
+def merge_pull_request(project_dir: str, pr_number: int, expected_head: str, *, dry_run: bool = False) -> MergeGateResult:
     """Merge only after the exact-head gate; dry-run never contacts GitHub."""
     if dry_run:
-        return {"ok": True, "dry_run": True, "reason": "would_merge", "pr": pr_number, "head": expected_head}
+        return {"ok": True, "dry_run": True, "reason": "would_merge", "pr": pr_number, "head": expected_head}  # type: ignore[typeddict-item]
     gate = verify_merge_gate(project_dir, pr_number, expected_head)
     if not gate.get("ok"):
         return {**gate, "merged": False}

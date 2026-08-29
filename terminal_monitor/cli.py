@@ -206,7 +206,7 @@ def config_from_args(args: argparse.Namespace) -> MonitorConfig:
         process=process,
         profile=profile,
         title=_val(getattr(args, "title", None), "title", None),
-        continue_text=continue_text,
+        continue_text=continue_text,  # type: ignore[arg-type]
         continue_file=getattr(args, "continue_file", None),
         poll_seconds=float(_val(getattr(args, "poll_seconds", None), "poll_seconds", 3.0)),
         idle_seconds=float(_val(getattr(args, "idle_seconds", None), "idle_seconds", 15.0)),
@@ -366,9 +366,9 @@ def main() -> int:
         if not expected_head:
             print("An expected full PR head SHA is required (--head or saved state).", file=sys.stderr)
             return 2
-        result = merge_pull_request(config.project_dir, args.pr, expected_head, dry_run=config.dry_run)
-        print(json.dumps(result, indent=2))
-        return 0 if result.get("ok") else 4
+        merge_result: dict[str, Any] = dict(merge_pull_request(config.project_dir, args.pr, expected_head, dry_run=config.dry_run))
+        print(json.dumps(merge_result, indent=2))
+        return 0 if merge_result.get("ok") else 4
 
     if args.command == "verify-final-state":
         state = TaskState.load(Path(config.state_dir, "task-state.json"))

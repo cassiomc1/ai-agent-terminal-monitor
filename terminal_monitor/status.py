@@ -97,11 +97,16 @@ def render_status_dashboard(snapshot: dict[str, Any], *, color: bool = True, wid
     monitor_label, monitor_tone = _status_monitor_label(snapshot)
     state = str(snapshot.get("state", "unknown")).upper()
     state_tone = "green" if state in {"THINKING", "COMPLETED"} else "yellow" if state in {"IDLE", "PERMISSION", "QUESTION"} else "red" if state in {"MISSING", "ATTENTION", "STOPPED"} else "cyan"
-    task = snapshot.get("task") if isinstance(snapshot.get("task"), dict) else {}
-    todo = snapshot.get("todo") if isinstance(snapshot.get("todo"), dict) else {}
-    activity = snapshot.get("activity") if isinstance(snapshot.get("activity"), dict) else {}
-    git = snapshot.get("git") if isinstance(snapshot.get("git"), dict) else {}
-    ci_events = snapshot.get("ci_events") if isinstance(snapshot.get("ci_events"), list) else []
+    raw_task = snapshot.get("task")
+    task: dict[str, Any] = raw_task if isinstance(raw_task, dict) else {}
+    raw_todo = snapshot.get("todo")
+    todo: dict[str, Any] = raw_todo if isinstance(raw_todo, dict) else {}
+    raw_activity = snapshot.get("activity")
+    activity: dict[str, Any] = raw_activity if isinstance(raw_activity, dict) else {}
+    raw_git = snapshot.get("git")
+    git: dict[str, Any] = raw_git if isinstance(raw_git, dict) else {}
+    raw_ci_events = snapshot.get("ci_events")
+    ci_events: list[Any] = raw_ci_events if isinstance(raw_ci_events, list) else []
     ci_categories = [str(item.get("category", "unknown")) for item in ci_events[-8:] if isinstance(item, dict)]
     ci_label = "green" if ci_categories and all(item == "passed" for item in ci_categories) else "attention" if any(item in {"failed", "failed-external"} for item in ci_categories) else "waiting" if ci_categories else "not observed"
     ci_tone = "green" if ci_label == "green" else "red" if ci_label == "attention" else "yellow" if ci_label == "waiting" else "dim"
@@ -175,7 +180,7 @@ def stop_monitor(state_dir: str | Path, *, reason: str = "cli_stop") -> dict[str
     result: dict[str, Any] = {"ok": True, "action": "stop", "state_dir": str(state_path), "pid": pid, "agent_untouched": True}
     if _monitor_process_matches(pid, state_path):
         try:
-            os.kill(int(pid), signal.SIGTERM)
+            os.kill(int(str(pid)), signal.SIGTERM)
             result.update({"signal": "SIGTERM", "reason": reason})
         except OSError as exc:
             result.update({"ok": False, "error": str(exc)})

@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .types import AttemptRecord
+
 
 class StateFileError(RuntimeError):
     """Raised when persistent supervisor state cannot be trusted."""
@@ -18,7 +20,7 @@ class StateFileError(RuntimeError):
 
 def json_safe(value: Any) -> Any:
     """Convert monitor values into deterministic JSON-compatible structures."""
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return {key: json_safe(item) for key, item in asdict(value).items()}
     if isinstance(value, dict):
         return {str(key): json_safe(item) for key, item in value.items()}
@@ -177,9 +179,10 @@ class AttemptLedger:
             raise KeyError(f"Unknown attempt: {attempt_id}")
         self._append(attempt_id, status, detail=detail, observed_state=observed_state)
 
-    def latest(self, attempt_id: str | None = None) -> dict[str, Any] | None:
+    def latest(self, attempt_id: str | None = None) -> AttemptRecord | None:
         records = self.records if attempt_id is None else [item for item in self.records if item.get("attempt_id") == attempt_id]
-        return dict(records[-1]) if records else None
+        record: AttemptRecord | None = dict(records[-1]) if records else None  # type: ignore[assignment]
+        return record
 
 @dataclass
 class SessionTracker:

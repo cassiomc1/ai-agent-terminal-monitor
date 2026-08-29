@@ -29,6 +29,7 @@ from . import profiles as profiles
 from . import safety as safety
 from . import state as state
 from . import status as status
+from . import types as types
 from . import web as web
 from .backends import (  # noqa: F401
     COMMAND_TIMEOUT_SECONDS,

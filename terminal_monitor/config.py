@@ -11,7 +11,7 @@ try:
     import tomllib
 except ImportError:  # pragma: no cover
     try:
-        import tomli as tomllib  # type: ignore
+        import tomli as tomllib  # type: ignore[no-redef, unused-ignore]
     except ImportError:
         tomllib = None
 from .safety import UNSAFE_PHRASES

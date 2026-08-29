@@ -28,6 +28,25 @@ class AgentProfile:
     plan_ready_patterns: list[str] = field(default_factory=list)
     mode_switch_key: str = "tab"
     completion_patterns: list[str] = field(default_factory=list)
+    # Locale-specific completion detection (regex strings, case-insensitive).
+    # Defaults cover English and Portuguese; override per profile via the
+    # custom-profile config file (``profiles.<name>.todo_*`` keys) for other
+    # languages.
+    todo_ratio_pattern: str = (
+        r"(?<!\d)(?P<completed>\d+)\s*/\s*(?P<total>\d+)"
+        r"(?:\s*(?:tasks?|tarefas?))?\s*"
+        r"(?P<status>complete(?:d)?|conclu[ií]d[ao]s?|feitas?|finished|done)\b"
+    )
+    todo_all_complete_pattern: str = (
+        r"\b(?:all\s+(?:of\s+the\s+)?tasks?|todas?(?:\s+as)?\s+tarefas?|todos?(?:\s+os)?\s+tasks?)\b"
+        r".{0,80}\b(?:complete(?:d)?|done|conclu[ií]d[ao]s?|feitas?)\b"
+    )
+    todo_no_pending_pattern: str = (
+        r"\b(?:no\s+(?:pending|remaining)\s+tasks?|nenhuma?\s+pendente(?:s)?|não\s+há\s+(?:tarefas?\s+)?pendente(?:s)?)\b"
+    )
+    todo_final_complete_pattern: str = (
+        r"\b(?:estado\s+final|final\s+state)\b.{0,160}\b(?:complete|completed|conclu[ií]d[ao]s?|feitas?|finished|done)\b"
+    )
 
     def matches_thinking(self, history_tail: str) -> bool:
         return any(match_pattern(pat, history_tail) for pat in self.thinking_patterns)
@@ -328,6 +347,10 @@ def get_profile(name_or_process: str | None = None, custom_profiles: dict[str, A
                 plan_ready_patterns=val.get("plan_ready_patterns", []),
                 mode_switch_key=val.get("mode_switch_key", "tab"),
                 completion_patterns=val.get("completion_patterns", []),
+                todo_ratio_pattern=val.get("todo_ratio_pattern", AgentProfile.todo_ratio_pattern),
+                todo_all_complete_pattern=val.get("todo_all_complete_pattern", AgentProfile.todo_all_complete_pattern),
+                todo_no_pending_pattern=val.get("todo_no_pending_pattern", AgentProfile.todo_no_pending_pattern),
+                todo_final_complete_pattern=val.get("todo_final_complete_pattern", AgentProfile.todo_final_complete_pattern),
             )
 
     # Match in built-in profiles
@@ -356,6 +379,10 @@ def get_profile(name_or_process: str | None = None, custom_profiles: dict[str, A
         plan_ready_patterns=list(generic.plan_ready_patterns),
         mode_switch_key=generic.mode_switch_key,
         completion_patterns=list(generic.completion_patterns),
+        todo_ratio_pattern=generic.todo_ratio_pattern,
+        todo_all_complete_pattern=generic.todo_all_complete_pattern,
+        todo_no_pending_pattern=generic.todo_no_pending_pattern,
+        todo_final_complete_pattern=generic.todo_final_complete_pattern,
     )
 
 

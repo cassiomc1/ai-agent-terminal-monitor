@@ -285,7 +285,10 @@ def _get_git_status_uncached(repo_dir: str = ".") -> GitStatus:
         code, out, _ = run_command(["git", "rev-parse", "--is-inside-work-tree"], cwd=repo_dir)
         if code != 0 or "true" not in out:
             return GitStatus(is_repo=False)
-        branch, head, dirty, modified, untracked, modified_files, last_commit = _get_local_git_fields(repo_dir)
+        fields = _get_local_git_fields(repo_dir)
+        if fields is None:
+            return GitStatus(is_repo=False)
+        branch, head, dirty, modified, untracked, modified_files, last_commit = fields
         open_prs = _get_open_pr_count(repo_dir)
         return GitStatus(
             is_repo=True,

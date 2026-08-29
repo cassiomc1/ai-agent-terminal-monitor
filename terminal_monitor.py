@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import sys
 
-from terminal_monitor import *  # noqa: F401,F403
-from terminal_monitor import __version__, main  # noqa: F401
+from terminal_monitor import *  # noqa: F403
+from terminal_monitor import main
 
 if __name__ == "__main__":
     sys.exit(main())
