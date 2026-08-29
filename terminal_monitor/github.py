@@ -66,34 +66,69 @@ def classify_check_result(check: dict[str, Any]) -> dict[str, Any]:
 class PullRequestStateMachine:
     """Map GitHub PR/check snapshots to an actionable supervision stage."""
 
+    KNOWN_STAGES: frozenset[str] = frozenset(
+        {
+            "TASK_RECEIVED",
+            "EXECUTING",
+            "VERIFYING",
+            "PR_CREATED",
+            "CI_CHECKS",
+            "CI_PENDING",
+            "CI_GREEN",
+            "CI_RETRY_REQUIRED",
+            "FIX_REQUIRED",
+            "POST_MERGE_VERIFY",
+            "MERGED",
+        }
+    )
+
     def __init__(self) -> None:
-        self.stage = "TASK_RECEIVED"
+        self._stage = "TASK_RECEIVED"
         self.seen_pr_number: int | None = None
+
+    @property
+    def stage(self) -> str:
+        """Current stage; assign via :meth:`restore` so invariants stay consistent."""
+        return self._stage
+
+    def restore(self, stage: str, pr_number: int | None = None) -> None:
+        """Restore a persisted stage, validating it and syncing the seen PR number.
+
+        Restoring through this method (instead of poking ``stage`` directly)
+        keeps ``seen_pr_number`` consistent with the restored stage so the
+        next ``advance`` cannot misfire the PR_CREATED transition.
+        """
+        normalized = str(stage or "").strip().upper()
+        if normalized and normalized not in self.KNOWN_STAGES:
+            raise ValueError(f"Unknown PR stage: {stage!r}")
+        self._stage = normalized or "TASK_RECEIVED"
+        if pr_number is not None:
+            self.seen_pr_number = int(pr_number)
 
     def advance(self, pr: dict[str, Any] | None) -> str:
         if not pr or not pr.get("number"):
-            self.stage = "TASK_RECEIVED"
-            return self.stage
+            self._stage = "TASK_RECEIVED"
+            return self._stage
         number = int(pr["number"])
-        if self.seen_pr_number != number and self.stage == "TASK_RECEIVED":
+        if self.seen_pr_number != number and self._stage == "TASK_RECEIVED":
             self.seen_pr_number = number
-            self.stage = "PR_CREATED"
-            return self.stage
+            self._stage = "PR_CREATED"
+            return self._stage
         self.seen_pr_number = number
         checks = list(pr.get("checks") or [])
         classifications = [classify_check_result(check) for check in checks]
         conclusions = {item["category"] for item in classifications}
         if str(pr.get("state", "")).upper() == "MERGED":
-            self.stage = "POST_MERGE_VERIFY"
+            self._stage = "POST_MERGE_VERIFY"
         elif "failed" in conclusions:
-            self.stage = "FIX_REQUIRED"
+            self._stage = "FIX_REQUIRED"
         elif conclusions & {"cancelled-infra", "failed-external"}:
-            self.stage = "CI_RETRY_REQUIRED"
+            self._stage = "CI_RETRY_REQUIRED"
         elif checks and conclusions <= {"passed"}:
-            self.stage = "CI_GREEN"
+            self._stage = "CI_GREEN"
         else:
-            self.stage = "CI_PENDING"
-        return self.stage
+            self._stage = "CI_PENDING"
+        return self._stage
 
 
 @dataclass(frozen=True)

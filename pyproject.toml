@@ -3,7 +3,19 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["terminal_monitor"]
+packages = ["terminal_monitor"]
+
+[tool.setuptools.dynamic]
+version = { attr = "terminal_monitor.__version__" }
+
+[tool.mypy]
+python_version = "3.10"
+files = ["terminal_monitor"]
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
 
 [tool.ruff]
 line-length = 160
@@ -27,7 +39,7 @@ known-first-party = ["terminal_monitor"]
 
 [project]
 name = "ai-agent-terminal-monitor"
-version = "1.1.0"
+dynamic = ["version"]
 description = "Universal, autonomous watcher and safe continuation driver for any AI coding agent CLI"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -66,6 +78,7 @@ classifiers = [
 
 [project.scripts]
 terminal-monitor = "terminal_monitor:main"
+terminal-monitor-supervise = "terminal_monitor.supervise:main"
 
 [project.urls]
 Homepage = "https://github.com/cassiomc1/ai-agent-terminal-monitor"

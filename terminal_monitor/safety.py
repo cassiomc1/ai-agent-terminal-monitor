@@ -148,24 +148,31 @@ def classify_action_risk(action: str, *, npm_publish_allowed: bool = False) -> s
     if any(phrase in low for phrase in UNSAFE_PHRASES):
         return "blocked"
     return "safe"
-SENSITIVE_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?i)(\b(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|token)\b\s*[:=]\s*)([^\s,;]+)"),
-    re.compile(r"(?i)(\bBearer\s+)([A-Za-z0-9._~+/=-]{12,})"),
-    re.compile(r"\b(?:ghp|gho|ghs|ghr|github_pat)_[A-Za-z0-9_\-]{12,}\b"),
-    re.compile(r"(?i)([?&](?:token|key|secret|password|signature)=)([^&\s]+)"),
+# Each sensitive pattern is paired with its explicit replacement template so
+# the substitution behavior no longer depends on introspecting the regex
+# source.  Patterns whose replacement keeps a capture group use backrefs;
+# whole-match patterns replace everything with "<redacted>".
+SENSITIVE_VALUE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?i)(\b(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|token)\b\s*[:=]\s*)[^\s,;]+"), r"\g<1><redacted>"),
+    (re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/=-]{12,}"), r"\g<1><redacted>"),
+    (re.compile(r"\b(?:ghp|gho|ghs|ghr|github_pat)_[A-Za-z0-9_\-]{12,}\b"), "<redacted>"),
+    (re.compile(r"(?i)([?&](?:token|key|secret|password|signature)=)[^&\s]+"), r"\g<1><redacted>"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "<redacted>"),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"), "<redacted>"),
 )
 
 
 def redact_sensitive(text: str) -> str:
-    """Mask common credentials before terminal history leaves the local monitor."""
+    """Mask common credentials before terminal history leaves the local monitor.
+
+    AWS access keys and Slack tokens are covered in addition to the original
+    GitHub/Bearer/query patterns.  Generic 40+ character hex secrets are
+    deliberately NOT redacted: git commit SHAs are exactly 40 hex chars and
+    would corrupt every git fingerprint in logs and status output.
+    """
     redacted = str(text)
-    for pattern in SENSITIVE_VALUE_PATTERNS:
-        if pattern.groups >= 2 and (
-            pattern.pattern.startswith("(?i)(\\b") or "Bearer" in pattern.pattern or "(?:token|key" in pattern.pattern
-        ):
-            redacted = pattern.sub(lambda match: f"{match.group(1)}<redacted>", redacted)
-        else:
-            redacted = pattern.sub("<redacted>", redacted)
+    for pattern, replacement in SENSITIVE_VALUE_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
     return redacted
 def is_unsafe(value: str, unsafe_list: list[str] | tuple[str, ...] | None = None) -> bool:
     """Check if an option or command string matches known unsafe phrases."""

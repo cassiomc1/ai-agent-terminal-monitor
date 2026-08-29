@@ -229,17 +229,73 @@ def is_table_or_box_line(line: str) -> bool:
         return True
     return bool(re.match(r"^[\s|+_=-]+$", stripped))
 def now_iso() -> str:
-    """Return current UTC timestamp in ISO-8601 format."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Return current UTC timestamp in ISO-8601 format with millisecond precision.
+
+    Attempt-ledger transitions (queued -> sent -> accepted) routinely happen
+    within the same second; sub-second precision keeps the persisted trail
+    orderable by timestamp alone.
+    """
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 def normalize_snapshot(history: str) -> str:
     """Clean and normalize history snapshot for state hashing."""
     text = re.sub(r"[ \t]+", " ", history)
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return "\n".join(lines[-30:])
+
+# Directories already prepared for log writes (mkdir + chmod done once).
+_PREPARED_LOG_DIRS: set[str] = set()
+
+# Opt-in debug channel for suppressed exceptions (item: fail loudly-ish).
+# Enabled via the CLI ``--debug-log <path>`` flag or ``TERMINAL_MONITOR_DEBUG=1``.
+_DEBUG_LOG_PATH: str = ""
+
+
+def enable_debug_log(path: str | None) -> None:
+    """Route swallowed exceptions to ``path``; empty value disables the channel."""
+    global _DEBUG_LOG_PATH
+    if not path:
+        _DEBUG_LOG_PATH = ""
+        return
+    _DEBUG_LOG_PATH = str(path)
+
+
+def _default_debug_log_path() -> str:
+    root = os.environ.get("TERMINAL_MONITOR_STATE_DIR") or "/tmp/terminal-monitor"
+    return os.path.join(root, "debug.log")
+
+
+def _debug_enabled() -> bool:
+    return bool(_DEBUG_LOG_PATH or os.environ.get("TERMINAL_MONITOR_DEBUG", "").strip() not in ("", "0"))
+
+
+def debug_swallow(context: str, exc: BaseException) -> None:
+    """Record a deliberately suppressed exception when debug logging is enabled.
+
+    Fail-open behavior is intentional for a supervisor; this only adds an
+    auditable trace so field debugging ("why is my webhook not firing?")
+    no longer requires reproducing locally.
+    """
+    if not _debug_enabled():
+        return
+    path = _DEBUG_LOG_PATH or _default_debug_log_path()
+    with contextlib.suppress(OSError):
+        append_log(path, f"SUPPRESSED {context}: {exc!r}")
+
+
 def append_log(path: str, message: str, *, max_bytes: int = 2_000_000) -> None:
-    """Append a timestamped log line and retain a bounded one-file archive."""
+    """Append a timestamped log line and retain a bounded one-file archive.
+
+    Directory setup and permissions are ensured once per directory; the mode
+    is applied at creation time via ``os.open`` instead of a per-append
+    ``chmod`` syscall.
+    """
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    parent_key = str(target.parent)
+    if parent_key not in _PREPARED_LOG_DIRS:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(target.parent, 0o700)
+        _PREPARED_LOG_DIRS.add(parent_key)
     try:
         if target.exists() and target.stat().st_size >= max(1024, int(max_bytes)):
             archive = target.with_name(f"{target.name}.1")
@@ -248,10 +304,12 @@ def append_log(path: str, message: str, *, max_bytes: int = 2_000_000) -> None:
                 os.chmod(archive, 0o600)
     except OSError:
         pass
-    with open(target, "a", encoding="utf-8") as handle:
-        handle.write(f"{now_iso()} {message}\n")
-    with contextlib.suppress(OSError):
-        os.chmod(target, 0o600)
+    try:
+        descriptor = os.open(target, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+            handle.write(f"{now_iso()} {message}\n")
+    except OSError:
+        pass
 def consume_manual_answer(path: str) -> str | None:
     """Read and delete a manual answer file if present."""
     try:

@@ -11,7 +11,7 @@ import signal
 import time
 import webbrowser
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -19,7 +19,7 @@ from uuid import uuid4
 
 from .backends import BaseTerminalBackend, TerminalIdentity, get_backend
 from .classify import classify_state, decide_question, extract_todo_progress, infer_current_task_id, redact_snapshot
-from .config import MonitorConfig
+from .config import DEFAULT_STATE_DIR, MonitorConfig
 from .github import (
     FinalVerificationReport,
     PullRequestStateMachine,
@@ -37,8 +37,10 @@ from .github import (
     write_final_report,
 )
 from .gitinfo import (
+    GitStatus,
     discover_agent_project_dir,
     dispatch_webhook,
+    ensure_private_dir,
     extract_test_progress,
     generate_smart_nudge,
     get_git_status,
@@ -72,6 +74,41 @@ from .state import (
 )
 from .web import MonitorWebServer
 
+# ---------------------------------------------------------------------------
+# Tuning constants (previously inline magic numbers in step())
+# ---------------------------------------------------------------------------
+
+# Log-file sniffing cap when extracting test progress from descendant
+# command lines, and the bounded snapshot size exported for dashboards.
+LOG_SNIFF_MAX_BYTES = 20000
+SNAPSHOT_MAX_CHARS = 6000
+# Pause between a mode-switch key and the follow-up continuation text.
+MODE_SWITCH_SLEEP_SECONDS = 0.5
+
+
+@dataclass
+class StepContext:
+    """Per-iteration observation data shared by step handlers.
+
+    Handlers receive one context instead of re-fetching tab state, git
+    status, or process activity; a handler returning a non-None result
+    short-circuits the ordered chain in :meth:`TerminalMonitor.step`.
+    """
+
+    pids: list[int]
+    tab: dict[str, str | bool]
+    history: str
+    snapshot: str
+    safe_snapshot: str
+    digest: str
+    activity: ProcessActivity
+    state: str
+    mode: str | None
+    test_progress: dict[str, Any] | None
+    queued_attempt: dict[str, Any] | None = None
+    git_status: GitStatus = field(default_factory=GitStatus)
+    repository_safety: dict[str, Any] = field(default_factory=dict)
+    stable_for: float = 0.0
 
 class TerminalMonitor:
     """Main monitor engine supporting event callbacks, mode management, and step/run lifecycle."""
@@ -101,11 +138,11 @@ class TerminalMonitor:
                 self.config = replace(self.config, project_dir=discovered)
 
         # Setup state paths with project-level isolation
-        if self.config.state_dir == "/tmp/terminal-monitor":
+        if self.config.state_dir == DEFAULT_STATE_DIR:
             self.state_dir = resolve_project_state_dir(self.config.state_dir, self.config.project_dir)
         else:
             self.state_dir = self.config.state_dir
-        os.makedirs(self.state_dir, exist_ok=True)
+        ensure_private_dir(self.state_dir)
         self.log_path = os.path.join(self.state_dir, "monitor.log")
         self.attention_path = os.path.join(self.state_dir, "attention.txt")
         self.answer_path = os.path.join(self.state_dir, "answer.txt")
@@ -145,7 +182,10 @@ class TerminalMonitor:
         )
         self.policy = PolicyEnvelope(self.task_state.objective, self.task_state.prohibitions)
         self.pr_machine = PullRequestStateMachine()
-        self.pr_machine.stage = self.task_state.last_known_stage
+        try:
+            self.pr_machine.restore(self.task_state.last_known_stage, self.task_state.pr.get("number"))
+        except ValueError:
+            self.pr_machine.restore("TASK_RECEIVED")
         self.attempt_ledger = AttemptLedger(list(self.task_state.attempts), max_records=config.attempt_history_limit)
         self.agent_loop_guard = AgentLoopGuard(config.loop_repeat_limit)
         self.loop_assessment = LoopAssessment()
@@ -263,15 +303,37 @@ class TerminalMonitor:
         _atomic_json_write(self.monitor_meta_path, self._monitor_metadata(lifecycle))
 
     def _claim_monitor_lock(self) -> bool:
-        """Claim one supervisor per state directory, replacing only a stale lock."""
+        """Claim one supervisor per state directory, replacing only a stale lock.
+
+        The happy path is race-free: ``O_CREAT | O_EXCL`` creates the lock
+        atomically, so two monitors starting simultaneously cannot both pass
+        a read-then-write stale check (TOCTOU).  Only when the lock already
+        exists do we fall back to stale-PID recovery via ``os.replace``.
+        """
+        payload = json.dumps({"pid": os.getpid(), "instance_id": self.monitor_instance_id, "started_at": self.monitor_started_at}).encode("utf-8")
         try:
-            existing = json.loads(Path(self.monitor_lock_path).read_text(encoding="utf-8"))
-            existing_pid = existing.get("pid") if isinstance(existing, dict) else None
-            if existing_pid and int(existing_pid) != os.getpid() and pid_is_alive(existing_pid):
+            descriptor = os.open(self.monitor_lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            try:
+                existing = json.loads(Path(self.monitor_lock_path).read_text(encoding="utf-8"))
+                existing_pid = existing.get("pid") if isinstance(existing, dict) else None
+                if existing_pid and int(existing_pid) != os.getpid() and pid_is_alive(existing_pid):
+                    return False
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+            try:
+                descriptor = os.open(self.monitor_lock_path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+            except OSError as exc:
+                self.log(f"LOCK_FAILED error={redact_sensitive(str(exc))}")
                 return False
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except OSError as exc:
+            self.log(f"LOCK_FAILED error={redact_sensitive(str(exc))}")
+            return False
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(payload)
+        except OSError:
             pass
-        _atomic_json_write(self.monitor_lock_path, {"pid": os.getpid(), "instance_id": self.monitor_instance_id, "started_at": self.monitor_started_at})
         self._write_monitor_metadata("running")
         self._lock_claimed = True
         self._lifecycle = "running"
@@ -423,16 +485,10 @@ class TerminalMonitor:
             "Keep this agent session alive. Diagnose the cause, use targeted checks first, and do not relaunch the same full suite until Git or task progress changes."
         )
         payload = self.policy.compose(instruction, self.task_state.last_known_stage)
-        attempt_id = self._queue_attempt("loop_recovery", payload, observed_state)
-        ok, detail = self.backend.send(self.config.process, self.config.title, payload)
-        self._transition_attempt(attempt_id, "sent", detail=detail, observed_state=observed_state)
-        self._transition_attempt(attempt_id, "accepted" if ok else "ignored", detail=detail, observed_state=observed_state)
+        ok, _attempt_id, _detail = self._dispatch("loop_recovery", payload, observed_state)
         if not ok:
             return False, "recovery_prompt_failed"
         self.agent_loop_guard.reset()
-        self.last_send = time.monotonic()
-        self.last_change = time.monotonic()
-        self.sends += 1
         self.last_action = "loop_recovery:accepted"
         return True, f"interrupted={','.join(str(pid) for pid in interrupted)}"
 
@@ -445,7 +501,29 @@ class TerminalMonitor:
         """Idle seconds to wait before acting; actionable prompts act faster."""
         if self.config.idle_seconds == 0.0:
             return 0.0
-        return 4.0 if state in ("permission", "question") else self.config.idle_seconds
+        return self.config.prompt_fast_threshold_seconds if state in ("permission", "question") else self.config.idle_seconds
+
+    def _dispatch(self, reason: str, payload: str, state: str, *, use_key: bool = False) -> tuple[bool, str, str]:
+        """Send a continuation through the single queue->send->ledger path.
+
+        Every outbound instruction (manual answer, nudges, loop recovery,
+        final verification, mode switch, and the main prompt) funnels
+        through here so attempt-ledger, cooldown, and logging semantics are
+        identical everywhere instead of duplicated with drift.
+        """
+        attempt_id = self._queue_attempt(reason, payload, state)
+        if self.config.dry_run:
+            self._transition_attempt(attempt_id, "ignored", detail="dry_run", observed_state=state)
+            return False, attempt_id, "dry_run"
+        send = self.backend.send_key if use_key else self.backend.send
+        ok, detail = send(self.config.process, self.config.title, payload)
+        self._transition_attempt(attempt_id, "sent", detail=detail, observed_state=state)
+        self._transition_attempt(attempt_id, "accepted" if ok else "ignored", detail=detail, observed_state=state)
+        if ok:
+            self.sends += 1
+            self.last_send = self.last_change = time.monotonic()
+        self.log(f"SEND kind={reason} n={self.sends} ok={ok} detail={detail}")
+        return ok, attempt_id, detail
 
     def log(self, message: str) -> None:
         append_log(self.log_path, message)
@@ -487,7 +565,7 @@ class TerminalMonitor:
             "timestamp": now_iso(),
             "web_url": self.web_url,
             "todo": self.todo_progress,
-            "history": {"available": True, "redacted": True, "max_chars": 6000},
+            "history": {"available": True, "redacted": True, "max_chars": SNAPSHOT_MAX_CHARS},
         }
         if extra:
             data.update(extra)
@@ -550,29 +628,37 @@ class TerminalMonitor:
             "tab": safe_tab,
         }
 
-    def step(self) -> tuple[int | None, str]:
-        """Perform a single monitor iteration.
+    def _sniffable_log_paths(self, commands: tuple[str, ...]) -> list[str]:
+        """Return descendant-command log paths that are safe to read.
 
-        Returns (exit_code, status_message).
-        If exit_code is None, the monitor should continue running.
+        Only files resolving inside the monitored project directory or the
+        state directory may be sniffed for test progress: a crafted command
+        line must not make the monitor read arbitrary user-readable files
+        and leak a summary into the public status JSON.
         """
-        if os.path.exists(self.stop_path):
-            self._stop_status("stop_file")
-            return 0, "CANCELLED"
+        allowed: list[Path] = []
+        for root in (self.config.project_dir, self.state_dir):
+            try:
+                allowed.append(Path(root).resolve())
+            except OSError:
+                continue
+        found: list[str] = []
+        seen: set[str] = set()
+        for cmd in commands:
+            for log_file in re.findall(r"(/[^\s'\"]+\.log)", cmd):
+                try:
+                    resolved = Path(log_file).resolve()
+                except OSError:
+                    continue
+                key = str(resolved)
+                inside = any(resolved == root or key.startswith(str(root) + os.sep) for root in allowed)
+                if inside and key not in seen:
+                    seen.add(key)
+                    found.append(log_file)
+        return found
 
-        pids = self.backend.get_pids(self.config.process)
-        if pids:
-            self.last_seen = time.monotonic()
-        elif time.monotonic() - self.last_seen >= self.config.gone_seconds:
-            self._stop_status("agent_gone")
-            return 0, "PROCESS_GONE"
-
-        tab = self._get_tab(pids)
-        if not tab.get("ok"):
-            if self.config.once:
-                return 2, f"MISSING: {tab.get('error')}"
-            return None, "TAB_MISSING"
-
+    def _observe(self, pids: list[int], tab: dict[str, str | bool]) -> StepContext:
+        """Capture tab, activity, classification, and test progress for this iteration."""
         history = str(tab.get("hist", ""))
         snapshot = normalize_snapshot(history)
         safe_snapshot, _ = redact_snapshot(snapshot)
@@ -594,194 +680,219 @@ class TerminalMonitor:
 
         test_progress = extract_test_progress(history)
         if not test_progress and activity.commands:
-            for cmd in activity.commands:
-                for log_file in re.findall(r"(/[^\s'\"]+\.log)", cmd):
-                    if os.path.exists(log_file):
-                        with contextlib.suppress(Exception):
-                            test_progress = extract_test_progress(Path(log_file).read_text(encoding="utf-8", errors="ignore")[-20000:])
-                            if test_progress:
-                                break
-                if test_progress:
-                    break
+            for log_file in self._sniffable_log_paths(activity.commands):
+                if os.path.exists(log_file):
+                    with contextlib.suppress(Exception):
+                        test_progress = extract_test_progress(Path(log_file).read_text(encoding="utf-8", errors="ignore")[-LOG_SNIFF_MAX_BYTES:])
+                        if test_progress:
+                            break
+        return StepContext(
+            pids=pids,
+            tab=tab,
+            history=history,
+            snapshot=snapshot,
+            safe_snapshot=safe_snapshot,
+            digest=digest,
+            activity=activity,
+            state=state,
+            mode=mode,
+            test_progress=test_progress,
+        )
 
-        if mode != self.current_mode:
-            if self.on_mode_change:
-                self.on_mode_change(self.current_mode, mode)
-            self.current_mode = mode
+    def _check_stop_file(self) -> tuple[int, str] | None:
+        if os.path.exists(self.stop_path):
+            self._stop_status("stop_file")
+            return 0, "CANCELLED"
+        return None
 
-        if state != self.current_state:
-            if self.on_state_change:
-                self.on_state_change(self.current_state, state)
-            self.current_state = state
+    def _check_process_gone(self) -> tuple[int, str] | None:
+        pids = self.backend.get_pids(self.config.process)
+        if pids:
+            self.last_seen = time.monotonic()
+            return None
+        if time.monotonic() - self.last_seen >= self.config.gone_seconds:
+            self._stop_status("agent_gone")
+            return 0, "PROCESS_GONE"
+        return None
 
+    def _check_queued_attempts(self, ctx: StepContext) -> tuple[int | None, str] | None:
         queued_attempt = self._stale_queued_attempt()
-        if queued_attempt:
-            if self.config.supervise:
-                self._record_policy_decision(str(queued_attempt.get("attempt_id", "")), "attention", "queued_attempt_stale")
-                Path(self.attention_path).write_text(json.dumps(queued_attempt, indent=2) + "\n" + safe_snapshot + "\n", encoding="utf-8")
-                self.log(f"PAUSE kind=queued_attempt_stale age={queued_attempt['age_seconds']}")
-                self.export_status_json(pids, "queued_attempt_stale", {"queued_attempt": queued_attempt})
-                self._notify("AI Terminal Monitor: Attention Required", "Queued attempt is stale", "attention_required", {"reason": "queued_attempt_stale"})
-                return 3, f"ATTENTION_REQUIRED kind=queued_attempt_stale file={self.attention_path}"
+        if not queued_attempt:
+            latest_attempt = self.attempt_ledger.latest(self.task_state.last_attempt_id or None)
+            if latest_attempt and latest_attempt.get("status") == "queued" and latest_attempt.get("detail") == "terminal reports message queued":
+                return None, "WAITING_QUEUED_ATTEMPT"
+            return None
+        if not self.config.supervise:
             return None, "WAITING_QUEUED_ATTEMPT"
-        latest_attempt = self.attempt_ledger.latest(self.task_state.last_attempt_id or None)
-        if latest_attempt and latest_attempt.get("status") == "queued" and latest_attempt.get("detail") == "terminal reports message queued":
-            return None, "WAITING_QUEUED_ATTEMPT"
+        self._record_policy_decision(str(queued_attempt.get("attempt_id", "")), "attention", "queued_attempt_stale")
+        Path(self.attention_path).write_text(json.dumps(queued_attempt, indent=2) + "\n" + ctx.safe_snapshot + "\n", encoding="utf-8")
+        self.log(f"PAUSE kind=queued_attempt_stale age={queued_attempt['age_seconds']}")
+        self.export_status_json(ctx.pids, "queued_attempt_stale", {"queued_attempt": queued_attempt})
+        self._notify("AI Terminal Monitor: Attention Required", "Queued attempt is stale", "attention_required", {"reason": "queued_attempt_stale"})
+        return 3, f"ATTENTION_REQUIRED kind=queued_attempt_stale file={self.attention_path}"
 
-        if self.config.supervise:
-            reference = str(self.task_state.pr.get("number") or self.task_state.branch or "")
-            pr_snapshot = get_current_pr_snapshot(self.config.project_dir, reference)
-            if pr_snapshot:
-                classifications = [classify_check_result(check) for check in pr_snapshot.get("statusCheckRollup") or []]
-                self._record_ci_events(classifications)
-                prev_stage = self.task_state.last_known_stage
-                stage = self.pr_machine.advance({
-                    "number": pr_snapshot.get("number"),
-                    "state": pr_snapshot.get("state"),
-                    "checks": pr_snapshot.get("statusCheckRollup") or [],
-                })
-                if stage == "PR_CREATED" and prev_stage != "PR_CREATED":
-                    self._notify("AI Terminal Monitor: PR Created", f"PR #{pr_snapshot.get('number')} created", "pr_created", {"pr": pr_snapshot.get("number")})
-                metadata = dict(self.task_state.pr)
-                metadata.update({
-                    "number": pr_snapshot.get("number"),
-                    "head": pr_snapshot.get("headRefOid"),
-                    "checkClassifications": classifications,
-                })
-                if stage == "CI_RETRY_REQUIRED":
-                    retried = retry_infrastructure_checks(self.config.project_dir, pr_snapshot)
-                    if retried:
-                        metadata["retriedRuns"] = retried
-                        stage = "CI_PENDING"
-                self.task_state = replace(self.task_state, last_known_stage=stage, pr=metadata)
-                self.task_state.save(self.task_state_path)
+    def _sync_pr_stage(self, ctx: StepContext) -> tuple[int | None, str] | None:
+        if not self.config.supervise:
+            return None
+        reference = str(self.task_state.pr.get("number") or self.task_state.branch or "")
+        pr_snapshot = get_current_pr_snapshot(self.config.project_dir, reference)
+        if not pr_snapshot:
+            return None
+        classifications = [classify_check_result(check) for check in pr_snapshot.get("statusCheckRollup") or []]
+        self._record_ci_events(classifications)
+        prev_stage = self.task_state.last_known_stage
+        stage = self.pr_machine.advance({
+            "number": pr_snapshot.get("number"),
+            "state": pr_snapshot.get("state"),
+            "checks": pr_snapshot.get("statusCheckRollup") or [],
+        })
+        if stage == "PR_CREATED" and prev_stage != "PR_CREATED":
+            self._notify("AI Terminal Monitor: PR Created", f"PR #{pr_snapshot.get('number')} created", "pr_created", {"pr": pr_snapshot.get("number")})
+        metadata = dict(self.task_state.pr)
+        metadata.update({
+            "number": pr_snapshot.get("number"),
+            "head": pr_snapshot.get("headRefOid"),
+            "checkClassifications": classifications,
+        })
+        if stage == "CI_RETRY_REQUIRED":
+            retried = retry_infrastructure_checks(self.config.project_dir, pr_snapshot)
+            if retried:
+                metadata["retriedRuns"] = retried
+                stage = "CI_PENDING"
+        self.task_state = replace(self.task_state, last_known_stage=stage, pr=metadata)
+        self.task_state.save(self.task_state_path)
+        return None
 
-        git_status = get_git_status(self.config.project_dir)
+    def _refresh_git_context(self, ctx: StepContext) -> tuple[int | None, str] | None:
+        ctx.git_status = get_git_status(self.config.project_dir)
         event_signature = "|".join(
             (
-                state,
-                str(mode or ""),
-                ",".join(str(pid) for pid in pids),
-                ",".join(str(pid) for pid in activity.descendants),
+                ctx.state,
+                str(ctx.mode or ""),
+                ",".join(str(pid) for pid in ctx.pids),
+                ",".join(str(pid) for pid in ctx.activity.descendants),
                 str(self.todo_progress.get("completed", 0)),
                 str(self.todo_progress.get("total", 0)),
-                git_status.head,
-                ",".join(activity.duplicate_commands),
+                ctx.git_status.head,
+                ",".join(ctx.activity.duplicate_commands),
             )
         )
         if event_signature != self.last_event_signature:
             self.last_event_signature = event_signature
             self.log(
-                f"EVENT state={state} mode={mode or 'unknown'} roots={len(pids)} children={len(activity.descendants)} "
-                f"task={self.todo_progress.get('completed', 0)}/{self.todo_progress.get('total', 0)} git={git_status.head[:8] or 'none'}"
+                f"EVENT state={ctx.state} mode={ctx.mode or 'unknown'} roots={len(ctx.pids)} children={len(ctx.activity.descendants)} "
+                f"task={self.todo_progress.get('completed', 0)}/{self.todo_progress.get('total', 0)} git={ctx.git_status.head[:8] or 'none'}"
             )
-        if git_status.branch not in self.config.protected_branches:
+        if ctx.git_status.branch not in self.config.protected_branches:
             self._protected_branch_nudged = False
             if self.task_state.expected_branch in self.config.protected_branches or not self.task_state.expected_branch:
-                self.task_state = replace(self.task_state, expected_branch=git_status.branch, branch=git_status.branch)
+                self.task_state = replace(self.task_state, expected_branch=ctx.git_status.branch, branch=ctx.git_status.branch)
                 self.task_state.save(self.task_state_path)
-                self.log(f"BRANCH_TRACK branch={git_status.branch}")
+                self.log(f"BRANCH_TRACK branch={ctx.git_status.branch}")
+        return None
 
+    def _check_branch_safety(self, ctx: StepContext) -> tuple[int | None, str] | None:
         repository_safety = evaluate_repository_safety(
-            git_status,
+            ctx.git_status,
             expected_branch=self.task_state.expected_branch,
             protected_branches=self.config.protected_branches,
         )
-        if self.config.supervise and not repository_safety["safe"]:
-            reason = str(repository_safety["reason"])
-            if (
-                reason == "protected_branch_dirty"
-                and self.config.smart_nudges
-                and not self._protected_branch_nudged
-                and not (self.config.expected_branch and self.config.expected_branch != git_status.branch)
-            ):
-                self._protected_branch_nudged = True
-                self._protected_branch_nudge_time = time.monotonic()
-                nudge_msg = (
-                    f"Direct changes detected on protected branch '{git_status.branch}'. "
-                    f"Please create and switch to a dedicated feature branch (e.g. 'git checkout -b <feature-name>') "
-                    f"and commit your changes before proceeding."
-                )
-                attempt_id = self._queue_attempt("branch_safety", nudge_msg, state)
-                ok, detail = self.backend.send(self.config.process, self.config.title, nudge_msg)
-                self._transition_attempt(attempt_id, "sent", detail=detail, observed_state=state)
-                self._transition_attempt(attempt_id, "accepted" if ok else "ignored", detail=detail, observed_state=state)
-                self.log(f"NUDGE kind=protected_branch_dirty branch={git_status.branch}")
-                return None, "NUDGE_SENT kind=protected_branch_dirty"
-            if (
-                reason == "protected_branch_dirty"
-                and self._protected_branch_nudged
-                and (time.monotonic() - self._protected_branch_nudge_time < 45.0)
-                and not (self.config.expected_branch and self.config.expected_branch != git_status.branch)
-            ):
-                pass
-            else:
-                self._record_policy_decision(
-                    f"branch={repository_safety.get('branch', '')}",
-                    "attention",
-                    reason,
-                )
-                with open(self.attention_path, "w", encoding="utf-8") as handle:
-                    handle.write(json.dumps(repository_safety, indent=2) + "\n" + safe_snapshot + "\n")
-                self.log(f"PAUSE kind=repository_safety reason={reason}")
-                self.export_status_json(pids, "branch_safety", {"repository_safety": repository_safety})
-                self._notify("AI Terminal Monitor: Attention Required", f"Repository safety violation: {reason}", "attention_required", {"reason": reason})
-                return 3, f"ATTENTION_REQUIRED kind=repository_safety reason={reason} file={self.attention_path}"
+        ctx.repository_safety = repository_safety
+        if not (self.config.supervise and not repository_safety["safe"]):
+            return None
+        reason = str(repository_safety["reason"])
+        if (
+            reason == "protected_branch_dirty"
+            and self.config.smart_nudges
+            and not self._protected_branch_nudged
+            and not (self.config.expected_branch and self.config.expected_branch != ctx.git_status.branch)
+        ):
+            self._protected_branch_nudged = True
+            self._protected_branch_nudge_time = time.monotonic()
+            nudge_msg = (
+                f"Direct changes detected on protected branch '{ctx.git_status.branch}'. "
+                f"Please create and switch to a dedicated feature branch (e.g. 'git checkout -b <feature-name>') "
+                f"and commit your changes before proceeding."
+            )
+            self._dispatch("branch_safety", nudge_msg, ctx.state)
+            self.log(f"NUDGE kind=protected_branch_dirty branch={ctx.git_status.branch}")
+            return None, "NUDGE_SENT kind=protected_branch_dirty"
+        if (
+            reason == "protected_branch_dirty"
+            and self._protected_branch_nudged
+            and (time.monotonic() - self._protected_branch_nudge_time < self.config.protected_branch_nudge_window_seconds)
+            and not (self.config.expected_branch and self.config.expected_branch != ctx.git_status.branch)
+        ):
+            return None
+        self._record_policy_decision(
+            f"branch={repository_safety.get('branch', '')}",
+            "attention",
+            reason,
+        )
+        with open(self.attention_path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(repository_safety, indent=2) + "\n" + ctx.safe_snapshot + "\n")
+        self.log(f"PAUSE kind=repository_safety reason={reason}")
+        self.export_status_json(ctx.pids, "branch_safety", {"repository_safety": repository_safety})
+        self._notify("AI Terminal Monitor: Attention Required", f"Repository safety violation: {reason}", "attention_required", {"reason": reason})
+        return 3, f"ATTENTION_REQUIRED kind=repository_safety reason={reason} file={self.attention_path}"
 
+    def _check_loop_guard(self, ctx: StepContext) -> tuple[int | None, str] | None:
         immediate_assessment = assess_agent_commands(
-            activity.commands,
-            duplicate_commands=activity.duplicate_commands,
+            ctx.activity.commands,
+            duplicate_commands=ctx.activity.duplicate_commands,
             allow_history_rewrite=self.config.allow_history_rewrite,
         )
         progress_fingerprint = f"{self.todo_progress.get('completed', 0)}/{self.todo_progress.get('total', 0)}"
         git_fingerprint = hashlib.sha256(
-            f"{git_status.head}|{git_status.branch}|{git_status.modified_files}|{git_status.untracked_count}".encode("utf-8", "replace")
+            f"{ctx.git_status.head}|{ctx.git_status.branch}|{ctx.git_status.modified_files}|{ctx.git_status.untracked_count}".encode("utf-8", "replace")
         ).hexdigest()[:16]
         repeated_assessment = self.agent_loop_guard.observe(
-            digest,
+            ctx.digest,
             progress_fingerprint,
             git_fingerprint,
-            git_status.head,
-            activity.commands,
-            episode=",".join(str(pid) for pid in activity.direct_descendants),
+            ctx.git_status.head,
+            ctx.activity.commands,
+            episode=",".join(str(pid) for pid in ctx.activity.direct_descendants),
         )
         self.loop_assessment = immediate_assessment if immediate_assessment.detected else repeated_assessment
-        if self.config.supervise and self.config.loop_guard and self.loop_assessment.detected:
-            reason = self.loop_assessment.reason
-            attention = {
-                "kind": "agent_loop",
-                "reason": reason,
-                "evidence": list(self.loop_assessment.evidence),
-                "occurrences": self.loop_assessment.occurrences,
-                "activity": json_safe(activity),
-            }
-            self._record_policy_decision("agent_process_activity", "attention", reason)
-            if reason in {"duplicate_expensive_commands", "repeated_expensive_command_without_progress"}:
-                recovered, recovery_detail = self._recover_agent_loop(pids, activity, state)
-                attention["recovery"] = {"ok": recovered, "detail": recovery_detail, "root_pids_protected": list(pids)}
-                if recovered:
-                    Path(self.attention_path).write_text(json.dumps(attention, indent=2) + "\n", encoding="utf-8")
-                    self.log(f"RECOVER kind=agent_loop reason={reason} {recovery_detail}")
-                    self.export_status_json(pids, "loop_recovered", {"loop_guard": attention})
-                    return None, f"LOOP_RECOVERED reason={reason} {recovery_detail}"
-            Path(self.attention_path).write_text(json.dumps(attention, indent=2) + "\n" + safe_snapshot + "\n", encoding="utf-8")
-            self.log(f"PAUSE kind=agent_loop reason={reason}")
-            self.export_status_json(pids, "agent_loop", {"loop_guard": attention})
-            self._notify("AI Terminal Monitor: Loop Detected", f"Monitored agent loop: {reason}", "attention_required", {"reason": reason})
-            return 3, f"ATTENTION_REQUIRED kind=agent_loop reason={reason} file={self.attention_path}"
+        if not (self.config.supervise and self.config.loop_guard and self.loop_assessment.detected):
+            return None
+        reason = self.loop_assessment.reason
+        attention = {
+            "kind": "agent_loop",
+            "reason": reason,
+            "evidence": list(self.loop_assessment.evidence),
+            "occurrences": self.loop_assessment.occurrences,
+            "activity": json_safe(ctx.activity),
+        }
+        self._record_policy_decision("agent_process_activity", "attention", reason)
+        if reason in {"duplicate_expensive_commands", "repeated_expensive_command_without_progress"}:
+            recovered, recovery_detail = self._recover_agent_loop(ctx.pids, ctx.activity, ctx.state)
+            attention["recovery"] = {"ok": recovered, "detail": recovery_detail, "root_pids_protected": list(ctx.pids)}
+            if recovered:
+                Path(self.attention_path).write_text(json.dumps(attention, indent=2) + "\n", encoding="utf-8")
+                self.log(f"RECOVER kind=agent_loop reason={reason} {recovery_detail}")
+                self.export_status_json(ctx.pids, "loop_recovered", {"loop_guard": attention})
+                return None, f"LOOP_RECOVERED reason={reason} {recovery_detail}"
+        Path(self.attention_path).write_text(json.dumps(attention, indent=2) + "\n" + ctx.safe_snapshot + "\n", encoding="utf-8")
+        self.log(f"PAUSE kind=agent_loop reason={reason}")
+        self.export_status_json(ctx.pids, "agent_loop", {"loop_guard": attention})
+        self._notify("AI Terminal Monitor: Loop Detected", f"Monitored agent loop: {reason}", "attention_required", {"reason": reason})
+        return 3, f"ATTENTION_REQUIRED kind=agent_loop reason={reason} file={self.attention_path}"
 
-        self.export_status_json(pids, state, {
+    def _export_observed_status(self, ctx: StepContext) -> tuple[int | None, str] | None:
+        self.export_status_json(ctx.pids, ctx.state, {
             "activity": {
-                "active": activity.active,
-                "descendants": list(activity.descendants),
-                "direct_descendants": list(activity.direct_descendants),
-                "commands": list(activity.commands),
-                "cpu_percent": activity.cpu_percent,
-                "oldest_seconds": activity.oldest_seconds,
-                "git_changed": activity.git_changed,
-                "duplicate_commands": list(activity.duplicate_commands),
-                "expensive_roots": list(activity.expensive_roots),
-                "test_progress": test_progress,
+                "active": ctx.activity.active,
+                "descendants": list(ctx.activity.descendants),
+                "direct_descendants": list(ctx.activity.direct_descendants),
+                "commands": list(ctx.activity.commands),
+                "cpu_percent": ctx.activity.cpu_percent,
+                "oldest_seconds": ctx.activity.oldest_seconds,
+                "git_changed": ctx.activity.git_changed,
+                "duplicate_commands": list(ctx.activity.duplicate_commands),
+                "expensive_roots": list(ctx.activity.expensive_roots),
+                "test_progress": ctx.test_progress,
             },
             "loop_guard": json_safe(self.loop_assessment),
             "task": {
@@ -791,134 +902,118 @@ class TerminalMonitor:
                 "pr": self.task_state.pr,
                 "npm_publish_allowed": self.task_state.npm_publish_allowed,
             },
-            "repository_safety": repository_safety,
+            "repository_safety": ctx.repository_safety,
         })
+        return None
 
+    def _finish_observation(self, ctx: StepContext) -> tuple[int | None, str] | None:
         if self.config.once:
-            return 0, f"STATE={state} MODE={mode} PID_COUNT={len(pids)}"
-
-        if digest != self.last_digest:
-            self.last_digest = digest
+            return 0, f"STATE={ctx.state} MODE={ctx.mode} PID_COUNT={len(ctx.pids)}"
+        if ctx.digest != self.last_digest:
+            self.last_digest = ctx.digest
             self.last_change = time.monotonic()
+        ctx.stable_for = time.monotonic() - self.last_change
+        return None
 
-        stable_for = time.monotonic() - self.last_change
-
+    def _handle_manual_answer(self, ctx: StepContext) -> tuple[int | None, str] | None:
         # A human/operator answer is an explicit instruction and therefore
         # outranks inferred UI state, spinner text, thresholds, and cooldowns.
         manual_answer = consume_manual_answer(self.answer_path)
-        if manual_answer:
-            allowed, policy_reason = self.policy.authorize_action(
-                manual_answer,
-                unsafe_phrases=tuple(dict.fromkeys([*UNSAFE_PHRASES, *self.config.unsafe_phrases])),
-                npm_publish_allowed=self.task_state.npm_publish_allowed,
-            )
-            if not allowed:
-                self._record_policy_decision(manual_answer, "blocked", policy_reason)
-                with open(self.attention_path, "w", encoding="utf-8") as handle:
-                    handle.write(safe_snapshot + "\n")
-                self.log(f"PAUSE kind=policy_conflict reason={policy_reason}")
-                return 3, f"ATTENTION_REQUIRED kind=policy_conflict file={self.attention_path}"
-            attempt_id = self._queue_attempt("manual", manual_answer, state)
-            if self.config.dry_run:
-                self._transition_attempt(attempt_id, "ignored", detail="dry_run", observed_state=state)
-                return 0, f"DRY_RUN kind=manual payload={manual_answer}"
-            ok, detail = self.backend.send(self.config.process, self.config.title, manual_answer)
-            self._transition_attempt(attempt_id, "sent", detail=detail, observed_state=state)
-            self._transition_attempt(attempt_id, "accepted" if ok else "ignored", detail=detail, observed_state=state)
-            self.export_status_json(pids, state, {"last_attempt_id": attempt_id})
-            self.sends += 1
-            self.last_send = time.monotonic()
-            self.last_change = time.monotonic()
-            self.last_action = f"send:manual:{'accepted' if ok else 'failed'}"
-            self.session_tracker.mark_interaction(history)
-            self.task_state = replace(
-                self.task_state,
-                session_generation=self.session_tracker.generation,
-                interaction_marker=self.session_tracker.interaction_history,
-            )
-            self.task_state.save(self.task_state_path)
-            self.log(f"SEND kind=manual n={self.sends} ok={ok} detail={detail}")
-            if self.on_send:
-                self.on_send("manual", manual_answer, ok)
-            return (None, f"SENT kind=manual n={self.sends}") if ok else (1, f"SEND_FAILED kind=manual n={self.sends}")
+        if not manual_answer:
+            return None
+        allowed, policy_reason = self.policy.authorize_action(
+            manual_answer,
+            unsafe_phrases=tuple(dict.fromkeys([*UNSAFE_PHRASES, *self.config.unsafe_phrases])),
+            npm_publish_allowed=self.task_state.npm_publish_allowed,
+        )
+        if not allowed:
+            self._record_policy_decision(manual_answer, "blocked", policy_reason)
+            with open(self.attention_path, "w", encoding="utf-8") as handle:
+                handle.write(ctx.safe_snapshot + "\n")
+            self.log(f"PAUSE kind=policy_conflict reason={policy_reason}")
+            return 3, f"ATTENTION_REQUIRED kind=policy_conflict file={self.attention_path}"
+        ok, attempt_id, detail = self._dispatch("manual", manual_answer, ctx.state)
+        if detail == "dry_run":
+            return 0, f"DRY_RUN kind=manual payload={manual_answer}"
+        self.export_status_json(ctx.pids, ctx.state, {"last_attempt_id": attempt_id})
+        self.last_action = f"send:manual:{'accepted' if ok else 'failed'}"
+        self.session_tracker.mark_interaction(ctx.history)
+        self.task_state = replace(
+            self.task_state,
+            session_generation=self.session_tracker.generation,
+            interaction_marker=self.session_tracker.interaction_history,
+        )
+        self.task_state.save(self.task_state_path)
+        if self.on_send:
+            self.on_send("manual", manual_answer, ok)
+        return (None, f"SENT kind=manual n={self.sends}") if ok else (1, f"SEND_FAILED kind=manual n={self.sends}")
 
-        # Handle Completion State
-        if state == "completed" and self.config.completion_check:
-            merge_required = self.config.supervise and self.task_state.required_outcome.lower() == "merged"
-            if merge_required and self.task_state.last_known_stage != "POST_MERGE_VERIFY":
-                self.log(f"WAIT completion_text_before_required_stage stage={self.task_state.last_known_stage}")
-                return None, f"WAITING_FOR_REQUIRED_OUTCOME stage={self.task_state.last_known_stage}"
-            if merge_required:
-                report = evaluate_final_state(collect_final_evidence(self.config.project_dir, self.task_state))
-                if not report.ok:
-                    if time.monotonic() - self.last_send < self.config.cooldown_seconds:
-                        return None, "WAITING_FINAL_VERIFICATION"
-                    instruction = "Resolve the remaining final-verification checks: " + ", ".join(report.failures)
-                    payload = self.policy.compose(instruction, "POST_MERGE_VERIFY")
-                    attempt_id = self._queue_attempt("final_verification", payload, state)
-                    if self.config.dry_run:
-                        self._transition_attempt(attempt_id, "ignored", detail="dry_run", observed_state=state)
-                        return 0, "DRY_RUN kind=final_verification"
-                    ok, detail = self.backend.send(self.config.process, self.config.title, payload)
-                    self._transition_attempt(attempt_id, "sent", detail=detail, observed_state=state)
-                    self._transition_attempt(attempt_id, "accepted" if ok else "ignored", detail=detail, observed_state=state)
-                    self.last_send = time.monotonic()
-                    self.sends += 1
-                    self.last_action = f"send:final_verification:{'accepted' if ok else 'failed'}"
-                    self.log(f"SEND kind=final_verification n={self.sends} ok={ok} detail={detail}")
-                    return (None, "SENT kind=final_verification") if ok else (1, "SEND_FAILED kind=final_verification")
-            self.log("SUCCESS: Completion indicators detected. Work complete.")
-            if self.config.supervise:
-                evidence = collect_final_evidence(self.config.project_dir, self.task_state)
-                write_final_report(self.report_path, self.task_state, evidence, FinalVerificationReport(True, {"completion_detected": True}, ()))
-            if self.on_complete:
-                self.on_complete(snapshot)
-            self.export_status_json(pids, "completed", {"done": True})
-            return 0, "COMPLETED"
+    def _handle_completion(self, ctx: StepContext) -> tuple[int | None, str] | None:
+        if ctx.state != "completed" or not self.config.completion_check:
+            return None
+        merge_required = self.config.supervise and self.task_state.required_outcome.lower() == "merged"
+        if merge_required and self.task_state.last_known_stage != "POST_MERGE_VERIFY":
+            self.log(f"WAIT completion_text_before_required_stage stage={self.task_state.last_known_stage}")
+            return None, f"WAITING_FOR_REQUIRED_OUTCOME stage={self.task_state.last_known_stage}"
+        if merge_required:
+            report = evaluate_final_state(collect_final_evidence(self.config.project_dir, self.task_state))
+            if not report.ok:
+                if time.monotonic() - self.last_send < self.config.cooldown_seconds:
+                    return None, "WAITING_FINAL_VERIFICATION"
+                instruction = "Resolve the remaining final-verification checks: " + ", ".join(report.failures)
+                payload = self.policy.compose(instruction, "POST_MERGE_VERIFY")
+                ok, _attempt_id, detail = self._dispatch("final_verification", payload, ctx.state)
+                if detail == "dry_run":
+                    return 0, "DRY_RUN kind=final_verification"
+                self.last_action = f"send:final_verification:{'accepted' if ok else 'failed'}"
+                return (None, "SENT kind=final_verification") if ok else (1, "SEND_FAILED kind=final_verification")
+        self.log("SUCCESS: Completion indicators detected. Work complete.")
+        if self.config.supervise:
+            evidence = collect_final_evidence(self.config.project_dir, self.task_state)
+            write_final_report(self.report_path, self.task_state, evidence, FinalVerificationReport(True, {"completion_detected": True}, ()))
+        if self.on_complete:
+            self.on_complete(ctx.snapshot)
+        self.export_status_json(ctx.pids, "completed", {"done": True})
+        return 0, "COMPLETED"
 
-        threshold = self._effective_threshold(state)
-
-        if state == "thinking" or stable_for < threshold:
+    def _handle_wait_threshold(self, ctx: StepContext) -> tuple[int | None, str] | None:
+        threshold = self._effective_threshold(ctx.state)
+        if ctx.state == "thinking" or ctx.stable_for < threshold:
             if self.on_tick:
-                self.on_tick(state, len(pids))
-            return None, f"WAITING state={state} stable_for={stable_for:.1f}"
-
+                self.on_tick(ctx.state, len(ctx.pids))
+            return None, f"WAITING state={ctx.state} stable_for={ctx.stable_for:.1f}"
         if time.monotonic() - self.last_send < self.config.cooldown_seconds:
             return None, "COOLDOWN"
+        return None
 
+    def _handle_mode_switch(self, ctx: StepContext) -> tuple[int | None, str] | None:
         mode_threshold = self._effective_threshold("permission")
-        # Handle Plan Mode Auto-Transition
-        if self.config.auto_switch_modes and mode == "plan" and self.profile.is_plan_ready(history) and stable_for >= mode_threshold:
-            self.log("MODE: Plan completed. Auto-switching mode via switch key.")
-            self.last_action = "mode_switch:queued"
-            attempt_id = self._queue_attempt("mode_switch", self.profile.mode_switch_key, state)
-            if self.config.dry_run:
-                self._transition_attempt(attempt_id, "ignored", detail="dry_run", observed_state=state)
-                self._record_policy_decision("mode_switch", "ignored", "dry_run")
-                return 0, "DRY_RUN kind=mode_switch"
-            ok, detail = self.backend.send_key(self.config.process, self.config.title, self.profile.mode_switch_key)
-            self._transition_attempt(attempt_id, "sent", detail=detail, observed_state=state)
-            self._transition_attempt(attempt_id, "accepted" if ok else "ignored", detail=detail, observed_state=state)
-            self.last_send = time.monotonic()
-            self.last_change = time.monotonic()
-            self.last_action = "mode_switch:accepted" if ok else "mode_switch:failed"
-            if self.config.continue_text:
-                time.sleep(0.5)
-                self.backend.send(self.config.process, self.config.title, self.config.continue_text)
-            return None, "MODE_SWITCH_SENT"
+        if not (self.config.auto_switch_modes and ctx.mode == "plan" and self.profile.is_plan_ready(ctx.history) and ctx.stable_for >= mode_threshold):
+            return None
+        self.log("MODE: Plan completed. Auto-switching mode via switch key.")
+        self.last_action = "mode_switch:queued"
+        ok, _attempt_id, detail = self._dispatch("mode_switch", self.profile.mode_switch_key, ctx.state, use_key=True)
+        if detail == "dry_run":
+            self._record_policy_decision("mode_switch", "ignored", "dry_run")
+            return 0, "DRY_RUN kind=mode_switch"
+        self.last_action = "mode_switch:accepted" if ok else "mode_switch:failed"
+        if self.config.continue_text:
+            time.sleep(MODE_SWITCH_SLEEP_SECONDS)
+            self.backend.send(self.config.process, self.config.title, self.config.continue_text)
+        return None, "MODE_SWITCH_SENT"
 
+    def _handle_prompt_decision(self, ctx: StepContext) -> tuple[int | None, str] | None:
         payload: str | None = self.config.continue_text
         reason = "idle"
 
-        if state == "permission":
+        if ctx.state == "permission":
             payload = self.profile.auto_permission_payload if self.config.auto_allow_permissions else None
             reason = "permission"
-        elif state == "question":
-            payload = decide_question(history, self.profile)
+        elif ctx.state == "question":
+            payload = decide_question(ctx.history, self.profile)
             reason = "question"
-        elif state == "idle" and self.config.smart_nudges:
-            git_info = get_git_status(self.config.project_dir)
-            payload = generate_smart_nudge(git_info, self.config.continue_text)
+        elif ctx.state == "idle" and self.config.smart_nudges:
+            payload = generate_smart_nudge(ctx.git_status, self.config.continue_text)
             reason = "smart_nudge"
 
         if payload and (self.policy.objective or self.policy.prohibitions):
@@ -931,10 +1026,10 @@ class TerminalMonitor:
 
         if payload is None:
             with open(self.attention_path, "w", encoding="utf-8") as handle:
-                handle.write(safe_snapshot + "\n")
+                handle.write(ctx.safe_snapshot + "\n")
             if self.on_attention:
-                self.on_attention(reason, safe_snapshot)
-            self.log(f"PAUSE kind={reason} hash={digest}")
+                self.on_attention(reason, ctx.safe_snapshot)
+            self.log(f"PAUSE kind={reason} hash={ctx.digest}")
             return 3, f"ATTENTION_REQUIRED kind={reason} file={self.attention_path}"
 
         allowed, policy_reason = self.policy.authorize_action(
@@ -945,26 +1040,17 @@ class TerminalMonitor:
         if not allowed:
             self._record_policy_decision(payload, "blocked", policy_reason)
             with open(self.attention_path, "w", encoding="utf-8") as handle:
-                handle.write(safe_snapshot + "\n")
+                handle.write(ctx.safe_snapshot + "\n")
             self.log(f"PAUSE kind=policy_conflict reason={policy_reason}")
             return 3, f"ATTENTION_REQUIRED kind=policy_conflict file={self.attention_path}"
 
-        attempt_id = self._queue_attempt(reason, payload, state)
-
-        if self.config.dry_run:
-            self._transition_attempt(attempt_id, "ignored", detail="dry_run", observed_state=state)
+        ok, attempt_id, detail = self._dispatch(reason, payload, ctx.state)
+        if detail == "dry_run":
             return 0, f"DRY_RUN kind={reason} payload={payload or '<enter>'}"
-
-        ok, detail = self.backend.send(self.config.process, self.config.title, payload)
-        self._transition_attempt(attempt_id, "sent", detail=detail, observed_state=state)
-        self._transition_attempt(attempt_id, "accepted" if ok else "ignored", detail=detail, observed_state=state)
-        self.export_status_json(pids, state, {"last_attempt_id": attempt_id})
-        self.sends += 1
-        self.last_send = time.monotonic()
+        self.export_status_json(ctx.pids, ctx.state, {"last_attempt_id": attempt_id})
         self.last_action = f"send:{reason}:{'accepted' if ok else 'failed'}"
-        self.log(f"SEND kind={reason} n={self.sends} ok={ok} detail={detail}")
         if ok:
-            self.session_tracker.mark_interaction(history)
+            self.session_tracker.mark_interaction(ctx.history)
             self.task_state = replace(
                 self.task_state,
                 session_generation=self.session_tracker.generation,
@@ -983,6 +1069,66 @@ class TerminalMonitor:
 
         return None, f"SENT kind={reason} n={self.sends}"
 
+    def step(self) -> tuple[int | None, str]:
+        """Perform a single monitor iteration.
+
+        Returns (exit_code, status_message).
+        If exit_code is None, the monitor should continue running.
+
+        The iteration is an ordered chain of focused handlers over one
+        shared :class:`StepContext`; the first non-None handler result
+        short-circuits the chain.
+        """
+        early = self._check_stop_file()
+        if early is not None:
+            return early
+        early = self._check_process_gone()
+        if early is not None:
+            return early
+
+        pids = self.backend.get_pids(self.config.process)
+        if pids:
+            self.last_seen = time.monotonic()
+        elif time.monotonic() - self.last_seen >= self.config.gone_seconds:
+            self._stop_status("agent_gone")
+            return 0, "PROCESS_GONE"
+
+        tab = self._get_tab(pids)
+        if not tab.get("ok"):
+            if self.config.once:
+                return 2, f"MISSING: {tab.get('error')}"
+            return None, "TAB_MISSING"
+
+        ctx = self._observe(pids, tab)
+
+        if ctx.mode != self.current_mode:
+            if self.on_mode_change:
+                self.on_mode_change(self.current_mode, ctx.mode)
+            self.current_mode = ctx.mode
+
+        if ctx.state != self.current_state:
+            if self.on_state_change:
+                self.on_state_change(self.current_state, ctx.state)
+            self.current_state = ctx.state
+
+        for handler in (
+            self._check_queued_attempts,
+            self._sync_pr_stage,
+            self._refresh_git_context,
+            self._check_branch_safety,
+            self._check_loop_guard,
+            self._export_observed_status,
+            self._finish_observation,
+            self._handle_manual_answer,
+            self._handle_completion,
+            self._handle_wait_threshold,
+            self._handle_mode_switch,
+            self._handle_prompt_decision,
+        ):
+            result = handler(ctx)
+            if result is not None:
+                return result
+        return None, "CONTINUE"
     def run(self) -> int:
         """Run monitor loop continuously until exit condition is met."""
         if not self._claim_monitor_lock():

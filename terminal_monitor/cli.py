@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -12,7 +13,7 @@ from typing import Any
 
 from . import __version__
 from .backends import get_backend, validate_web_port
-from .config import MonitorConfig, discover_config_file, generate_starter_config, load_config_file
+from .config import DEFAULT_STATE_DIR, MonitorConfig, discover_config_file, generate_starter_config, load_config_file
 from .github import (
     _parent_pid,
     build_restart_command,
@@ -27,7 +28,7 @@ from .monitor import TerminalMonitor
 from .processes import _children_pids, interrupt_process_tree
 from .profiles import list_profiles
 from .safety import UNSAFE_PHRASES, PolicyEnvelope
-from .state import StateFileError, TaskState, json_safe
+from .state import StateFileError, TaskState, enable_debug_log, json_safe
 from .status import read_status_snapshot, render_status_dashboard, resume_monitor, stop_monitor
 
 
@@ -122,7 +123,7 @@ def _add_monitor_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--backend", "-b", choices=["auto", "terminal", "iterm2", "tmux"], default=None, help="Terminal backend")
     parser.add_argument("--project-dir", "-d", default=None, help="Project directory for config discovery and git status")
     parser.add_argument("--config", default=None, help="Explicit configuration file path")
-    parser.add_argument("--state-dir", default=None, help="Directory for state/logs (default: /tmp/terminal-monitor)")
+    parser.add_argument("--state-dir", default=None, help="Directory for state/logs (default: ~/.cache/terminal-monitor, per-project subdirectory)")
     parser.add_argument("--unsafe-phrase", action="append", dest="unsafe_phrases", help="Add custom unsafe phrases")
     parser.add_argument("--objective", default=None, help="Permanent task objective included with every nudge")
     parser.add_argument("--prohibition", action="append", dest="prohibitions", help="Permanent instruction that dynamic nudges cannot override")
@@ -144,6 +145,9 @@ def _add_monitor_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-desktop-notifications", action="store_true", help="Disable native desktop notifications")
     parser.add_argument("--webhook-url", default=None, help="Webhook URL for event dispatch (Slack, Discord, custom)")
     parser.add_argument("--loop-interrupt-wait-seconds", type=float, default=None, help="Seconds to wait for a loop child tree to stop")
+    parser.add_argument("--prompt-fast-threshold-seconds", type=float, default=None, help="Idle seconds before acting on permission/question prompts (default: 4.0s)")
+    parser.add_argument("--protected-branch-nudge-window-seconds", type=float, default=None, help="Seconds a protected-branch nudge suppresses further attention pauses (default: 45.0s)")
+    parser.add_argument("--debug-log", default=None, help="Path that receives records of deliberately suppressed exceptions (or set TERMINAL_MONITOR_DEBUG=1)")
     parser.add_argument("--once", action="store_true", default=False, help="Inspect status once and exit")
     parser.add_argument("--dry-run", action="store_true", default=False, help="Simulate actions without sending keystrokes")
 
@@ -195,8 +199,8 @@ def config_from_args(args: argparse.Namespace) -> MonitorConfig:
     file_prohibitions = _string_values(file_cfg.get("prohibitions", []))
     merged_prohibitions = list(dict.fromkeys([*file_prohibitions, *cli_prohibitions]))
 
-    raw_state_dir = str(_val(getattr(args, "state_dir", None), "state_dir", "/tmp/terminal-monitor"))
-    resolved_state_dir = resolve_project_state_dir(raw_state_dir, str(project_dir)) if raw_state_dir == "/tmp/terminal-monitor" else raw_state_dir
+    raw_state_dir = str(_val(getattr(args, "state_dir", None), "state_dir", DEFAULT_STATE_DIR))
+    resolved_state_dir = resolve_project_state_dir(raw_state_dir, str(project_dir)) if raw_state_dir == DEFAULT_STATE_DIR else raw_state_dir
 
     return MonitorConfig(
         process=process,
@@ -242,6 +246,9 @@ def config_from_args(args: argparse.Namespace) -> MonitorConfig:
         loop_interrupt_wait_seconds=max(0.0, float(_val(getattr(args, "loop_interrupt_wait_seconds", None), "loop_interrupt_wait_seconds", 2.0))),
         desktop_notifications=not getattr(args, "no_desktop_notifications", False) and bool(file_cfg.get("desktop_notifications", True)),
         webhook_url=str(_val(getattr(args, "webhook_url", None), "webhook_url", "")),
+        prompt_fast_threshold_seconds=max(0.0, float(_val(getattr(args, "prompt_fast_threshold_seconds", None), "prompt_fast_threshold_seconds", 4.0))),
+        protected_branch_nudge_window_seconds=max(0.0, float(_val(getattr(args, "protected_branch_nudge_window_seconds", None), "protected_branch_nudge_window_seconds", 45.0))),
+        debug_log_path=getattr(args, "debug_log", None) or file_cfg.get("debug_log_path"),
     )
 
 
@@ -249,6 +256,12 @@ def main() -> int:
     """CLI entrypoint."""
     parser = build_parser()
     args = parser.parse_args()
+
+    debug_log_path = getattr(args, "debug_log", None)
+    if debug_log_path:
+        enable_debug_log(debug_log_path)
+    elif os.environ.get("TERMINAL_MONITOR_DEBUG", "").strip() not in ("", "0"):
+        enable_debug_log(os.path.join(DEFAULT_STATE_DIR, "debug.log"))
 
     # Handle init subcommand
     if args.command == "init":

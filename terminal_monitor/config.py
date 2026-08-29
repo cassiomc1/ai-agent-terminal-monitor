@@ -16,6 +16,12 @@ except ImportError:  # pragma: no cover
         tomllib = None
 from .safety import UNSAFE_PHRASES
 
+# Per-user default state root: private by construction (item: state-directory
+# permissions).  The historical default was the world-shared /tmp/terminal-monitor;
+# that path is still honored when passed explicitly, but project scoping and
+# 0o700 hardening now apply to this default root.
+DEFAULT_STATE_DIR = str(Path.home() / ".cache" / "terminal-monitor")
+
 
 @dataclass
 class MonitorConfig:
@@ -34,7 +40,7 @@ class MonitorConfig:
     auto_allow_permissions: bool = False
     once: bool = False
     dry_run: bool = False
-    state_dir: str = "/tmp/terminal-monitor"
+    state_dir: str = DEFAULT_STATE_DIR
     backend: str = "auto"
     project_dir: str = "."
     unsafe_phrases: list[str] = field(default_factory=lambda: list(UNSAFE_PHRASES))
@@ -65,7 +71,11 @@ class MonitorConfig:
     loop_interrupt_wait_seconds: float = 2.0
     desktop_notifications: bool = True
     webhook_url: str = ""
+    # Tunable policy windows (previously inline magic numbers).
+    prompt_fast_threshold_seconds: float = 4.0
+    protected_branch_nudge_window_seconds: float = 45.0
     launch_command: tuple[str, ...] = ()
+    debug_log_path: str | None = None
 CONFIG_FILENAMES = (
     ".terminal-monitor.json",
     ".terminal-monitor.toml",

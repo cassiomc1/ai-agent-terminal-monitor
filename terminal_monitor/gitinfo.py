@@ -18,7 +18,7 @@ from typing import Any
 
 from .backends import run_command
 from .safety import redact_sensitive
-from .state import json_safe, now_iso
+from .state import debug_swallow, json_safe, now_iso
 
 
 @dataclass
@@ -62,9 +62,30 @@ def discover_agent_project_dir(pids: list[int] | tuple[int, ...] | set[int]) -> 
                 resolved = str(proc_cwd.resolve())
                 if os.path.isdir(resolved):
                     return resolved
-        except Exception:
+        except Exception as exc:
+            debug_swallow("discover_agent_project_dir", exc)
             continue
     return None
+
+
+def ensure_private_dir(path: str | Path) -> Path:
+    """Create (or harden) a state directory so only the current user can use it.
+
+    ``answer.txt`` is a command-injection channel and ``status.json`` /
+    ``terminal-snapshot.txt`` are readable operational data, so state
+    directories must never be group/world accessible.  The owner check fails
+    closed against a pre-created attacker-owned directory in a shared /tmp.
+    """
+    target = Path(path)
+    target.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(target, 0o700)
+    try:
+        if target.stat().st_uid != os.getuid():
+            raise PermissionError(f"State directory {target} is owned by another user; refusing to use it")
+    except FileNotFoundError:
+        pass
+    return target
 
 
 def resolve_project_state_dir(base_state_dir: str, project_dir: str) -> str:
@@ -75,8 +96,7 @@ def resolve_project_state_dir(base_state_dir: str, project_dir: str) -> str:
         resolved_proj = str(project_dir)
     proj_hash = hashlib.sha256(resolved_proj.encode("utf-8")).hexdigest()[:10]
     proj_name = Path(resolved_proj).name or "project"
-    scoped_dir = Path(base_state_dir, f"{proj_name}-{proj_hash}")
-    scoped_dir.mkdir(parents=True, exist_ok=True)
+    scoped_dir = ensure_private_dir(Path(base_state_dir, f"{proj_name}-{proj_hash}"))
     return str(scoped_dir)
 
 
@@ -99,8 +119,8 @@ def send_desktop_notification(title: str, message: str) -> bool:
                 stderr=subprocess.DEVNULL,
             )
             return True
-    except Exception:
-        pass
+    except Exception as exc:
+        debug_swallow("send_desktop_notification", exc)
     return False
 
 
@@ -119,8 +139,8 @@ def dispatch_webhook(webhook_url: str, event_type: str, payload: dict[str, Any])
             )
             with urllib.request.urlopen(req, timeout=4.0):
                 pass
-        except Exception:
-            pass
+        except Exception as exc:
+            debug_swallow("dispatch_webhook", exc)
 
     threading.Thread(target=_post, name="terminal-monitor-webhook", daemon=True).start()
     return True
@@ -154,30 +174,89 @@ def extract_test_progress(log_text: str) -> dict[str, Any] | None:
 
 
 GIT_STATUS_TTL_SECONDS = 30.0
+# ``gh pr list`` is a network call; caching it independently keeps the hot
+# poll loop from hitting the GitHub API every few seconds (rate limits).
+OPEN_PRS_TTL_SECONDS = 60.0
 _GIT_STATUS_CACHE: dict[str, tuple[float, GitStatus]] = {}
+_OPEN_PRS_CACHE: dict[str, tuple[float, int]] = {}
+# Thread-safety: the monitor loop and web-server threads may both refresh;
+# dict assignment is atomic in CPython but check-then-set is not, and the
+# duplicated refresh would double the git subprocess fan-out.
+_GIT_STATUS_LOCK = threading.Lock()
+_OPEN_PRS_LOCK = threading.Lock()
 
 
 def get_git_status(repo_dir: str = ".", ttl_seconds: float = GIT_STATUS_TTL_SECONDS) -> GitStatus:
-    """Cached wrapper around :func:`_get_git_status_uncached` with a TTL per repository."""
+    """Cached wrapper around :func:`_get_local_git_fields` with a TTL per repository.
+
+    Local ``git`` data uses ``ttl_seconds``; the network-backed open-PR count
+    uses its own, longer TTL so supervision refreshes never rate-limit the
+    GitHub API.
+    """
     try:
         key = str(Path(repo_dir).resolve())
     except OSError:
         key = repo_dir
     now = time.monotonic()
-    cached = _GIT_STATUS_CACHE.get(key)
-    if cached is not None and now - cached[0] < ttl_seconds:
-        return cached[1]
-    status = _get_git_status_uncached(repo_dir)
-    _GIT_STATUS_CACHE[key] = (now, status)
+    with _GIT_STATUS_LOCK:
+        cached = _GIT_STATUS_CACHE.get(key)
+        if cached is not None and now - cached[0] < ttl_seconds:
+            return cached[1]
+    fields = _get_local_git_fields(repo_dir)
+    if fields is None:
+        status = GitStatus(is_repo=False)
+    else:
+        branch, head, dirty, modified, untracked, modified_files, last_commit = fields
+        open_prs = _get_open_pr_count(repo_dir)
+        status = GitStatus(
+            is_repo=True,
+            branch=branch,
+            head=head,
+            dirty=dirty,
+            modified_count=modified,
+            untracked_count=untracked,
+            modified_files=modified_files,
+            commits_ahead=0,
+            open_prs_count=open_prs,
+            last_commit=last_commit,
+            summary=f"branch={branch} dirty={dirty} mod={modified} untracked={untracked} prs={open_prs}",
+        )
+    with _GIT_STATUS_LOCK:
+        _GIT_STATUS_CACHE[key] = (now, status)
     return status
 
 
-def _get_git_status_uncached(repo_dir: str = ".") -> GitStatus:
-    """Inspect git repository status safely without mutating workspace."""
+def _get_open_pr_count(repo_dir: str) -> int:
+    """Fetch the open-PR count with its own network TTL cache."""
+    if not shutil.which("gh"):
+        return 0
+    try:
+        key = str(Path(repo_dir).resolve())
+    except OSError:
+        key = repo_dir
+    now = time.monotonic()
+    with _OPEN_PRS_LOCK:
+        cached = _OPEN_PRS_CACHE.get(key)
+        if cached is not None and now - cached[0] < OPEN_PRS_TTL_SECONDS:
+            return cached[1]
+        gh_code, gh_out, _ = run_command(["gh", "pr", "list", "--state", "open", "--json", "number"], cwd=repo_dir)
+        open_prs = 0
+        if gh_code == 0:
+            with contextlib.suppress(Exception):
+                open_prs = len(json.loads(gh_out))
+        _OPEN_PRS_CACHE[key] = (now, open_prs)
+        return open_prs
+
+
+def _get_local_git_fields(repo_dir: str) -> tuple[str, str, bool, int, int, tuple[str, ...], str] | None:
+    """Inspect local git state safely without mutating the workspace.
+
+    Returns ``None`` when the directory is not inside a git work tree.
+    """
     try:
         code, out, _ = run_command(["git", "rev-parse", "--is-inside-work-tree"], cwd=repo_dir)
         if code != 0 or "true" not in out:
-            return GitStatus(is_repo=False)
+            return None
 
         branch_code, branch_out, _ = run_command(["git", "branch", "--show-current"], cwd=repo_dir)
         branch = branch_out.strip() if branch_code == 0 else ""
@@ -194,15 +273,20 @@ def _get_git_status_uncached(repo_dir: str = ".") -> GitStatus:
 
         log_code, log_out, _ = run_command(["git", "log", "-n", "1", "--oneline"], cwd=repo_dir)
         last_commit = log_out.strip() if log_code == 0 else ""
+        return (branch, head, dirty, modified, untracked, modified_files, last_commit)
+    except Exception as exc:
+        debug_swallow("_get_local_git_fields", exc)
+        return None
 
-        open_prs = 0
-        if shutil.which("gh"):
-            gh_code, gh_out, _ = run_command(["gh", "pr", "list", "--state", "open", "--json", "number"], cwd=repo_dir)
-            if gh_code == 0:
-                with contextlib.suppress(Exception):
-                    open_prs = len(json.loads(gh_out))
 
-        summary = f"branch={branch} dirty={dirty} mod={modified} untracked={untracked} prs={open_prs}"
+def _get_git_status_uncached(repo_dir: str = ".") -> GitStatus:
+    """Uncached snapshot; kept for callers that must bypass both TTL caches."""
+    try:
+        code, out, _ = run_command(["git", "rev-parse", "--is-inside-work-tree"], cwd=repo_dir)
+        if code != 0 or "true" not in out:
+            return GitStatus(is_repo=False)
+        branch, head, dirty, modified, untracked, modified_files, last_commit = _get_local_git_fields(repo_dir)
+        open_prs = _get_open_pr_count(repo_dir)
         return GitStatus(
             is_repo=True,
             branch=branch,
@@ -214,7 +298,7 @@ def _get_git_status_uncached(repo_dir: str = ".") -> GitStatus:
             commits_ahead=0,
             open_prs_count=open_prs,
             last_commit=last_commit,
-            summary=summary,
+            summary=f"branch={branch} dirty={dirty} mod={modified} untracked={untracked} prs={open_prs}",
         )
     except Exception:
         return GitStatus(is_repo=False)

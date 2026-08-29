@@ -41,6 +41,18 @@ class MockBackend(terminal_monitor.BaseTerminalBackend):
         return self.pids
 
 
+def web_json(server, path, *, method="GET", data=None, token=True, headers=None, timeout=5):
+    """Authenticated urllib helper for MonitorWebServer tests."""
+    if not path.startswith("/"):
+        path = "/" + path
+    url = f"http://127.0.0.1:{server.port}{path}"
+    final_headers = dict(headers or {})
+    if token:
+        final_headers["X-Monitor-Token"] = server.token
+    req = urllib.request.Request(url, data=data, headers=final_headers, method=method)
+    return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
+
+
 class MonitorBehaviorTests(unittest.TestCase):
     def test_classifies_permission_over_thinking_markers(self):
         history = "Preparing write... esc to cancel\nAllow once / Deny"
@@ -625,15 +637,14 @@ class RobustnessTests(unittest.TestCase):
 
     def test_git_status_cache_respects_ttl(self):
         calls = []
-        fake_status = terminal_monitor.GitStatus(is_repo=True, branch="cached-branch")
 
         def fake_uncached(repo_dir="."):
             calls.append(repo_dir)
-            return fake_status
+            return ("cached-branch", "", False, 0, 0, (), "")
 
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
-            terminal_monitor.gitinfo, "_get_git_status_uncached", side_effect=fake_uncached
-        ):
+            terminal_monitor.gitinfo, "_get_local_git_fields", side_effect=fake_uncached
+        ), mock.patch.object(terminal_monitor.gitinfo, "_get_open_pr_count", return_value=0):
             first = terminal_monitor.get_git_status(directory, ttl_seconds=60.0)
             second = terminal_monitor.get_git_status(directory, ttl_seconds=60.0)
             self.assertEqual(len(calls), 1)
@@ -641,6 +652,28 @@ class RobustnessTests(unittest.TestCase):
             refreshed = terminal_monitor.get_git_status(directory, ttl_seconds=0.0)
             self.assertEqual(len(calls), 2)
             self.assertEqual(refreshed.branch, "cached-branch")
+
+    def test_open_pr_count_uses_independent_longer_cache(self):
+        gh_calls = []
+
+        def fake_run_command(cmd, cwd=None):
+            if cmd[:2] == ["gh", "pr"]:
+                gh_calls.append(tuple(cmd))
+                return (0, json.dumps([{"number": 1}, {"number": 2}, {"number": 3}]), "")
+            return (0, "", "")
+
+        # ttl_seconds=0.0 forces the local git refresh every call, but the
+        # network-backed open-PR count must keep its own longer cache.
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            terminal_monitor.gitinfo, "_get_local_git_fields", return_value=("main", "a" * 40, False, 0, 0, (), "")
+        ), mock.patch("shutil.which", return_value="/usr/bin/gh"), mock.patch.object(
+            terminal_monitor.gitinfo, "run_command", side_effect=fake_run_command
+        ):
+            first = terminal_monitor.get_git_status(directory, ttl_seconds=0.0)
+            second = terminal_monitor.get_git_status(directory, ttl_seconds=0.0)
+            self.assertEqual(len(gh_calls), 1)
+            self.assertEqual(first.open_prs_count, 3)
+            self.assertEqual(second.open_prs_count, 3)
 
 
     def test_unsafe_phrases_merge_file_and_cli(self):
@@ -1338,12 +1371,15 @@ class SupervisorV2Tests(unittest.TestCase):
             url = server.start()
             try:
                 html = urllib.request.urlopen(url, timeout=2).read().decode()
-                events = json.loads(urllib.request.urlopen(url + "api/events", timeout=2).read())
-                terminal = json.loads(urllib.request.urlopen(url + "api/terminal", timeout=2).read())
+                css = urllib.request.urlopen(url + "app.css", timeout=2).read().decode()
+                events = web_json(server, "api/events", timeout=2)
+                terminal = web_json(server, "api/terminal", timeout=2)
             finally:
                 server.stop()
             self.assertIn("AGENT // CENTER", html)
-            self.assertIn("#fe6e00", html)
+            self.assertIn(server.token, html)
+            self.assertIn(server.csp_nonce, html)
+            self.assertIn("#fe6e00", css)
             self.assertIn("AGENT TERMINAL SNAPSHOT (REDACTED)", html)
             self.assertIn("/api/terminal", html)
             self.assertIn('data-view="process"', html)
@@ -1373,7 +1409,7 @@ class SupervisorV2Tests(unittest.TestCase):
             server = terminal_monitor.MonitorWebServer(str(status_path), str(pathlib.Path(directory, "monitor.log")), port=0)
             url = server.start()
             try:
-                payload = json.loads(urllib.request.urlopen(url + "api/status", timeout=2).read())
+                payload = web_json(server, "api/status", timeout=2)
             finally:
                 server.stop()
         rendered = json.dumps(payload)
@@ -1390,7 +1426,7 @@ class SupervisorV2Tests(unittest.TestCase):
             server = terminal_monitor.MonitorWebServer(str(status_path), str(pathlib.Path(directory, "monitor.log")), port=0)
             url = server.start()
             try:
-                payload = json.loads(urllib.request.urlopen(url + "api/status", timeout=2).read())
+                payload = web_json(server, "api/status", timeout=2)
             finally:
                 server.stop()
         self.assertEqual(payload, {"state": "starting", "pids": []})
@@ -1576,7 +1612,7 @@ class SupervisorV2Tests(unittest.TestCase):
                 req = urllib.request.Request(
                     url + "api/send",
                     data=json.dumps({"action": "answer", "payload": "yes"}).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
+                    headers={"Content-Type": "application/json", "X-Monitor-Token": server.token},
                 )
                 resp = json.loads(urllib.request.urlopen(req, timeout=2).read())
                 self.assertTrue(resp["ok"])
@@ -1586,7 +1622,7 @@ class SupervisorV2Tests(unittest.TestCase):
                 req_key = urllib.request.Request(
                     url + "api/send",
                     data=json.dumps({"action": "key", "key": "tab"}).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
+                    headers={"Content-Type": "application/json", "X-Monitor-Token": server.token},
                 )
                 resp_key = json.loads(urllib.request.urlopen(req_key, timeout=2).read())
                 self.assertTrue(resp_key["ok"])
@@ -1680,8 +1716,7 @@ class SupervisorV2Tests(unittest.TestCase):
             server = terminal_monitor.MonitorWebServer(str(status_path), str(log_path), port=0)
             url = server.start()
             try:
-                req = urllib.request.Request(url + "api/instances")
-                resp = json.loads(urllib.request.urlopen(req, timeout=2).read())
+                resp = web_json(server, "api/instances", timeout=2)
                 self.assertIn("instances", resp)
                 self.assertIsInstance(resp["instances"], list)
             finally:
@@ -1691,7 +1726,13 @@ class SupervisorV2Tests(unittest.TestCase):
         parser = terminal_monitor.build_parser()
         args = parser.parse_args(["status", "--project-dir", "/tmp/my-test-proj"])
         cfg = terminal_monitor.config_from_args(args)
-        self.assertIn("/tmp/terminal-monitor/my-test-proj-", cfg.state_dir)
+        expected_root = str(pathlib.Path.home() / ".cache" / "terminal-monitor")
+        self.assertTrue(
+            cfg.state_dir.startswith(expected_root + "/my-test-proj-"),
+            f"expected per-user scoped state dir, got {cfg.state_dir}",
+        )
+        self.assertTrue(pathlib.Path(cfg.state_dir).is_dir())
+        self.assertEqual(oct(pathlib.Path(cfg.state_dir).stat().st_mode & 0o777), "0o700")
 
     def test_pr_state_machine_instances_are_isolated(self):
         first = terminal_monitor.PullRequestStateMachine()
@@ -1704,9 +1745,17 @@ class SupervisorV2Tests(unittest.TestCase):
 
     def test_pr_state_machine_stage_restored_from_persisted_state(self):
         machine = terminal_monitor.PullRequestStateMachine()
-        machine.stage = "CI_GREEN"
-        machine.seen_pr_number = 9
+        machine.restore("CI_GREEN", 9)
         self.assertEqual(machine.advance({"number": 9, "state": "OPEN", "checks": [{"conclusion": "success"}]}), "CI_GREEN")
+
+    def test_pr_state_machine_restore_rejects_unknown_stage(self):
+        machine = terminal_monitor.PullRequestStateMachine()
+        with self.assertRaises(ValueError):
+            machine.restore("NOT_A_STAGE")
+        machine.restore("CI_PENDING")
+        self.assertEqual(machine.stage, "CI_PENDING")
+        with self.assertRaises(AttributeError):
+            machine.stage = "MERGED"  # type: ignore[misc]
 
     def test_web_server_instances_api_uses_configured_state_root(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1722,7 +1771,7 @@ class SupervisorV2Tests(unittest.TestCase):
             server = terminal_monitor.MonitorWebServer(str(status_path), str(log_path), port=0, state_root=str(root))
             url = server.start()
             try:
-                resp = json.loads(urllib.request.urlopen(url + "api/instances", timeout=2).read())
+                resp = web_json(server, "api/instances", timeout=2)
             finally:
                 server.stop()
             self.assertEqual(len(resp["instances"]), 1)
@@ -1742,7 +1791,7 @@ class SupervisorV2Tests(unittest.TestCase):
                 req = urllib.request.Request(
                     url + "api/send",
                     data=json.dumps({"action": "answer", "payload": "x" * (terminal_monitor.WEB_POST_BODY_LIMIT_BYTES + 1)}).encode(),
-                    headers={"Content-Type": "application/json"},
+                    headers={"Content-Type": "application/json", "X-Monitor-Token": server.token},
                 )
                 try:
                     urllib.request.urlopen(req, timeout=2)
