@@ -206,6 +206,6 @@
     <circle cx="94" cy="0" r="4" fill="#fe6e00"/><text class="legend" x="106" y="4">decision</text>
     <circle cx="188" cy="0" r="4" fill="#fb4b55"/><text class="legend" x="200" y="4">safety stop</text>
     <circle cx="306" cy="0" r="4" fill="#50e3a4"/><text class="legend" x="318" y="4">evidence</text>
-    <text class="legend" x="1090" y="4">v1 · local monitor</text>
+    <text class="legend" x="1090" y="4">v1.1 · local monitor</text>
   </g>
 </svg>

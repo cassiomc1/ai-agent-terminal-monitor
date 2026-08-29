@@ -117,7 +117,7 @@ The continuous monitor owns a localhost-only web server with a visual system ins
 - **Privacy & Safety Projections:** The JSON projection intentionally masks credentials, prompts, attempt payloads, configured prohibitions, and policy actions while serving status safely over HTTP.
 
 ### 15. Supervisor Intelligence & State Isolation
-- **Project-Level State Isolation:** Automatically scopes monitor state, logs, and artifacts per project in `/tmp/terminal-monitor/<project-name>-<hash>/`.
+- **Project-Level State Isolation:** Automatically scopes monitor state, logs, and artifacts per project in `~/.cache/terminal-monitor/<project-name>-<hash>/` (per-user and private by construction; an explicit `--state-dir`, including the historical `/tmp/terminal-monitor`, is still honored).
 - **Automatic CWD Discovery:** Automatically resolves the target agent process directory via `lsof` or `/proc` when `--project-dir` is not explicitly passed.
 - **Smart Protected Branch Nudges:** Rather than crashing or halting when `main` has uncommitted changes, automatically sends a guidance nudge instructing the agent to create a feature branch before enforcing repository safety gates.
 - **Task Title Reconciliation:** Expands truncated TUI checklist labels into full task descriptions discovered in planning blocks throughout the terminal history.
