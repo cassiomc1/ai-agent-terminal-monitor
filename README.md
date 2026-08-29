@@ -144,6 +144,9 @@ python3 terminal_monitor.py resume --state-dir /tmp/terminal-monitor --project-d
 ### 7. Operational control commands
 
 ```bash
+# List built-in and discovered agent profiles
+python3 terminal_monitor.py profiles
+
 # Explicit operator message; this also outranks a visible "thinking" spinner
 python3 terminal_monitor.py send "Resume the remaining work" --profile opencode
 
@@ -183,6 +186,7 @@ The HTTP surface supports real-time Server-Sent Events (SSE) streaming and manua
 | `/api/stream` | `GET` | Real-time Server-Sent Events (SSE) stream for instant, low-latency UI updates |
 | `/api/send` | `POST` | Dispatches operator answers, continuation prompts, smart nudges, or mode switch keystrokes (`Tab`) |
 | `/api/status` | `GET` | Safe projection of state, Git, task progress, CI stage and attempt status |
+| `/api/instances` | `GET` | Active supervisor sessions discovered under the state root for the instance switcher |
 | `/api/events` | `GET` | Last 400 event lines with credentials and free-form payloads redacted |
 | `/api/terminal` | `GET` | Last bounded terminal snapshot after credential masking |
 
@@ -499,8 +503,6 @@ failure requiring a fix.
   instance parsing) instead of failing open silently.
 - `terminal_monitor.py --version` prints the running release (currently `1.1.0`,
   matching `pyproject.toml`).
-- `terminal_monitor.py --version` prints the running release (currently `1.1.0`,
-  matching `pyproject.toml`).
 - `PullRequestStateMachine` now keeps its stage and last-seen PR number per
   instance; embedding multiple monitors in one process no longer shares PR
   lifecycle state between them.
@@ -559,6 +561,7 @@ still works through a thin compatibility shim (one release cycle), but prefer
 
 ```
 terminal_monitor/
+├── types.py       # TypedDict boundaries for dict-shaped payloads
 ├── safety.py      # safety rules, redaction, PolicyEnvelope
 ├── state.py       # TaskState, AttemptLedger, atomic writes, logging
 ├── backends.py    # Terminal.app / iTerm2 / tmux backends
