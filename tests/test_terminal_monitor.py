@@ -1,4 +1,4 @@
-import importlib.util
+import importlib
 import json
 import pathlib
 import subprocess
@@ -10,11 +10,9 @@ import urllib.error
 import urllib.request
 from unittest import mock
 
-MODULE_PATH = pathlib.Path(__file__).parents[1] / "terminal_monitor.py"
-SPEC = importlib.util.spec_from_file_location("terminal_monitor", MODULE_PATH)
-terminal_monitor = importlib.util.module_from_spec(SPEC)
-sys.modules["terminal_monitor"] = terminal_monitor
-SPEC.loader.exec_module(terminal_monitor)
+REPO_ROOT = pathlib.Path(__file__).parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+terminal_monitor = importlib.import_module("terminal_monitor")
 
 
 class MockBackend(terminal_monitor.BaseTerminalBackend):
@@ -445,7 +443,7 @@ class TmuxBackendTests(unittest.TestCase):
         )
         backend = terminal_monitor.TmuxBackend()
         with mock.patch("shutil.which", return_value="/usr/bin/tmux"), mock.patch.object(
-            terminal_monitor, "run_command", return_value=(0, panes, "")
+            terminal_monitor.backends, "run_command", return_value=(0, panes, "")
         ):
             self.assertEqual(backend._find_target("opencode"), "session:0.1")
             self.assertEqual(backend._find_target("vim", title="main"), "session:0.0")
@@ -634,7 +632,7 @@ class RobustnessTests(unittest.TestCase):
             return fake_status
 
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
-            terminal_monitor, "_get_git_status_uncached", side_effect=fake_uncached
+            terminal_monitor.gitinfo, "_get_git_status_uncached", side_effect=fake_uncached
         ):
             first = terminal_monitor.get_git_status(directory, ttl_seconds=60.0)
             second = terminal_monitor.get_git_status(directory, ttl_seconds=60.0)
@@ -740,7 +738,7 @@ class SupervisorV2Tests(unittest.TestCase):
             "statusCheckRollup": [{"name": "tests", "conclusion": "success"}],
         }
         with mock.patch.object(
-            terminal_monitor,
+            terminal_monitor.github,
             "run_command",
             return_value=(0, json.dumps(pr), ""),
         ) as run:
@@ -750,7 +748,7 @@ class SupervisorV2Tests(unittest.TestCase):
 
         pr["headRefOid"] = "b" * 40
         with mock.patch.object(
-            terminal_monitor,
+            terminal_monitor.github,
             "run_command",
             return_value=(0, json.dumps(pr), ""),
         ):
@@ -767,7 +765,7 @@ class SupervisorV2Tests(unittest.TestCase):
             "statusCheckRollup": [{"name": "tests", "conclusion": "success"}],
         }
         with mock.patch.object(
-            terminal_monitor,
+            terminal_monitor.github,
             "run_command",
             side_effect=[(0, json.dumps(pr), ""), (0, "merged", "")],
         ) as run:
@@ -780,7 +778,7 @@ class SupervisorV2Tests(unittest.TestCase):
     def test_merge_gate_treats_already_merged_pr_as_completed(self):
         head = "d" * 40
         pr = {"number": 9, "state": "MERGED", "headRefOid": head, "statusCheckRollup": []}
-        with mock.patch.object(terminal_monitor, "run_command", return_value=(0, json.dumps(pr), "")):
+        with mock.patch.object(terminal_monitor.github, "run_command", return_value=(0, json.dumps(pr), "")):
             result = terminal_monitor.merge_pull_request(".", 9, head)
         self.assertTrue(result["ok"])
         self.assertTrue(result["merged"])
@@ -793,19 +791,19 @@ class SupervisorV2Tests(unittest.TestCase):
                 {"name": "code-job", "conclusion": "failure", "detailsUrl": "https://github.com/x/actions/runs/222"},
             ]
         }
-        with mock.patch.object(terminal_monitor, "run_command", return_value=(0, "", "")) as run:
+        with mock.patch.object(terminal_monitor.github, "run_command", return_value=(0, "", "")) as run:
             retried = terminal_monitor.retry_infrastructure_checks(".", pr)
         self.assertEqual(retried, [111])
         self.assertEqual(run.call_args.args[0], ["gh", "run", "rerun", "111", "--failed"])
 
     def test_dry_run_merge_never_calls_github(self):
-        with mock.patch.object(terminal_monitor, "run_command") as run:
+        with mock.patch.object(terminal_monitor.github, "run_command") as run:
             result = terminal_monitor.merge_pull_request(".", 7, "a" * 40, dry_run=True)
         self.assertTrue(result["dry_run"])
         run.assert_not_called()
 
     def test_merge_gate_rejects_non_full_head_sha(self):
-        with mock.patch.object(terminal_monitor, "run_command") as run:
+        with mock.patch.object(terminal_monitor.github, "run_command") as run:
             result = terminal_monitor.verify_merge_gate(".", 7, "abc123")
         self.assertFalse(result["ok"])
         self.assertEqual(result["reason"], "invalid_expected_head")
@@ -992,8 +990,8 @@ class SupervisorV2Tests(unittest.TestCase):
             monitor._transition_attempt(attempt_id, "queued", detail="terminal reports message queued", observed_state="thinking")
             monitor.attempt_ledger.records[-1]["monotonic"] = 1.0
             with mock.patch.object(terminal_monitor.time, "monotonic", return_value=10.0), mock.patch.object(
-                terminal_monitor, "get_git_status", return_value=terminal_monitor.GitStatus()
-            ), mock.patch.object(terminal_monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()):
+                terminal_monitor.monitor, "get_git_status", return_value=terminal_monitor.GitStatus()
+            ), mock.patch.object(terminal_monitor.monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()):
                 code, message = monitor.step()
         self.assertEqual(code, 3)
         self.assertIn("queued_attempt_stale", message)
@@ -1093,10 +1091,10 @@ class SupervisorV2Tests(unittest.TestCase):
                 expected_branch="codex/work",
                 state_dir=directory,
             )
-            with mock.patch.object(terminal_monitor, "get_git_status", return_value=dirty_main), mock.patch.object(
-                terminal_monitor, "capture_safety_baseline", return_value={"safetyBaselineCaptured": True}
-            ), mock.patch.object(terminal_monitor, "get_current_pr_snapshot", return_value=None), mock.patch.object(
-                terminal_monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()
+            with mock.patch.object(terminal_monitor.monitor, "get_git_status", return_value=dirty_main), mock.patch.object(
+                terminal_monitor.monitor, "capture_safety_baseline", return_value={"safetyBaselineCaptured": True}
+            ), mock.patch.object(terminal_monitor.monitor, "get_current_pr_snapshot", return_value=None), mock.patch.object(
+                terminal_monitor.monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()
             ):
                 monitor = terminal_monitor.TerminalMonitor(config, backend=backend)
                 code, message = monitor.step()
@@ -1114,10 +1112,10 @@ class SupervisorV2Tests(unittest.TestCase):
                 supervise=True,
                 state_dir=directory,
             )
-            with mock.patch.object(terminal_monitor, "get_git_status", side_effect=[feature, switched, switched]), mock.patch.object(
-                terminal_monitor, "capture_safety_baseline", return_value={"safetyBaselineCaptured": True}
-            ), mock.patch.object(terminal_monitor, "get_current_pr_snapshot", return_value=None), mock.patch.object(
-                terminal_monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()
+            with mock.patch.object(terminal_monitor.monitor, "get_git_status", side_effect=[feature, switched, switched]), mock.patch.object(
+                terminal_monitor.monitor, "capture_safety_baseline", return_value={"safetyBaselineCaptured": True}
+            ), mock.patch.object(terminal_monitor.monitor, "get_current_pr_snapshot", return_value=None), mock.patch.object(
+                terminal_monitor.monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()
             ):
                 monitor = terminal_monitor.TerminalMonitor(config, backend=backend)
                 code, message = monitor.step()
@@ -1140,14 +1138,14 @@ class SupervisorV2Tests(unittest.TestCase):
 
     def test_persistent_idle_helper_is_not_mistaken_for_active_command(self):
         ps_output = "200 100 02:00:00 0.0 typescript-language-server --stdio"
-        with mock.patch.object(terminal_monitor, "run_command", return_value=(0, ps_output, "")):
+        with mock.patch.object(terminal_monitor.processes, "run_command", return_value=(0, ps_output, "")):
             activity = terminal_monitor.collect_process_activity([100])
         self.assertFalse(activity.active)
         self.assertEqual(activity.descendants, (200,))
 
     def test_long_running_test_command_counts_as_activity_even_when_cpu_is_quiet(self):
         ps_output = "200 100 15:00 0.0 python3 -m unittest discover -s tests"
-        with mock.patch.object(terminal_monitor, "run_command", return_value=(0, ps_output, "")):
+        with mock.patch.object(terminal_monitor.processes, "run_command", return_value=(0, ps_output, "")):
             activity = terminal_monitor.collect_process_activity([100])
         self.assertTrue(activity.active)
 
@@ -1157,7 +1155,7 @@ class SupervisorV2Tests(unittest.TestCase):
             "201 100 00:09 0.0 npm test",
             "210 200 00:08 0.0 node scripts/run-tests.js",
         ])
-        with mock.patch.object(terminal_monitor, "run_command", return_value=(0, ps_output, "")):
+        with mock.patch.object(terminal_monitor.processes, "run_command", return_value=(0, ps_output, "")):
             activity = terminal_monitor.collect_process_activity([100])
         self.assertEqual(activity.direct_descendants, (200, 201))
         self.assertEqual(activity.duplicate_commands, ("full-test-suite",))
@@ -1192,10 +1190,10 @@ class SupervisorV2Tests(unittest.TestCase):
                 idle_seconds=999,
             )
             clean_git = terminal_monitor.GitStatus(is_repo=True, branch="codex/work")
-            with mock.patch.object(terminal_monitor, "capture_safety_baseline", return_value={"safetyBaselineCaptured": True}), mock.patch.object(
-                terminal_monitor, "get_current_pr_snapshot", return_value=None
-            ), mock.patch.object(terminal_monitor, "get_git_status", return_value=clean_git), mock.patch.object(
-                terminal_monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()
+            with mock.patch.object(terminal_monitor.monitor, "capture_safety_baseline", return_value={"safetyBaselineCaptured": True}), mock.patch.object(
+                terminal_monitor.monitor, "get_current_pr_snapshot", return_value=None
+            ), mock.patch.object(terminal_monitor.monitor, "get_git_status", return_value=clean_git), mock.patch.object(
+                terminal_monitor.monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()
             ):
                 monitor = terminal_monitor.TerminalMonitor(config, backend=backend)
                 code, message = monitor.step()
@@ -1299,8 +1297,8 @@ class SupervisorV2Tests(unittest.TestCase):
             )
             monitor.loop_assessment = terminal_monitor.LoopAssessment(True, "repeated_expensive_command_without_progress", ("full-test-suite",), 3)
             activity = terminal_monitor.ProcessActivity(expensive_roots=(200,), direct_descendants=(200,), commands=("npm test",))
-            with mock.patch.object(terminal_monitor, "interrupt_process_tree", return_value=True) as interrupt, mock.patch.object(
-                terminal_monitor, "process_is_running", return_value=False
+            with mock.patch.object(terminal_monitor.monitor, "interrupt_process_tree", return_value=True) as interrupt, mock.patch.object(
+                terminal_monitor.monitor, "process_is_running", return_value=False
             ):
                 recovered, detail = monitor._recover_agent_loop([100], activity, "thinking")
             self.assertTrue(recovered)
@@ -1318,8 +1316,8 @@ class SupervisorV2Tests(unittest.TestCase):
             )
             monitor.loop_assessment = terminal_monitor.LoopAssessment(True, "repeated_expensive_command_without_progress", ("full-test-suite",), 3)
             activity = terminal_monitor.ProcessActivity(expensive_roots=(200, 210), descendants=(200, 210), direct_descendants=(200, 210), commands=("npm test",))
-            with mock.patch.object(terminal_monitor, "interrupt_process_tree", return_value=True) as interrupt, mock.patch.object(
-                terminal_monitor, "process_is_running", return_value=True
+            with mock.patch.object(terminal_monitor.monitor, "interrupt_process_tree", return_value=True) as interrupt, mock.patch.object(
+                terminal_monitor.monitor, "process_is_running", return_value=True
             ):
                 recovered, detail = monitor._recover_agent_loop([100], activity, "thinking")
             self.assertFalse(recovered)
@@ -1452,7 +1450,7 @@ class SupervisorV2Tests(unittest.TestCase):
             ("git", "tag", "--list"): (0, "", ""),
             ("pgrep", "-af", "(?:^|/)(?:npm|pnpm|yarn)(?:\\s|$)"): (1, "", ""),
         }
-        with mock.patch.object(terminal_monitor, "run_command", side_effect=lambda cmd, cwd=None: commands.get(tuple(cmd), (1, "", ""))), mock.patch(
+        with mock.patch.object(terminal_monitor.github, "run_command", side_effect=lambda cmd, cwd=None: commands.get(tuple(cmd), (1, "", ""))), mock.patch(
             "shutil.which", return_value=None
         ):
             evidence = terminal_monitor.collect_final_evidence(".", state)
@@ -1473,7 +1471,7 @@ class SupervisorV2Tests(unittest.TestCase):
             ),
         }
         with mock.patch.object(
-            terminal_monitor,
+            terminal_monitor.github,
             "run_command",
             side_effect=lambda cmd, cwd=None: commands.get(tuple(cmd), (1, "", "")),
         ), mock.patch("shutil.which", return_value=None):
@@ -1514,8 +1512,8 @@ class SupervisorV2Tests(unittest.TestCase):
         self.assertEqual(parser.parse_args(["resume"]).command, "resume")
 
     def test_stop_monitor_does_not_signal_unverified_agent_pid(self):
-        with tempfile.TemporaryDirectory() as directory, mock.patch.object(terminal_monitor, "pid_is_alive", return_value=False), mock.patch.object(
-            terminal_monitor, "_monitor_process_matches", return_value=False
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(terminal_monitor.status, "pid_is_alive", return_value=False), mock.patch.object(
+            terminal_monitor.status, "_monitor_process_matches", return_value=False
         ), mock.patch.object(terminal_monitor.os, "kill") as kill:
             pathlib.Path(directory, "status.json").write_text(json.dumps({"running": True, "monitor_pid": 123}), encoding="utf-8")
             result = terminal_monitor.stop_monitor(directory)
@@ -1552,10 +1550,10 @@ class SupervisorV2Tests(unittest.TestCase):
                 expected_branch="",
                 state_dir=directory,
             )
-            with mock.patch.object(terminal_monitor, "get_git_status", return_value=dirty_main), mock.patch.object(
-                terminal_monitor, "capture_safety_baseline", return_value={"safetyBaselineCaptured": True}
-            ), mock.patch.object(terminal_monitor, "get_current_pr_snapshot", return_value=None), mock.patch.object(
-                terminal_monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()
+            with mock.patch.object(terminal_monitor.monitor, "get_git_status", return_value=dirty_main), mock.patch.object(
+                terminal_monitor.monitor, "capture_safety_baseline", return_value={"safetyBaselineCaptured": True}
+            ), mock.patch.object(terminal_monitor.monitor, "get_current_pr_snapshot", return_value=None), mock.patch.object(
+                terminal_monitor.monitor, "collect_process_activity", return_value=terminal_monitor.ProcessActivity()
             ):
                 monitor = terminal_monitor.TerminalMonitor(config, backend=backend)
                 code, message = monitor.step()
@@ -1758,7 +1756,7 @@ class SupervisorV2Tests(unittest.TestCase):
 
     def test_version_flag_reports_package_version(self):
         result = subprocess.run(
-            [sys.executable, str(MODULE_PATH), "--version"],
+            [sys.executable, str(REPO_ROOT / "terminal_monitor.py"), "--version"],
             capture_output=True,
             text=True,
             check=False,
