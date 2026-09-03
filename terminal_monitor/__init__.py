@@ -23,10 +23,16 @@ from . import cli as cli
 from . import config as config
 from . import github as github
 from . import gitinfo as gitinfo
+from . import managed_pty as managed_pty
 from . import monitor as monitor
 from . import processes as processes
 from . import profiles as profiles
+from . import remote as remote
+from . import replay as replay
 from . import safety as safety
+from . import session_host as session_host
+from . import session_protocol as session_protocol
+from . import shell_online as shell_online
 from . import state as state
 from . import status as status
 from . import types as types
@@ -116,6 +122,12 @@ from .gitinfo import (  # noqa: F401
     resolve_project_state_dir,
     send_desktop_notification,
 )
+from .managed_pty import (  # noqa: F401
+    ManagedPTYBackend,
+    ManagedSessionClient,
+    ManagedSessionStatus,
+    managed_session_is_reconnectable,
+)
 from .monitor import TerminalMonitor
 from .processes import (  # noqa: F401
     EXPENSIVE_COMMAND_PATTERNS,
@@ -140,6 +152,8 @@ from .profiles import (  # noqa: F401
     get_profile,
     list_profiles,
 )
+from .remote import RemoteProvider, RemoteShare  # noqa: F401
+from .replay import ReplayBuffer
 from .safety import (  # noqa: F401
     DEFAULT_PREFERRED_ANSWERS,
     HIGH_RISK_ACTION_MARKERS,
@@ -154,6 +168,16 @@ from .safety import (  # noqa: F401
     is_unsafe,
     redact_sensitive,
 )
+from .session_host import SessionHost, SessionHostConfig
+from .session_protocol import (  # noqa: F401
+    MAX_CONTROL_MESSAGE_BYTES,
+    PROTOCOL_VERSION,
+    SessionProtocolError,
+    encode_message,
+    receive_message,
+    send_message,
+)
+from .shell_online import ShellOnlineLaunchResult, ShellOnlineProvider  # noqa: F401
 from .state import (  # noqa: F401
     ATTEMPT_STATUSES,
     AttemptLedger,
@@ -202,12 +226,21 @@ __all__ = [
     "GitStatus",
     "ITerm2Backend",
     "LoopAssessment",
+    "ManagedPTYBackend",
+    "ManagedSessionClient",
+    "ManagedSessionStatus",
     "MonitorConfig",
     "MonitorWebServer",
     "PolicyEnvelope",
     "ProcessActivity",
     "PullRequestStateMachine",
+    "RemoteShare",
+    "ReplayBuffer",
+    "SessionHost",
+    "SessionHostConfig",
+    "SessionProtocolError",
     "SessionTracker",
+    "ShellOnlineProvider",
     "StateFileError",
     "TaskState",
     "TerminalAppBackend",
