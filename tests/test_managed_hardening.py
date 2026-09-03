@@ -480,24 +480,65 @@ class DrainTests(ManagedTestBase):
         Many small writes overflow the per-viewer item queue. Dropping the
         viewer there truncated the stream mid-frame with no exit event; the
         backlog is coalesced instead, so the tail survives.
+
+        The child stays alive while the viewer is idle, so the assertion
+        measures backlog delivery only. Racing it against host teardown made
+        the test depend on draining within ``FINAL_FLUSH_SECONDS`` of session
+        end, which a loaded runner cannot guarantee: teardown is deliberately
+        bounded so a wedged viewer cannot keep the host alive.
         """
+        from terminal_monitor.session_protocol import FramedReader
+
         child = (
             sys.executable,
             "-u",
             "-c",
-            "import sys; print('READY', flush=True); sys.stdin.readline(); "
+            "import sys,time; print('READY', flush=True); sys.stdin.readline(); "
             "[print(f'row{i}', flush=True) for i in range(4000)]; "
-            "print('TAIL_MARKER', flush=True)",
+            "print('TAIL_MARKER', flush=True); time.sleep(60)",
         )
         tmp = self._state_dir()
         client = ManagedSessionClient.start(state_dir=tmp, command=child, cwd=tmp)
         self.addCleanup(self._cleanup_client, client, tmp)
         self.assertTrue(_wait_for(lambda: b"READY" in client.snapshot(), timeout=10.0))
         token = pathlib.Path(tmp, "session-token").read_text(encoding="utf-8").strip()
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(30.0)
+        self.addCleanup(sock.close)
+        sock.connect(str(pathlib.Path(tmp, "session-control.sock")))
+        send_message(sock, {"version": PROTOCOL_VERSION, "token": token, "op": "stream"})
         # Start the burst only once the viewer is attached, then read nothing
-        # for long enough that the per-viewer queue overflows.
-        data = self._collect_stream(tmp, token, delay=1.5, after_connect=lambda: client.send_bytes(b"go\n"))
-        self.assertIn(b"TAIL_MARKER", data)
+        # for long enough that the per-viewer item queue overflows.
+        client.send_bytes(b"go\n")
+        time.sleep(1.5)
+        reader = FramedReader(sock)
+        collected = bytearray()
+        self.assertEqual(reader.read_message().get("event"), "snapshot_start")
+        while True:
+            event = reader.read_message()
+            kind = event.get("event")
+            if kind == "snapshot_chunk":
+                collected += base64.b64decode(event["data_b64"].encode("ascii"))
+                continue
+            self.assertEqual(kind, "snapshot_end")
+            break
+        deadline = time.monotonic() + 30.0
+        while b"TAIL_MARKER" not in collected and time.monotonic() < deadline:
+            event = reader.read_message()
+            if event.get("event") != "output":
+                break
+            collected += base64.b64decode(event["data_b64"].encode("ascii"))
+        self.assertIn(b"TAIL_MARKER", collected, "coalesced backlog must keep the tail")
+        # The same viewer still receives a deterministic exit event; it is
+        # caught up now, so delivery does not depend on teardown timing.
+        client.terminate_session()
+        exit_deadline = time.monotonic() + 30.0
+        exit_event = None
+        while exit_event is None and time.monotonic() < exit_deadline:
+            event = reader.read_message()
+            if event.get("event") == "exit":
+                exit_event = event
+        self.assertIsNotNone(exit_event, "a stream viewer must observe the exit event")
 
     def test_large_final_burst_drains(self):
         child = (
