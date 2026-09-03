@@ -1923,6 +1923,127 @@ class SupervisorV2Tests(unittest.TestCase):
         self.assertNotIn("\nversion = \"1.", pyproject_text)
 
 
+class BackendCapabilityTests(unittest.TestCase):
+    def test_existing_backends_do_not_own_process(self):
+        self.assertFalse(terminal_monitor.TerminalAppBackend().owns_process)
+        self.assertFalse(terminal_monitor.ITerm2Backend().owns_process)
+        self.assertFalse(terminal_monitor.TmuxBackend().owns_process)
+
+    def test_get_backend_accepts_pty(self):
+        backend = terminal_monitor.get_backend("pty")
+        self.assertEqual(backend.name(), "pty")
+        self.assertTrue(backend.owns_process)
+
+
+class ManagedConfigTests(unittest.TestCase):
+    def test_agent_command_list_accepted(self):
+        from terminal_monitor.config import validate_agent_command
+
+        self.assertEqual(validate_agent_command(["claude", "--model", "x"]), ("claude", "--model", "x"))
+
+    def test_agent_command_string_rejected(self):
+        from terminal_monitor.config import validate_agent_command
+
+        with self.assertRaises(ValueError):
+            validate_agent_command("claude --model x")
+
+    def test_agent_command_empty_entries_rejected(self):
+        from terminal_monitor.config import validate_agent_command
+
+        with self.assertRaises(ValueError):
+            validate_agent_command(["claude", ""])
+        with self.assertRaises(ValueError):
+            validate_agent_command(["claude", 123])
+
+    def test_cli_parses_agent_command_with_shlex(self):
+        parser = terminal_monitor.build_parser()
+        args = parser.parse_args(["supervise", "--backend", "pty", "--agent-command", "claude --model example"])
+        config = terminal_monitor.config_from_args(args)
+        self.assertEqual(config.agent_command, ("claude", "--model", "example"))
+        self.assertEqual(config.backend, "pty")
+
+    def test_pty_requires_command(self):
+        from terminal_monitor.config import validate_managed_config
+
+        with self.assertRaises(ValueError):
+            validate_managed_config("pty", ())
+
+
+class ManagedStatusRedactionTests(unittest.TestCase):
+    def test_public_status_redacts_secrets(self):
+        from terminal_monitor.status import _public_status
+
+        raw = {
+            "state": "thinking",
+            "session-token": "secret",
+            "control_token": "secret",
+            "e2ee_password": "secret",
+            "runtime": {
+                "backend": "pty",
+                "managed": True,
+                "session_id": "abc123",
+                "host_pid": 1,
+                "root_pid": 2,
+                "connected": True,
+                "alive": True,
+                "control_token": "should-not-pass",
+            },
+            "remote": {"provider": "shell.online", "active": True, "read_only": True, "encrypted": True, "session_id": "s", "share_url": "u", "e2ee_password": "nope"},
+        }
+        public = _public_status(raw)
+        dumped = __import__("json").dumps(public)
+        self.assertNotIn("secret", dumped)
+        self.assertNotIn("control_token", dumped)
+        self.assertNotIn("e2ee_password", dumped)
+        self.assertNotIn("session-token", dumped)
+        self.assertEqual(public["runtime"]["session_id"], "abc123")
+        self.assertTrue(public["remote"]["read_only"])
+
+    def test_stale_host_reports_disconnected(self):
+        import tempfile
+
+        from terminal_monitor.config import MonitorConfig
+        from terminal_monitor.monitor import TerminalMonitor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stale_meta = {
+                "schema_version": 1,
+                "session_id": "stale",
+                "backend": "pty",
+                "host_pid": 999999,
+                "root_pid": 999998,
+                "command": ["true"],
+                "cwd": tmp,
+                "started_at": "2026-01-01T00:00:00Z",
+                "state": "running",
+                "exit_code": None,
+            }
+            pathlib.Path(tmp, "managed-session.json").write_text(__import__("json").dumps(stale_meta), encoding="utf-8")
+            backend = mock.Mock()
+            backend.owns_process = False
+            backend.get_pids.return_value = []
+            config = MonitorConfig(process="opencode", state_dir=tmp, project_dir=tmp)
+            monitor = TerminalMonitor(config, backend=backend)
+            runtime = monitor.managed_runtime_status()
+            self.assertFalse(runtime.get("connected"))
+            self.assertFalse(runtime.get("alive"))
+
+
+class ShellOnlineAvailabilityTests(unittest.TestCase):
+    def test_missing_binary_fails_closed(self):
+        from terminal_monitor.shell_online import ShellOnlineProvider
+
+        ok, reason = ShellOnlineProvider(binary="/nonexistent-shell-xyz").available()
+        self.assertFalse(ok)
+        self.assertTrue(reason)
+
+    def test_stop_validates_session_id(self):
+        from terminal_monitor.shell_online import ShellOnlineProvider
+
+        ok, _ = ShellOnlineProvider(binary="/nonexistent-shell-xyz").stop("bad id with spaces")
+        self.assertFalse(ok)
+
+
 if __name__ == "__main__":
     unittest.main()
 

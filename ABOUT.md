@@ -52,6 +52,7 @@ Different AI agents use distinct visual conventions in the terminal:
 - **macOS Terminal.app**: Native AppleScript tab scanning and non-intrusive script dispatch.
 - **macOS iTerm2**: Native AppleScript session text extraction and command writing.
 - **tmux**: Cross-platform pane capture (`tmux capture-pane`) and keystroke dispatch (`tmux send-keys`), enabling execution across **Linux, macOS, WSL, devcontainers, and remote headless servers**.
+- **Managed PTY (`pty`, POSIX-only, opt-in)**: A detached local `SessionHost` owns the PTY and agent process, keeps bounded in-memory replay (512 KiB default, never persisted), and serves an authenticated owner-only Unix-socket control plane. The supervisor may restart and reconnect to the same live session; existing attach backends are unchanged.
 
 ### 8. Fail-Closed Safety Model
 - **Blacklist of Destructive Phrases**: Blocks dangerous actions by default.
@@ -121,6 +122,21 @@ The continuous monitor owns a localhost-only web server with a visual system ins
 - **Automatic CWD Discovery:** Automatically resolves the target agent process directory via `lsof` or `/proc` when `--project-dir` is not explicitly passed.
 - **Smart Protected Branch Nudges:** Rather than crashing or halting when `main` has uncommitted changes, automatically sends a guidance nudge instructing the agent to create a feature branch before enforcing repository safety gates.
 - **Task Title Reconciliation:** Expands truncated TUI checklist labels into full task descriptions discovered in planning blocks throughout the terminal history.
+
+### 16. Managed Sessions & Safe Remote Viewing
+
+AI Agent Terminal Monitor is a local-first runtime supervisor that can own,
+observe, recover, verify, and safely expose read-only access to long-running
+AI coding-agent sessions.
+
+- **Session ownership:** `ManagedPTYBackend` is a client; the detached
+  `SessionHost` owns the PTY, replay, and lifecycle and survives supervisor
+  restarts.
+- **Read-only remote:** the optional `shell.online` provider shares only
+  `terminal-monitor attach --read-only` over E2EE; browser input never reaches
+  the PTY, and the password is never persisted.
+- **Fail-closed writes:** every monitor-generated action still flows through
+  policy, safety, and the attempt ledger before reaching the backend.
 
 ---
 

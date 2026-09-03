@@ -176,6 +176,10 @@ def parse_tab_output(raw: str) -> TabResult:
 class BaseTerminalBackend:
     """Abstract base class for terminal interaction backends."""
 
+    @property
+    def owns_process(self) -> bool:
+        return False
+
     def name(self) -> str:
         raise NotImplementedError
 
@@ -531,8 +535,12 @@ def get_backend(backend_name: str = "auto") -> BaseTerminalBackend:
         return ITerm2Backend()
     if choice == "tmux":
         return TmuxBackend()
+    if choice in ("pty", "managed", "managed-pty"):
+        from .managed_pty import ManagedPTYBackend
 
-    raise ValueError(f"Unknown terminal backend: {backend_name}. Available: auto, terminal, iterm2, tmux")
+        return ManagedPTYBackend()
+
+    raise ValueError(f"Unknown terminal backend: {backend_name}. Available: auto, terminal, iterm2, tmux, pty")
 
 
 # Backward-compatible function wrappers

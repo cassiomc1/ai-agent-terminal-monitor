@@ -252,6 +252,19 @@ def _public_status(data: dict[str, Any]) -> dict[str, Any]:
     attempts = data.get("attempts", [])
     safe["attempts"] = [_public_attempt(item) for item in attempts if isinstance(item, dict)] if isinstance(attempts, list) else []
     safe.pop("last_prompt", None)
+    # Never expose local control or remote viewer secrets, even if a future
+    # writer accidentally includes them in status.json.
+    for secret_key in (
+        "session-token",
+        "session_token",
+        "control_token",
+        "control-token",
+        "token",
+        "e2ee_password",
+        "browser_password",
+        "password",
+    ):
+        safe.pop(secret_key, None)
     prohibitions = data.get("prohibitions", [])
     safe["prohibitions"] = ["<configured>" for _item in prohibitions] if isinstance(prohibitions, (list, tuple)) else []
     safe["last_command"] = "<redacted>" if data.get("last_command") else ""
@@ -272,6 +285,34 @@ def _public_status(data: dict[str, Any]) -> dict[str, Any]:
             for item in decisions
             if isinstance(item, dict)
         ]
+    # Managed runtime: allowlist non-secret fields only.
+    runtime = data.get("runtime")
+    if isinstance(runtime, dict):
+        safe["runtime"] = {
+            key: runtime.get(key)
+            for key in (
+                "backend",
+                "managed",
+                "session_id",
+                "host_pid",
+                "root_pid",
+                "connected",
+                "alive",
+                "started_at",
+                "last_output_at",
+                "exit_code",
+            )
+            if key in runtime
+        }
+    # Remote share: allowlist non-secret metadata only.
+    remote = data.get("remote")
+    if isinstance(remote, dict):
+        safe["remote"] = {
+            key: remote.get(key)
+            for key in ("provider", "active", "read_only", "encrypted", "session_id", "share_url")
+            if key in remote
+        }
+        safe["remote"]["read_only"] = True
     return safe
 
 

@@ -75,7 +75,42 @@ class MonitorConfig:
     prompt_fast_threshold_seconds: float = 4.0
     protected_branch_nudge_window_seconds: float = 45.0
     launch_command: tuple[str, ...] = ()
+    agent_command: tuple[str, ...] = ()
+    remote_provider: str = ""
     debug_log_path: str | None = None
+
+
+def validate_agent_command(value: object) -> tuple[str, ...]:
+    """Validate a managed agent command from config files.
+
+    Config files must store commands as arrays of non-empty strings.
+    """
+    if value is None or value == () or value == [] or value == "":
+        return ()
+    if isinstance(value, str):
+        raise ValueError("E_MANAGED_COMMAND_REQUIRED: agent_command must be a list of strings, not a string")
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("E_MANAGED_COMMAND_REQUIRED: agent_command must be a list of strings")
+    cleaned: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("E_MANAGED_COMMAND_REQUIRED: agent_command entries must be non-empty strings")
+        cleaned.append(item)
+    if not cleaned:
+        return ()
+    return tuple(cleaned)
+
+
+def validate_managed_config(backend: str, agent_command: tuple[str, ...]) -> None:
+    """Fail closed for managed PTY misconfiguration."""
+    if backend.strip().lower() in ("pty", "managed", "managed-pty"):
+        import os as _os
+        import sys as _sys
+
+        if _os.name != "posix" or _sys.platform == "win32":
+            raise ValueError("E_MANAGED_UNSUPPORTED_PLATFORM: Managed PTY backend requires a POSIX platform.")
+        if not agent_command:
+            raise ValueError("E_MANAGED_COMMAND_REQUIRED: The pty backend requires a non-empty agent command.")
 CONFIG_FILENAMES = (
     ".terminal-monitor.json",
     ".terminal-monitor.toml",

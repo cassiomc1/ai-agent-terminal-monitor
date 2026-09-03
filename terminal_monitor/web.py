@@ -67,6 +67,15 @@ DASHBOARD_HTML = """<!doctype html>
   </div>
 </div>
 
+<!-- MANAGED RUNTIME (WHEN PRESENT) -->
+<div class="detail" id="managed-box" style="padding:14px 18px;margin-top:2px" hidden>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+    <span style="font:700 11px var(--font-mono);color:var(--dim);letter-spacing:.1em">MANAGED RUNTIME</span>
+    <span style="font:600 12px var(--font-mono)" id="managed-summary">—</span>
+  </div>
+  <div style="font:11px var(--font-mono);color:var(--dim)" id="managed-detail">—</div>
+</div>
+
 <div class="action-bar">
 <div class="action-pills">
 <button class="act-btn primary" type="button" onclick="sendAction('answer','yes')">✓ Approve (yes)</button>
@@ -248,6 +257,22 @@ function applySnapshot(s,e,terminalData){
   document.getElementById('safety-list').innerHTML=safety.length?safety.map(x=>'<li>'+esc(x)+'</li>').join(''):'<li>No safety events recorded.</li>';
   const attempts=(s.attempts||[]).map(x=>(x.timestamp||'')+' · '+(x.status||'unknown')+' · '+(x.observed_state||''));
   document.getElementById('attempt-list').innerHTML=attempts.length?attempts.map(x=>'<li>'+esc(x)+'</li>').join(''):'<li>No continuation attempts recorded.</li>';
+  const managedBox=document.getElementById('managed-box');
+  if(managedBox){
+    const rt=s.runtime||null;
+    const rm=s.remote||null;
+    if(rt&&rt.managed){
+      managedBox.hidden=false;
+      const sid=String(rt.session_id||'').slice(0,8)||'—';
+      const host=rt.connected?'connected':'disconnected';
+      const agentPid=rt.root_pid||'—';
+      const remoteLabel=!rm||!rm.active?'off':(rm.read_only?'on/read-only':'on');
+      document.getElementById('managed-summary').textContent='Managed PTY · '+sid+' · '+host;
+      document.getElementById('managed-detail').textContent='Runtime: Managed PTY · Session: '+sid+' · Host: '+host+' · Agent PID: '+agentPid+' · Remote View: '+remoteLabel;
+    } else {
+      managedBox.hidden=true;
+    }
+  }
   connection.textContent='LIVE ●';connection.classList.remove('reconnecting');
 }
 async function pollFallback(){try{const [sr,er,tr]=await Promise.all([fetch('/api/status',{cache:'no-store',headers:apiHeaders()}),fetch('/api/events',{cache:'no-store',headers:apiHeaders()}),fetch('/api/terminal',{cache:'no-store',headers:apiHeaders()})]);const s=await sr.json(),e=await er.json(),terminalData=await tr.json();applySnapshot(s,e,terminalData)}catch(e){connection.textContent='RECONNECTING';connection.classList.add('reconnecting')}}

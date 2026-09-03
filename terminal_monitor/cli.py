@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -96,6 +97,25 @@ def build_parser() -> argparse.ArgumentParser:
     _add_monitor_args(supervise_parser)
     supervise_parser.add_argument("--status-json", dest="status_json_path", help="Path to write real-time status JSON")
 
+    attach_parser = subparsers.add_parser("attach", help="Follow a managed PTY session (read-only)")
+    attach_parser.add_argument("--state-dir", default=None, help="Monitor state directory")
+    attach_parser.add_argument("--read-only", action="store_true", help="Required: attach is output-only")
+    attach_parser.add_argument("--limit-bytes", type=int, default=512 * 1024, help="Initial replay snapshot size")
+
+    share_parser = subparsers.add_parser("share", help="Share a managed session read-only via an optional provider")
+    share_parser.add_argument("--provider", default="shell-online", help="Remote provider (default: shell-online)")
+    share_parser.add_argument("--state-dir", default=None, help="Monitor state directory")
+    share_parser.add_argument("--project-dir", "-d", default=None, help="Project directory for state resolution")
+
+    unshare_parser = subparsers.add_parser("unshare", help="Stop remote sharing without stopping the agent")
+    unshare_parser.add_argument("--state-dir", default=None, help="Monitor state directory")
+    unshare_parser.add_argument("--project-dir", "-d", default=None, help="Project directory for state resolution")
+    unshare_parser.add_argument("--session-id", default=None, help="Provider session id (defaults to saved remote metadata)")
+
+    terminate_parser = subparsers.add_parser("terminate-session", help="Terminate a managed PTY agent session explicitly")
+    terminate_parser.add_argument("--state-dir", default=None, help="Monitor state directory")
+    terminate_parser.add_argument("--project-dir", "-d", default=None, help="Project directory for state resolution")
+
     # Main monitor arguments
     _add_monitor_args(parser)
     parser.add_argument("--status-json", dest="status_json_path", help="Path to write real-time status JSON")
@@ -120,7 +140,11 @@ def _add_monitor_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-smart-nudges", action="store_true", help="Disable git-aware context smart nudges")
     parser.add_argument("--no-mode-switch", action="store_true", help="Disable automatic Plan->Build mode switching")
     parser.add_argument("--no-completion-check", action="store_true", help="Disable completion state auto-detection")
-    parser.add_argument("--backend", "-b", choices=["auto", "terminal", "iterm2", "tmux"], default=None, help="Terminal backend")
+    parser.add_argument("--backend", "-b", choices=["auto", "terminal", "iterm2", "tmux", "pty"], default=None, help="Terminal backend")
+    if "--agent-command" not in parser._option_string_actions:
+        parser.add_argument("--agent-command", default=None, help="Managed PTY agent command (parsed with shlex, e.g. 'claude --model example')")
+    if "--remote-provider" not in parser._option_string_actions:
+        parser.add_argument("--remote-provider", default=None, help="Optional read-only remote provider (e.g. shell-online)")
     parser.add_argument("--project-dir", "-d", default=None, help="Project directory for config discovery and git status")
     parser.add_argument("--config", default=None, help="Explicit configuration file path")
     parser.add_argument("--state-dir", default=None, help="Directory for state/logs (default: ~/.cache/terminal-monitor, per-project subdirectory)")
@@ -202,6 +226,10 @@ def config_from_args(args: argparse.Namespace) -> MonitorConfig:
     raw_state_dir = str(_val(getattr(args, "state_dir", None), "state_dir", DEFAULT_STATE_DIR))
     resolved_state_dir = resolve_project_state_dir(raw_state_dir, str(project_dir)) if raw_state_dir == DEFAULT_STATE_DIR else raw_state_dir
 
+    agent_command = _parse_agent_command(getattr(args, "agent_command", None), file_cfg.get("agent_command", ()))
+    backend_value = str(_val(getattr(args, "backend", None), "backend", "auto"))
+    remote_provider = str(_val(getattr(args, "remote_provider", None), "remote_provider", "") or "")
+
     return MonitorConfig(
         process=process,
         profile=profile,
@@ -217,7 +245,7 @@ def config_from_args(args: argparse.Namespace) -> MonitorConfig:
         once=bool(getattr(args, "once", False)),
         dry_run=bool(getattr(args, "dry_run", False)),
         state_dir=resolved_state_dir,
-        backend=str(_val(getattr(args, "backend", None), "backend", "auto")),
+        backend=backend_value,
         project_dir=str(project_dir),
         unsafe_phrases=merged_unsafe,
         custom_profiles=file_cfg.get("custom_profiles", {}),
@@ -249,7 +277,241 @@ def config_from_args(args: argparse.Namespace) -> MonitorConfig:
         prompt_fast_threshold_seconds=max(0.0, float(_val(getattr(args, "prompt_fast_threshold_seconds", None), "prompt_fast_threshold_seconds", 4.0))),
         protected_branch_nudge_window_seconds=max(0.0, float(_val(getattr(args, "protected_branch_nudge_window_seconds", None), "protected_branch_nudge_window_seconds", 45.0))),
         debug_log_path=getattr(args, "debug_log", None) or file_cfg.get("debug_log_path"),
+        agent_command=agent_command,
+        remote_provider=remote_provider,
     )
+
+
+def _parse_agent_command(cli_value: Any, file_value: Any) -> tuple[str, ...]:
+    """Parse the managed agent command without ever using shell=True."""
+    from .config import validate_agent_command
+
+    if isinstance(cli_value, (list, tuple)):
+        # `restart-agent --agent-command` uses nargs=REMAINDER (list) for a
+        # different purpose; it must not configure the managed PTY command.
+        cli_value = None
+    if cli_value:
+        try:
+            parts = shlex.split(str(cli_value))
+        except ValueError as exc:
+            raise ValueError(f"E_MANAGED_COMMAND_REQUIRED: invalid --agent-command: {exc}") from exc
+        if not parts:
+            raise ValueError("E_MANAGED_COMMAND_REQUIRED: The pty backend requires a non-empty agent command.")
+        return tuple(parts)
+    if file_value in (None, (), [], ""):
+        return ()
+    return validate_agent_command(file_value)
+
+
+def _resolve_attach_state_dir(args: argparse.Namespace, config: Any) -> str:
+    raw = getattr(args, "state_dir", None) or getattr(config, "state_dir", "")
+    project_dir = getattr(args, "project_dir", None) or getattr(config, "project_dir", ".")
+    if not raw:
+        raw = DEFAULT_STATE_DIR
+    if raw == DEFAULT_STATE_DIR:
+        return resolve_project_state_dir(raw, str(project_dir))
+    return str(raw)
+
+
+def _run_attach(args: argparse.Namespace, config: Any) -> int:
+    if not getattr(args, "read_only", False):
+        print("attach requires --read-only (output-only in this release)", file=sys.stderr)
+        return 2
+    state_dir = _resolve_attach_state_dir(args, config)
+    from .managed_pty import ManagedSessionClient
+    from .session_protocol import SessionProtocolError
+
+    try:
+        client = ManagedSessionClient.connect(state_dir)
+    except (OSError, ValueError, SessionProtocolError, PermissionError, ConnectionError, RuntimeError):
+        # Fixed message: never leak token material or socket details.
+        print("E_SESSION_NOT_FOUND: No active managed session exists for this state directory.", file=sys.stderr)
+        return 2
+    limit = int(getattr(args, "limit_bytes", 512 * 1024) or 512 * 1024)
+    try:
+        initial = client.snapshot(limit_bytes=limit)
+    except (OSError, ValueError, RuntimeError, ConnectionError, PermissionError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    binary_out = getattr(sys.stdout, "buffer", None)
+    text_out = sys.stdout
+    try:
+        if initial and binary_out is not None:
+            binary_out.write(initial)
+            binary_out.flush()
+        elif initial:
+            text_out.write(initial.decode("utf-8", errors="replace"))
+        for chunk in client.stream():
+            # stream() yields snapshot again first; skip duplicate initial bytes
+            # only when identical to avoid double-printing on fast attach.
+            if chunk == initial:
+                initial = b""
+                continue
+            initial = b""
+            if not chunk:
+                continue
+            if binary_out is not None:
+                binary_out.write(chunk)
+                binary_out.flush()
+            else:
+                text_out.write(chunk.decode("utf-8", errors="replace"))
+    except KeyboardInterrupt:
+        return 130
+    except BrokenPipeError:
+        return 0
+    finally:
+        import contextlib as _contextlib
+
+        with _contextlib.suppress(OSError, ValueError, RuntimeError):
+            client.close()
+    return 0
+
+
+def _run_share(args: argparse.Namespace, config: Any) -> int:
+    state_dir = _resolve_attach_state_dir(args, config)
+    provider_name = str(getattr(args, "provider", "shell-online") or "shell-online").lower().strip()
+    if provider_name not in ("shell-online", "shell.online", "shell_online"):
+        print(f"E_REMOTE_PROVIDER_UNAVAILABLE: unknown provider {provider_name!r}", file=sys.stderr)
+        return 2
+    # Sharing requires a healthy managed session.
+    from .managed_pty import ManagedSessionClient
+    from .session_protocol import SessionProtocolError
+
+    try:
+        probe = ManagedSessionClient.connect(state_dir)
+        probe_status = probe.status()
+        probe.close()
+        if not probe_status.alive:
+            print("E_SESSION_STALE: no live managed session to share", file=sys.stderr)
+            return 2
+    except (OSError, ValueError, SessionProtocolError, RuntimeError, ConnectionError, PermissionError) as exc:
+        print(f"E_SESSION_NOT_FOUND: {exc}", file=sys.stderr)
+        return 2
+    from .shell_online import ShellOnlineProvider
+
+    provider = ShellOnlineProvider()
+    try:
+        result = _create_share(provider, state_dir)
+    except (RuntimeError, ValueError, OSError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print("Remote view: read-only")
+    print(f"Encrypted: {'yes' if result.share.encrypted else 'no'}")
+    print(f"URL: {result.share.share_url}")
+    print(f"Browser password: {result.browser_password}")
+    return 0
+
+
+def _read_saved_share(state_dir: str) -> dict[str, Any]:
+    try:
+        saved = json.loads((Path(state_dir) / "remote-share.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return saved if isinstance(saved, dict) else {}
+
+
+def _create_share(provider: Any, state_dir: str) -> Any:
+    """Create a read-only share, stopping a previously saved one first.
+
+    Fail closed on the previous share: a saved active session must be stopped
+    before a replacement is created. If the provider cannot stop it, no new
+    share is created and the saved metadata is left untouched (still
+    ``active``), so an old browser link is never joined by a second live link.
+    Only non-secret metadata is persisted; the browser password stays
+    ephemeral. Remote lifecycle never touches the monitor, SessionHost, or
+    agent.
+    """
+    import contextlib as _contextlib_share
+
+    from .state import _atomic_json_write as _write_share
+
+    previous = _read_saved_share(state_dir)
+    previous_id = str(previous.get("session_id", "")) if previous.get("active") else ""
+    if previous_id:
+        ok, _detail = provider.stop(previous_id)
+        if not ok:
+            # No replacement share: the provider detail may carry secrets, so
+            # it is dropped entirely and the saved record stays active.
+            raise RuntimeError(
+                "E_REMOTE_SHARE_PREVIOUS_ACTIVE: previous remote session could not be stopped; "
+                "refusing to create another remote share. The earlier remote link may still be "
+                "active; local supervision, the managed session, and the agent are unaffected."
+            )
+    result = provider.share_read_only_with_password(state_dir=state_dir)
+    with _contextlib_share.suppress(OSError):
+        _write_share(
+            Path(state_dir) / "remote-share.json",
+            {
+                "provider": result.share.provider,
+                "active": True,
+                "read_only": True,
+                "encrypted": bool(result.share.encrypted),
+                "session_id": result.share.session_id,
+                "share_url": result.share.share_url,
+            },
+        )
+    return result
+
+
+def _run_unshare(args: argparse.Namespace, config: Any) -> int:
+    from .state import _atomic_json_write
+
+    state_dir = _resolve_attach_state_dir(args, config)
+    session_id = str(getattr(args, "session_id", None) or "")
+    if not session_id:
+        saved = _read_saved_share(state_dir)
+        session_id = str(saved.get("session_id", ""))
+    if not session_id:
+        print("E_REMOTE_SHARE_FAILED: no saved remote session to stop", file=sys.stderr)
+        return 2
+    from .shell_online import ShellOnlineProvider
+
+    ok, _detail = ShellOnlineProvider().stop(session_id)
+    if not ok:
+        # Fail closed: never claim the share stopped and never rewrite saved
+        # metadata to inactive while the provider session may still be live.
+        # Provider detail is dropped because it may carry secrets.
+        print(
+            "E_REMOTE_SHARE_FAILED: remote session could not be stopped; the remote share may still "
+            "be active. Saved share metadata was left unchanged; the monitor and agent are unaffected.",
+            file=sys.stderr,
+        )
+        return 1
+    # Clearing saved metadata must not stop monitor/host/agent.
+    import contextlib as _contextlib2
+
+    with _contextlib2.suppress(OSError):
+        _atomic_json_write(
+            Path(state_dir) / "remote-share.json",
+            {"provider": "shell.online", "active": False, "read_only": True, "session_id": session_id},
+        )
+    print("stopped")
+    return 0
+
+
+def _run_terminate_session(args: argparse.Namespace, config: Any) -> int:
+    import contextlib as _contextlib3
+
+    from .session_protocol import SessionProtocolError
+
+    state_dir = _resolve_attach_state_dir(args, config)
+    from .managed_pty import ManagedSessionClient
+
+    try:
+        client = ManagedSessionClient.connect(state_dir)
+    except (OSError, ValueError, SessionProtocolError, PermissionError, ConnectionError, RuntimeError) as exc:
+        print(f"E_SESSION_NOT_FOUND: {exc}", file=sys.stderr)
+        return 2
+    try:
+        client.terminate_session()
+    except (OSError, ValueError, SessionProtocolError, RuntimeError, ConnectionError, PermissionError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    finally:
+        with _contextlib3.suppress(OSError, ValueError, RuntimeError):
+            client.close()
+    print("TERMINATED")
+    return 0
 
 
 def main() -> int:
@@ -379,11 +641,50 @@ def main() -> int:
         print(json.dumps({"ok": report.ok, "checks": report.checks, "failures": report.failures, "evidence": evidence, "report_path": report_path}, indent=2))
         return 0 if report.ok else 4
 
+    if args.command == "attach":
+        return _run_attach(args, config)
+
+    if args.command == "share":
+        return _run_share(args, config)
+
+    if args.command == "unshare":
+        return _run_unshare(args, config)
+
+    if args.command == "terminate-session":
+        return _run_terminate_session(args, config)
+
+    # Validate managed configuration before supervising.
+    if str(config.backend).lower() in ("pty", "managed", "managed-pty"):
+        from .config import validate_managed_config
+
+        try:
+            validate_managed_config(config.backend, config.agent_command)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
     monitor = TerminalMonitor(config)
 
     if config.once:
         inspected = monitor.inspect()
         print(json.dumps(json_safe(inspected), indent=2, sort_keys=True))
         return 0 if inspected.get("ok") else 2
+
+    # Optional read-only remote sharing starts only after managed startup
+    # succeeds. Provider failure is non-fatal: local supervision continues.
+    # A previously saved active share must be stopped first; if that stop
+    # fails, share creation is aborted rather than multiplying remote links.
+    remote_provider = str(getattr(config, "remote_provider", "") or "").lower().strip()
+    if remote_provider in ("shell-online", "shell.online", "shell_online"):
+        try:
+            from .shell_online import ShellOnlineProvider
+
+            share_result = _create_share(ShellOnlineProvider(), monitor.state_dir)
+            print("Remote view: read-only")
+            print(f"Encrypted: {'yes' if share_result.share.encrypted else 'no'}")
+            print(f"URL: {share_result.share.share_url}")
+            print(f"Browser password: {share_result.browser_password}")
+        except (RuntimeError, ValueError, OSError) as exc:
+            print(f"REMOTE_PROVIDER_ERROR: {exc}", file=sys.stderr)
 
     return monitor.run()

@@ -535,6 +535,153 @@ failure requiring a fix.
 
 ---
 
+## Managed PTY Mode
+
+The `pty` backend lets the monitor own the agent session instead of only
+attaching to Terminal.app / iTerm2 / tmux. A detached `SessionHost` owns the
+PTY and agent process; the supervisor connects over an authenticated
+owner-only Unix socket.
+
+```bash
+terminal-monitor supervise \
+  --backend pty \
+  --profile claude \
+  --agent-command 'claude' \
+  --objective "Finish the task, verify it, and prepare the PR."
+```
+
+Config file equivalent (`agent_command` must be an array, never a string):
+
+```json
+{
+  "backend": "pty",
+  "agent_command": ["claude"]
+}
+```
+
+```toml
+backend = "pty"
+agent_command = ["claude"]
+```
+
+POSIX-only (macOS, Linux, WSL). `pty` is opt-in; `auto` keeps its existing
+selection policy.
+
+## Supervisor Restart / Session Reconnect
+
+```text
+Agent process:      keeps running
+SessionHost:        keeps running
+Supervisor:         may stop/restart
+Browser share:      independent optional viewer
+```
+
+Stopping the supervisor disconnects only the control client. Restarting
+re-adopts the same live session (`same session_id`, stable root PID) and
+replay includes output produced while the monitor was down. Replay is bounded
+to 512 KiB by default, held in host memory, and never written to disk.
+
+```bash
+terminal-monitor attach --state-dir <path> --read-only
+terminal-monitor terminate-session --state-dir <path>  # explicit only
+```
+
+`stop monitor != terminate managed agent`; `resume monitor == reconnect`.
+
+## Read-Only Browser Sharing
+
+Optional E2EE browser viewing via the external `shell.online` CLI (never
+auto-installed, never required):
+
+```bash
+terminal-monitor supervise \
+  --backend pty \
+  --profile claude \
+  --agent-command 'claude' \
+  --remote-provider shell-online
+```
+
+Or share an existing managed session once:
+
+```bash
+terminal-monitor share --provider shell-online --state-dir <path>
+terminal-monitor unshare --state-dir <path>
+```
+
+The provider shares `terminal-monitor attach --read-only`, not the agent
+command. Remote-share failure never terminates the agent; unsharing never
+stops the monitor, host, or agent.
+
+Remote share lifecycle is fail-closed: when saved metadata already records an
+active share, that session must be stopped before a replacement is created. If
+the provider cannot stop it, no second share is created, the previous metadata
+stays `active`, and the command exits non-zero. A failed `unshare` likewise
+never records the share as stopped.
+
+## Trust Boundaries
+
+```text
+READ:  PTY → SessionHost → monitor/read-only attach → optional remote viewer
+WRITE: operator → monitor policy/safety/ledger → backend → SessionHost → PTY
+```
+
+> shell.online is used only as an optional encrypted read-only transport for
+> a monitor-owned attach stream. The AI agent remains owned by AI Agent
+> Terminal Monitor's local SessionHost. Remote browser input is not enabled
+> by this integration.
+
+## What Remote Sharing Does Not Allow
+
+- remote raw PTY write access;
+- multiple simultaneous remote typists;
+- bypassing the Safety Engine, policy envelope, or attempt ledger;
+- disabling E2EE by default (`--no-e2ee` is never passed);
+- persisting the browser/E2EE password anywhere (status, logs, reports, web).
+
+Interactive remote control is deferred and requires a separate
+monitor-mediated design.
+
+## Session Files and Privacy
+
+Under the project-isolated state directory:
+
+```text
+<state-dir>/
+├── managed-session.json   # metadata only (no scrollback, no secrets)
+├── session-control.sock   # owner-only Unix socket (0600)
+├── session-token          # random 256-bit secret (0600)
+├── remote-share.json      # non-secret share metadata only
+├── status.json            # includes runtime/remote health, no passwords
+└── ...
+```
+
+`managed-session.json` never contains PTY scrollback, prompts, API keys, the
+monitor web token, the session-control token, or the shell.online password.
+The browser password is printed once to the invoking operator.
+
+## Troubleshooting shell.online Provider
+
+- `E_REMOTE_PROVIDER_UNAVAILABLE`: install the `shell` CLI and ensure
+  `shell --version` succeeds; core supervision keeps working without it.
+- `E_REMOTE_PROVIDER_UNRECOGNIZED_BINARY`: the resolved `shell` executable
+  could not be verified as shell.online; check `PATH`.
+- `E_REMOTE_SHARE_FAILED`: the provider did not return JSON metadata;
+  retry `share` after verifying the managed session is live
+  (`attach --read-only`). From `unshare`, it means the provider session could
+  not be stopped: the saved share stays `active` and may still be live.
+- `E_REMOTE_SHARE_PREVIOUS_ACTIVE`: a previously created share could not be
+  stopped, so no replacement was created (no duplicate remote links). Stop the
+  old session (`shell kill <id>`) and retry; local supervision is unaffected.
+- Stopping the share (`unshare` / `shell kill <id>`) never stops the agent.
+
+## Migration / Compatibility
+
+- Existing `terminal`, `iterm2`, `tmux`, and `auto` behavior is unchanged.
+- `pty` is additive and opt-in.
+- CI still covers Python 3.10–3.14 on Ubuntu and macOS; coverage floor 75%.
+
+---
+
 ## 🧪 Running Tests & Lint
 
 Run the complete built-in unit test suite (zero external test dependencies):
