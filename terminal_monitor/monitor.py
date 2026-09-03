@@ -132,13 +132,17 @@ class TerminalMonitor:
         if config.unsafe_phrases:
             self.profile.unsafe_phrases = list(set(self.profile.unsafe_phrases + config.unsafe_phrases))
 
+        # Managed PTY owns its session; do not auto-discover external PIDs.
+        is_managed = bool(getattr(self.backend, "owns_process", False))
         # Auto-discover agent project directory if default
-        if self.config.project_dir in (".", ""):
+        if self.config.project_dir in (".", "") and not is_managed:
             discovered = discover_agent_project_dir(self.backend.get_pids(self.config.process))
             if discovered and get_git_status(discovered, ttl_seconds=0.0).is_repo:
                 self.config = replace(self.config, project_dir=discovered)
 
         self._init_paths()
+        if is_managed:
+            self._init_managed_session()
         self._init_task_state()
         self._init_trackers()
 
@@ -199,6 +203,129 @@ class TerminalMonitor:
         self.terminal_snapshot_path = os.path.join(self.state_dir, "terminal-snapshot.txt")
         self.task_state_path = os.path.join(self.state_dir, "task-state.json")
         self.report_path = self.config.report_path or os.path.join(self.state_dir, "final-report.json")
+        self.managed_identity: TerminalIdentity | None = None
+
+    def _init_managed_session(self) -> None:
+        """Adopt a healthy host before creating a new managed agent session.
+
+        Stop/resume semantics: stopping the monitor never terminates the
+        agent; resuming reconnects to the same live session.
+        """
+        from .config import validate_managed_config
+
+        validate_managed_config(self.config.backend, tuple(self.config.agent_command or ()))
+        backend = self.backend
+        start_managed = getattr(backend, "start_managed", None)
+        reconnect = getattr(backend, "reconnect", None)
+        if not callable(start_managed) or not callable(reconnect):
+            raise ValueError("E_SESSION_NOT_FOUND: managed backend does not support session startup")
+        # Prefer reconnect when a healthy host already answers.
+        try:
+            from .managed_pty import managed_session_is_reconnectable
+
+            if managed_session_is_reconnectable(self.state_dir):
+                self.managed_identity = reconnect(state_dir=self.state_dir)
+                return
+        except (OSError, ValueError, RuntimeError):
+            pass
+        # Only start a new child when no healthy session is present.
+        try:
+            self.managed_identity = start_managed(
+                tuple(self.config.agent_command or ()),
+                cwd=self.config.project_dir,
+                state_dir=self.state_dir,
+            )
+        except (OSError, ValueError, RuntimeError):
+            # If a concurrent supervisor won the race, adopt instead of failing.
+            try:
+                from .managed_pty import managed_session_is_reconnectable as _reconnectable
+
+                if _reconnectable(self.state_dir):
+                    self.managed_identity = reconnect(state_dir=self.state_dir)
+                    return
+            except (OSError, ValueError, RuntimeError):
+                pass
+            raise
+
+    def managed_runtime_status(self) -> dict[str, Any]:
+        """Return non-secret managed runtime health for status/web surfaces."""
+        try:
+            from pathlib import Path as _Path
+
+            meta_path = _Path(self.state_dir) / "managed-session.json"
+            meta: dict[str, Any] = {}
+            try:
+                import json as _json
+
+                meta = _json.loads(meta_path.read_text(encoding="utf-8"))
+                if not isinstance(meta, dict):
+                    meta = {}
+            except (OSError, ValueError):
+                meta = {}
+            alive = False
+            connected = False
+            host_pid: Any = meta.get("host_pid")
+            root_pid: Any = meta.get("root_pid")
+            session_id = str(meta.get("session_id", ""))
+            started_at = str(meta.get("started_at", ""))
+            exit_code = meta.get("exit_code")
+            last_output_at = None
+            # Live authenticated status is authoritative when reachable.
+            try:
+                from .managed_pty import ManagedSessionClient
+
+                client = ManagedSessionClient.connect(self.state_dir)
+                try:
+                    live = client.status()
+                    connected = True
+                    alive = bool(live.alive)
+                    host_pid = live.host_pid
+                    root_pid = live.root_pid
+                    session_id = live.session_id or session_id
+                    started_at = live.started_at or started_at
+                    last_output_at = live.last_output_at
+                    exit_code = live.exit_code
+                finally:
+                    with contextlib.suppress(Exception):
+                        client.close()
+            except (OSError, ValueError, RuntimeError):
+                connected = False
+                alive = False
+            return {
+                "backend": "pty",
+                "managed": True,
+                "session_id": session_id,
+                "host_pid": host_pid,
+                "root_pid": root_pid,
+                "connected": connected,
+                "alive": alive,
+                "started_at": started_at,
+                "last_output_at": last_output_at,
+                "exit_code": exit_code,
+            }
+        except (OSError, ValueError, RuntimeError):
+            return {"backend": "pty", "managed": True, "connected": False, "alive": False}
+
+    def _remote_share_status(self) -> dict[str, Any]:
+        from pathlib import Path as _Path
+
+        try:
+            import json as _json
+
+            saved = _json.loads((_Path(self.state_dir) / "remote-share.json").read_text(encoding="utf-8"))
+            if not isinstance(saved, dict):
+                return {"provider": "shell.online", "active": False, "read_only": True}
+            # Never expose secrets: allowlist non-secret fields only.
+            return {
+                "provider": str(saved.get("provider", "shell.online")),
+                "active": bool(saved.get("active", False)),
+                "read_only": True,
+                "encrypted": bool(saved.get("encrypted", False)),
+                "session_id": str(saved.get("session_id", "")),
+                "share_url": str(saved.get("share_url", "")),
+            }
+        except (OSError, ValueError):
+            return {"provider": "shell.online", "active": False, "read_only": True}
 
     def _init_task_state(self) -> None:
         """Merge persisted task state with the configured policy and save it."""
@@ -597,6 +724,12 @@ class TerminalMonitor:
         data["report_path"] = self.report_path
         data["prohibitions"] = list(self.task_state.prohibitions)
         data["npm_publish_allowed"] = self.task_state.npm_publish_allowed
+        # Managed runtime health (non-secret) and remote-view status.
+        if bool(getattr(self.backend, "owns_process", False)):
+            with contextlib.suppress(Exception):
+                data["runtime"] = self.managed_runtime_status()
+            with contextlib.suppress(Exception):
+                data["remote"] = self._remote_share_status()
         with contextlib.suppress(Exception):
             _atomic_json_write(self.status_json_path, data)
 

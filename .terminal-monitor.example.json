@@ -4,6 +4,8 @@
   "process": "claude",
   "title": null,
   "backend": "auto",
+  "agent_command": ["claude"],
+  "remote_provider": "",
   "continue_text": "Proceed from the next incomplete step. Stop if you need human guidance.",
   "poll_seconds": 3.0,
   "idle_seconds": 15.0,
