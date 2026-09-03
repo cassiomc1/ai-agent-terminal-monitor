@@ -155,12 +155,16 @@ class ManagedPTYTests(unittest.TestCase):
         backend = ManagedPTYBackend(state_dir=tmp)
         backend.start_managed(CHILD_KEYS, cwd=tmp, state_dir=tmp)
         self.addCleanup(self._cleanup_backend, backend, tmp)
-        ok, _ = backend.send_key("ignored", None, "enter")
-        self.assertTrue(ok)
-        ok, _ = backend.send_key("ignored", None, "ctrl+c")
-        self.assertTrue(ok)
-        ok, _ = backend.send_key("ignored", None, "a")
-        self.assertTrue(ok)
+        # READY is printed only after SIGINT is ignored: startup readiness alone
+        # does not guarantee the child installed its handler, and ctrl+c reaches
+        # the whole foreground group.
+        self.assertTrue(_wait_for(lambda: b"READY" in backend._client.snapshot(), timeout=10.0))
+        ok, detail = backend.send_key("ignored", None, "enter")
+        self.assertTrue(ok, detail)
+        ok, detail = backend.send_key("ignored", None, "ctrl+c")
+        self.assertTrue(ok, detail)
+        ok, detail = backend.send_key("ignored", None, "a")
+        self.assertTrue(ok, detail)
 
     def test_backend_get_pids_and_owns_process(self):
         tmp = self._state_dir()
