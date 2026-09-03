@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import json
 import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -16,13 +18,101 @@ from typing import Any
 
 from .backends import BaseTerminalBackend, TerminalIdentity
 from .safety import SPECIAL_KEY_CODES
-from .session_protocol import MAX_CONTROL_MESSAGE_BYTES, PROTOCOL_VERSION, SessionProtocolError, receive_message, send_message
+from .session_protocol import (
+    MAX_CONTROL_MESSAGE_BYTES,
+    PROTOCOL_VERSION,
+    SNAPSHOT_CHUNK_BYTES,
+    FramedReader,
+    SessionProtocolError,
+    receive_message,
+    send_message,
+)
 from .types import TabResult
 
 SESSION_METADATA_NAME = "managed-session.json"
 SESSION_TOKEN_NAME = "session-token"
 SESSION_SOCKET_NAME = "session-control.sock"
+SESSION_LOCK_NAME = "managed-session.lock"
 STARTUP_TIMEOUT_SECONDS = 10.0
+STARTUP_LOCK_TIMEOUT_SECONDS = 30.0
+# Upper bound for waiting on a spawned host to exit. Must exceed the host-side
+# SIGTERM grace so a cooperating host is always reaped instead of orphaned.
+TERMINATE_REAP_SECONDS = 15.0
+
+# Spawned SessionHost processes keyed by resolved state dir. The starter
+# client owns the Popen handle so test and monitor teardowns can reap the
+# host process instead of leaking it (and tripping ResourceWarning).
+_HOST_PROCS: dict[str, subprocess.Popen[bytes]] = {}
+_HOST_PROCS_LOCK = threading.Lock()
+
+
+def _register_host_proc(state_dir: str, proc: subprocess.Popen[bytes]) -> None:
+    with _HOST_PROCS_LOCK:
+        _HOST_PROCS[str(Path(state_dir).resolve())] = proc
+
+
+def _reap_host_proc(state_dir: str, timeout: float) -> bool | None:
+    """Poll (timeout=0) or wait for the spawned host, dropping reaped handles.
+
+    Returns True once the spawned host has exited, False while it is still
+    running, and None when this process never spawned a host for ``state_dir``.
+    """
+    key = str(Path(state_dir).resolve())
+    with _HOST_PROCS_LOCK:
+        proc = _HOST_PROCS.get(key)
+    if proc is None:
+        return None
+    try:
+        if timeout > 0:
+            proc.wait(timeout=timeout)
+        else:
+            proc.poll()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return proc.returncode is not None
+    if proc.returncode is not None:
+        with _HOST_PROCS_LOCK:
+            _HOST_PROCS.pop(key, None)
+        return True
+    return False
+
+
+@contextlib.contextmanager
+def _startup_lock(state_dir: str, timeout: float = STARTUP_LOCK_TIMEOUT_SECONDS) -> Iterator[None]:
+    """Serialize managed-session startup decisions per state directory.
+
+    A POSIX advisory lock held only across startup/adoption coordination:
+    re-check live ownership, optionally spawn exactly one host, wait for
+    authenticated readiness, then release. Never held during supervision,
+    so monitor restarts are unaffected.
+    """
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise RuntimeError("E_MANAGED_UNSUPPORTED_PLATFORM: Managed PTY backend requires a POSIX platform.") from exc
+    base = Path(state_dir).resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    lock_path = base / SESSION_LOCK_NAME
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        with contextlib.suppress(OSError):
+            os.fchmod(fd, 0o600)
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("E_SESSION_START_TIMEOUT: timed out waiting for the managed-session startup lock.") from None
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
 
 _MANAGED_KEY_BYTES: dict[str, bytes] = {
     "enter": b"\n",
@@ -98,6 +188,53 @@ def _suppress() -> _Suppress:
     return _Suppress()
 
 
+def _read_chunked_snapshot(reader: FramedReader) -> bytes:
+    """Assemble a snapshot_start/chunk/end sequence, failing closed on defects.
+
+    Validates exact byte ordering (monotonic seq), exact total (sum matches
+    the announced total_bytes), and rejects any malformed or partial
+    sequence instead of yielding corrupted history.
+    """
+    try:
+        first = reader.read_message()
+    except SessionProtocolError as exc:
+        raise SessionProtocolError(f"E_SESSION_PROTOCOL_INVALID: incomplete snapshot sequence: {exc}") from exc
+    if first.get("event") != "snapshot_start" or not isinstance(first.get("total_bytes"), int):
+        raise SessionProtocolError("E_SESSION_PROTOCOL_INVALID: malformed snapshot sequence")
+    total = int(first["total_bytes"])
+    if total < 0 or total > 8 * 1024 * 1024:
+        raise SessionProtocolError("E_SESSION_PROTOCOL_INVALID: malformed snapshot sequence")
+    parts: list[bytes] = []
+    received = 0
+    expected_seq = 0
+    while True:
+        try:
+            event = reader.read_message()
+        except SessionProtocolError as exc:
+            raise SessionProtocolError(f"E_SESSION_PROTOCOL_INVALID: incomplete snapshot sequence: {exc}") from exc
+        kind = event.get("event")
+        if kind == "snapshot_chunk":
+            if event.get("seq") != expected_seq or not isinstance(event.get("data_b64"), str):
+                raise SessionProtocolError("E_SESSION_PROTOCOL_INVALID: malformed snapshot sequence")
+            try:
+                chunk = base64.b64decode(event["data_b64"].encode("ascii"), validate=True)
+            except (binascii.Error, ValueError, UnicodeEncodeError) as exc:
+                raise SessionProtocolError(f"E_SESSION_PROTOCOL_INVALID: malformed snapshot sequence: {exc}") from exc
+            if len(chunk) > SNAPSHOT_CHUNK_BYTES + 1024:
+                raise SessionProtocolError("E_SESSION_PROTOCOL_INVALID: malformed snapshot sequence")
+            received += len(chunk)
+            if received > total:
+                raise SessionProtocolError("E_SESSION_PROTOCOL_INVALID: malformed snapshot sequence")
+            parts.append(chunk)
+            expected_seq += 1
+        elif kind == "snapshot_end":
+            if event.get("total_bytes") != total or received != total:
+                raise SessionProtocolError("E_SESSION_PROTOCOL_INVALID: malformed snapshot sequence")
+            return b"".join(parts)
+        else:
+            raise SessionProtocolError("E_SESSION_PROTOCOL_INVALID: malformed snapshot sequence")
+
+
 @dataclass(frozen=True)
 class ManagedSessionStatus:
     session_id: str
@@ -155,17 +292,29 @@ class ManagedSessionClient:
 
             mode = _stat.S_IMODE(base.stat().st_mode)
             if mode & 0o022:
-                raise RuntimeError("E_SESSION_START_TIMEOUT: state directory must not be group/world writable (expected 0700)")
+                raise RuntimeError("E_SESSION_STATE_INVALID: state directory must not be group/world writable (expected 0700)")
             os.chmod(base, 0o700)
         except OSError:
             pass
-        # Adopt a healthy host instead of double-starting.
-        if managed_session_is_reconnectable(str(base)):
-            return cls.connect(str(base))
-        # If stale artifacts exist without a live host, the host itself cleans
-        # them; remove a dead socket file eagerly so bind succeeds.
-        _, _, socket_path = _state_paths(str(base))
-        if (socket_path.is_symlink() or socket_path.exists()) and not _try_status(str(base)):
+        with _startup_lock(str(base)):
+            return cls._start_locked(state_dir=str(base), command=tuple(command), cwd=str(cwd or "."))
+
+    @classmethod
+    def _start_locked(cls, *, state_dir: str, command: tuple[str, ...], cwd: str) -> ManagedSessionClient:
+        from .session_host import classify_startup_state
+
+        # Re-check under the lock: a concurrent starter may have won.
+        decision, _meta = classify_startup_state(state_dir)
+        if decision == "live":
+            return cls.connect(state_dir)
+        if decision == "uncertain":
+            raise RuntimeError(
+                "E_SESSION_OWNERSHIP_UNCERTAIN: Managed session metadata exists but no authenticated live host is available "
+                "while the recorded host process may still be alive. Refusing to start a second agent for this state directory."
+            )
+        # Stale or absent: remove a dead socket file eagerly so bind succeeds.
+        _, _, socket_path = _state_paths(state_dir)
+        if (socket_path.is_symlink() or socket_path.exists()) and not _try_status(state_dir):
             # Only unlink if nothing answers; never delete directories.
             with _suppress():
                 socket_path.unlink()
@@ -174,14 +323,14 @@ class ManagedSessionClient:
             "-m",
             "terminal_monitor.session_host",
             "--state-dir",
-            str(base),
+            state_dir,
             "--cwd",
-            str(cwd or "."),
+            cwd,
             "--command-json",
             json.dumps(list(command)),
         ]
         try:
-            subprocess.Popen(
+            proc = subprocess.Popen(
                 argv,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -191,11 +340,12 @@ class ManagedSessionClient:
             )
         except OSError as exc:
             raise RuntimeError(f"E_SESSION_START_TIMEOUT: Managed SessionHost did not become ready: {exc}") from exc
+        _register_host_proc(state_dir, proc)
         deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
         last_error: Exception | None = None
         while time.monotonic() < deadline:
             try:
-                client = cls.connect(str(base))
+                client = cls.connect(state_dir)
             except (OSError, ValueError, SessionProtocolError) as exc:
                 last_error = exc
                 time.sleep(0.1)
@@ -288,14 +438,20 @@ class ManagedSessionClient:
             raise RuntimeError(f"E_SESSION_PROTOCOL_INVALID: invalid status response: {exc}") from exc
 
     def snapshot(self, limit_bytes: int = 512 * 1024) -> bytes:
-        resp = self._checked({"op": "snapshot", "limit_bytes": int(limit_bytes)})
-        raw = resp.get("data_b64", "")
-        if not isinstance(raw, str):
-            raise RuntimeError("E_SESSION_PROTOCOL_INVALID: invalid snapshot response")
+        """Fetch replay via chunked transfer; each frame stays under 64 KiB."""
+        _, _, socket_path = _state_paths(self._state_dir)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(30.0)
         try:
-            return base64.b64decode(raw.encode("ascii"))
-        except (binascii.Error, ValueError) as exc:
-            raise RuntimeError(f"E_SESSION_PROTOCOL_INVALID: invalid snapshot payload: {exc}") from exc
+            sock.connect(str(socket_path))
+            body = {"version": PROTOCOL_VERSION, "token": self._token, "op": "snapshot", "limit_bytes": int(limit_bytes), "chunked": True}
+            send_message(sock, body)
+            return _read_chunked_snapshot(FramedReader(sock))
+        except OSError as exc:
+            raise ConnectionError(f"E_SESSION_STALE: cannot reach managed session host: {exc}") from exc
+        finally:
+            with _suppress():
+                sock.close()
 
     def send_bytes(self, payload: bytes) -> None:
         if len(payload) > MAX_CONTROL_MESSAGE_BYTES:
@@ -308,7 +464,24 @@ class ManagedSessionClient:
         self._checked({"op": "resize", "cols": cols, "rows": rows})
 
     def terminate_session(self) -> None:
-        self._checked({"op": "terminate"}, timeout=15.0)
+        """Terminate the managed session; already-exited sessions succeed silently."""
+        try:
+            self._checked({"op": "terminate"}, timeout=TERMINATE_REAP_SECONDS)
+        except (ConnectionError, OSError) as failure:
+            # The host is unreachable. A host this process spawned proves the
+            # outcome by exiting; otherwise durable metadata must show that the
+            # session finished. Anything else is reported as a failure, without
+            # waiting on a host that was never asked to stop.
+            if _reap_host_proc(self._state_dir, timeout=TERMINATE_REAP_SECONDS) is True:
+                return
+            try:
+                final = self.status()
+            except (OSError, ValueError, SessionProtocolError, PermissionError, ConnectionError, RuntimeError):
+                raise failure from None
+            if final.alive:
+                raise failure from None
+            return
+        _reap_host_proc(self._state_dir, timeout=TERMINATE_REAP_SECONDS)
 
     def stream(self) -> Iterator[bytes]:
         """Yield replay snapshot then live output until the child exits."""
@@ -319,22 +492,27 @@ class ManagedSessionClient:
             sock.connect(str(socket_path))
             send_message(sock, {"version": PROTOCOL_VERSION, "token": self._token, "op": "stream"})
             sock.settimeout(70.0)
+            reader = FramedReader(sock)
+            try:
+                initial = _read_chunked_snapshot(reader)
+            except SessionProtocolError:
+                return
+            if initial:
+                yield initial
             while True:
                 try:
-                    event = receive_message(sock)
+                    event = reader.read_message()
                 except SessionProtocolError:
                     break
                 kind = event.get("event")
-                if kind in ("snapshot", "output"):
+                if kind == "output":
                     raw = event.get("data_b64", "")
-                    if isinstance(raw, str) and raw:
-                        try:
-                            yield base64.b64decode(raw.encode("ascii"))
-                        except (binascii.Error, ValueError):
-                            break
-                    elif kind == "snapshot":
-                        # Empty snapshot is valid; keep streaming.
-                        continue
+                    if not isinstance(raw, str) or not raw:
+                        break
+                    try:
+                        yield base64.b64decode(raw.encode("ascii"))
+                    except (binascii.Error, ValueError):
+                        break
                 elif kind == "exit":
                     break
                 else:
@@ -347,6 +525,7 @@ class ManagedSessionClient:
 
     def close(self) -> None:
         self._closed = True
+        _reap_host_proc(self._state_dir, timeout=0)
 
 
 def _try_status(state_dir: str) -> dict[str, Any] | None:

@@ -11,6 +11,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from terminal_monitor.session_protocol import (  # noqa: E402
     MAX_CONTROL_MESSAGE_BYTES,
+    FramedReader,
     SessionProtocolError,
     encode_message,
     receive_message,
@@ -99,6 +100,69 @@ class SessionProtocolTests(unittest.TestCase):
     def test_encode_rejects_non_dict(self):
         with self.assertRaises(SessionProtocolError):
             encode_message(["not", "a", "dict"])  # type: ignore[arg-type]
+
+
+class FramedReaderTests(unittest.TestCase):
+    def _pair(self):
+        s1, s2 = socket.socketpair()
+        self.addCleanup(s1.close)
+        self.addCleanup(s2.close)
+        return s1, s2
+
+    def test_multiple_messages_in_one_packet(self):
+        s1, s2 = self._pair()
+        s1.sendall(encode_message({"n": 1}) + encode_message({"n": 2}) + encode_message({"n": 3}))
+        reader = FramedReader(s2)
+        self.assertEqual(reader.read_message(), {"n": 1})
+        self.assertEqual(reader.read_message(), {"n": 2})
+        self.assertEqual(reader.read_message(), {"n": 3})
+
+    def test_message_split_across_packets(self):
+        s1, s2 = self._pair()
+        encoded = encode_message({"key": "value", "n": 42})
+        for index in range(0, len(encoded), 3):
+            s1.sendall(encoded[index : index + 3])
+        s1.close()
+        reader = FramedReader(s2)
+        self.assertEqual(reader.read_message(), {"key": "value", "n": 42})
+
+    def test_back_to_back_large_messages(self):
+        s1, s2 = self._pair()
+        big = "y" * 8000
+        payload = encode_message({"data": big, "i": 1}) + encode_message({"data": big, "i": 2})
+
+        def _send() -> None:
+            with contextlib.suppress(OSError):
+                s1.sendall(payload)
+
+        sender = threading.Thread(target=_send, daemon=True)
+        sender.start()
+        reader = FramedReader(s2)
+        first = reader.read_message()
+        second = reader.read_message()
+        sender.join(timeout=5.0)
+        self.assertEqual((first["i"], second["i"]), (1, 2))
+        self.assertEqual(first["data"], big)
+
+    def test_oversized_message(self):
+        s1, s2 = self._pair()
+
+        def _send() -> None:
+            with contextlib.suppress(OSError):
+                s1.sendall(b"{" + b"z" * (MAX_CONTROL_MESSAGE_BYTES + 10) + b"\n")
+
+        sender = threading.Thread(target=_send, daemon=True)
+        sender.start()
+        with self.assertRaises(SessionProtocolError):
+            FramedReader(s2).read_message()
+        sender.join(timeout=5.0)
+
+    def test_eof_mid_message(self):
+        s1, s2 = self._pair()
+        s1.sendall(b'{"half": tru')
+        s1.close()
+        with self.assertRaises(SessionProtocolError):
+            FramedReader(s2).read_message()
 
 
 if __name__ == "__main__":

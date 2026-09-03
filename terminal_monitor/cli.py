@@ -319,15 +319,12 @@ def _run_attach(args: argparse.Namespace, config: Any) -> int:
         return 2
     state_dir = _resolve_attach_state_dir(args, config)
     from .managed_pty import ManagedSessionClient
+    from .session_protocol import SessionProtocolError
 
     try:
         client = ManagedSessionClient.connect(state_dir)
-    except (OSError, ValueError):
-        from .session_protocol import SessionProtocolError as _SPE  # noqa: F401
-
-        print("E_SESSION_NOT_FOUND: No active managed session exists for this state directory.", file=sys.stderr)
-        return 2
-    except Exception:  # fail closed without leaking token material
+    except (OSError, ValueError, SessionProtocolError, PermissionError, ConnectionError, RuntimeError):
+        # Fixed message: never leak token material or socket details.
         print("E_SESSION_NOT_FOUND: No active managed session exists for this state directory.", file=sys.stderr)
         return 2
     limit = int(getattr(args, "limit_bytes", 512 * 1024) or 512 * 1024)
@@ -365,14 +362,12 @@ def _run_attach(args: argparse.Namespace, config: Any) -> int:
     finally:
         import contextlib as _contextlib
 
-        with _contextlib.suppress(Exception):
+        with _contextlib.suppress(OSError, ValueError, RuntimeError):
             client.close()
     return 0
 
 
 def _run_share(args: argparse.Namespace, config: Any) -> int:
-    from .state import _atomic_json_write
-
     state_dir = _resolve_attach_state_dir(args, config)
     provider_name = str(getattr(args, "provider", "shell-online") or "shell-online").lower().strip()
     if provider_name not in ("shell-online", "shell.online", "shell_online"):
@@ -380,6 +375,7 @@ def _run_share(args: argparse.Namespace, config: Any) -> int:
         return 2
     # Sharing requires a healthy managed session.
     from .managed_pty import ManagedSessionClient
+    from .session_protocol import SessionProtocolError
 
     try:
         probe = ManagedSessionClient.connect(state_dir)
@@ -388,28 +384,54 @@ def _run_share(args: argparse.Namespace, config: Any) -> int:
         if not probe_status.alive:
             print("E_SESSION_STALE: no live managed session to share", file=sys.stderr)
             return 2
-    except (OSError, ValueError, RuntimeError, ConnectionError, PermissionError) as exc:
-        print(f"E_SESSION_NOT_FOUND: {exc}", file=sys.stderr)
-        return 2
-    except Exception as exc:
+    except (OSError, ValueError, SessionProtocolError, RuntimeError, ConnectionError, PermissionError) as exc:
         print(f"E_SESSION_NOT_FOUND: {exc}", file=sys.stderr)
         return 2
     from .shell_online import ShellOnlineProvider
 
     provider = ShellOnlineProvider()
     try:
-        result = provider.share_read_only_with_password(state_dir=state_dir)
-    except RuntimeError as exc:
+        result = _create_share(provider, state_dir)
+    except (RuntimeError, ValueError, OSError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    except ValueError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-    # Persist only non-secret metadata.
+    print("Remote view: read-only")
+    print(f"Encrypted: {'yes' if result.share.encrypted else 'no'}")
+    print(f"URL: {result.share.share_url}")
+    print(f"Browser password: {result.browser_password}")
+    return 0
+
+
+def _read_saved_share(state_dir: str) -> dict[str, Any]:
     try:
-        remote_path = Path(state_dir) / "remote-share.json"
-        _atomic_json_write(
-            remote_path,
+        saved = json.loads((Path(state_dir) / "remote-share.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return saved if isinstance(saved, dict) else {}
+
+
+def _create_share(provider: Any, state_dir: str) -> Any:
+    """Create a read-only share, stopping a previously saved one first.
+
+    Prevents duplicate remote links across monitor restarts: a saved active
+    session is stopped (best-effort) before a new share is created. Only
+    non-secret metadata is persisted; the browser password stays ephemeral.
+    Remote lifecycle never touches the monitor, SessionHost, or agent.
+    """
+    import contextlib as _contextlib_share
+
+    from .state import _atomic_json_write as _write_share
+
+    previous = _read_saved_share(state_dir)
+    previous_id = str(previous.get("session_id", "")) if previous.get("active") else ""
+    if previous_id:
+        ok, _detail = provider.stop(previous_id)
+        if not ok:
+            print(f"REMOTE_SHARE_ORPHANED: previous remote session {previous_id} could not be stopped; creating a new share.", file=sys.stderr)
+    result = provider.share_read_only_with_password(state_dir=state_dir)
+    with _contextlib_share.suppress(OSError):
+        _write_share(
+            Path(state_dir) / "remote-share.json",
             {
                 "provider": result.share.provider,
                 "active": True,
@@ -419,13 +441,7 @@ def _run_share(args: argparse.Namespace, config: Any) -> int:
                 "share_url": result.share.share_url,
             },
         )
-    except OSError:
-        pass
-    print("Remote view: read-only")
-    print(f"Encrypted: {'yes' if result.share.encrypted else 'no'}")
-    print(f"URL: {result.share.share_url}")
-    print(f"Browser password: {result.browser_password}")
-    return 0
+    return result
 
 
 def _run_unshare(args: argparse.Namespace, config: Any) -> int:
@@ -434,12 +450,8 @@ def _run_unshare(args: argparse.Namespace, config: Any) -> int:
     state_dir = _resolve_attach_state_dir(args, config)
     session_id = str(getattr(args, "session_id", None) or "")
     if not session_id:
-        try:
-            saved = json.loads((Path(state_dir) / "remote-share.json").read_text(encoding="utf-8"))
-            if isinstance(saved, dict):
-                session_id = str(saved.get("session_id", ""))
-        except (OSError, ValueError):
-            session_id = ""
+        saved = _read_saved_share(state_dir)
+        session_id = str(saved.get("session_id", ""))
     if not session_id:
         print("E_REMOTE_SHARE_FAILED: no saved remote session to stop", file=sys.stderr)
         return 2
@@ -459,26 +471,25 @@ def _run_unshare(args: argparse.Namespace, config: Any) -> int:
 
 
 def _run_terminate_session(args: argparse.Namespace, config: Any) -> int:
+    import contextlib as _contextlib3
+
+    from .session_protocol import SessionProtocolError
+
     state_dir = _resolve_attach_state_dir(args, config)
     from .managed_pty import ManagedSessionClient
 
     try:
         client = ManagedSessionClient.connect(state_dir)
-    except (OSError, ValueError) as exc:
-        print(str(exc), file=sys.stderr)
-        return 2
-    except Exception:
-        print("E_SESSION_NOT_FOUND: No active managed session exists for this state directory.", file=sys.stderr)
+    except (OSError, ValueError, SessionProtocolError, PermissionError, ConnectionError, RuntimeError) as exc:
+        print(f"E_SESSION_NOT_FOUND: {exc}", file=sys.stderr)
         return 2
     try:
         client.terminate_session()
-    except (OSError, ValueError, RuntimeError, ConnectionError, PermissionError) as exc:
+    except (OSError, ValueError, SessionProtocolError, RuntimeError, ConnectionError, PermissionError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     finally:
-        import contextlib as _contextlib3
-
-        with _contextlib3.suppress(Exception):
+        with _contextlib3.suppress(OSError, ValueError, RuntimeError):
             client.close()
     print("TERMINATED")
     return 0
@@ -642,27 +653,14 @@ def main() -> int:
 
     # Optional read-only remote sharing starts only after managed startup
     # succeeds. Provider failure is non-fatal: local supervision continues.
+    # A previously saved share is stopped first so restarts do not multiply
+    # remote links.
     remote_provider = str(getattr(config, "remote_provider", "") or "").lower().strip()
     if remote_provider in ("shell-online", "shell.online", "shell_online"):
         try:
-            import contextlib as _ctxlib
-
             from .shell_online import ShellOnlineProvider
-            from .state import _atomic_json_write as _write_remote
 
-            share_result = ShellOnlineProvider().share_read_only_with_password(state_dir=monitor.state_dir)
-            with _ctxlib.suppress(OSError):
-                _write_remote(
-                    Path(monitor.state_dir) / "remote-share.json",
-                    {
-                        "provider": share_result.share.provider,
-                        "active": True,
-                        "read_only": True,
-                        "encrypted": bool(share_result.share.encrypted),
-                        "session_id": share_result.share.session_id,
-                        "share_url": share_result.share.share_url,
-                    },
-                )
+            share_result = _create_share(ShellOnlineProvider(), monitor.state_dir)
             print("Remote view: read-only")
             print(f"Encrypted: {'yes' if share_result.share.encrypted else 'no'}")
             print(f"URL: {share_result.share.share_url}")

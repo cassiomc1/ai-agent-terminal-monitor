@@ -26,7 +26,15 @@ from pathlib import Path
 from typing import Any
 
 from .replay import ReplayBuffer
-from .session_protocol import MAX_CONTROL_MESSAGE_BYTES, PROTOCOL_VERSION, SessionProtocolError, receive_message, send_message
+from .safety import redact_sensitive
+from .session_protocol import (
+    MAX_CONTROL_MESSAGE_BYTES,
+    PROTOCOL_VERSION,
+    SNAPSHOT_CHUNK_BYTES,
+    SessionProtocolError,
+    receive_message,
+    send_message,
+)
 from .state import _atomic_json_write, now_iso
 
 SESSION_METADATA_NAME = "managed-session.json"
@@ -84,6 +92,14 @@ def _pid_alive(pid: int | None) -> bool:
     return True
 
 
+def _read_metadata_dict(state_dir: str) -> dict[str, Any] | None:
+    try:
+        data = json.loads(_metadata_path(state_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _try_authenticated_status(state_dir: str, timeout: float = 2.0) -> dict[str, Any] | None:
     try:
         sock_path = _socket_path(state_dir)
@@ -100,13 +116,44 @@ def _try_authenticated_status(state_dir: str, timeout: float = 2.0) -> dict[str,
             send_message(client, {"version": PROTOCOL_VERSION, "token": token, "op": "status"})
             resp = receive_message(client)
         finally:
-            with _suppress():
+            with contextlib.suppress(OSError):
                 client.close()
         if isinstance(resp, dict) and resp.get("ok"):
             return resp
         return None
     except (OSError, SessionProtocolError, ValueError, UnicodeDecodeError):
         return None
+
+
+def classify_startup_state(state_dir: str) -> tuple[str, dict[str, Any] | None]:
+    """Decide whether a new SessionHost may take ownership of ``state_dir``.
+
+    Returns ``(decision, metadata)`` where decision is one of:
+
+    - ``absent``: no metadata; safe to create.
+    - ``live``: an authenticated host answers; adopt instead of creating.
+    - ``stale``: metadata exists but the recorded host PID is provably dead.
+    - ``uncertain``: metadata exists, the host cannot be reached, but the
+      recorded PID may still be alive. Callers must FAIL CLOSED: never delete
+      ownership artifacts and never start a second agent.
+    """
+    meta = _read_metadata_dict(state_dir)
+    if meta is None:
+        meta_path = _metadata_path(state_dir)
+        if meta_path.exists() or meta_path.is_symlink():
+            return "uncertain", None
+        return "absent", None
+    live = _try_authenticated_status(state_dir)
+    if live and live.get("session_id"):
+        return "live", meta
+    raw_pid = meta.get("host_pid")
+    try:
+        host_pid = int(raw_pid) if raw_pid is not None else None
+    except (TypeError, ValueError):
+        host_pid = None
+    if host_pid is not None and not _pid_alive(host_pid):
+        return "stale", meta
+    return "uncertain", meta
 
 
 class _Suppress:
@@ -127,19 +174,15 @@ def _ensure_private_state_dir(state_dir: str) -> Path:
         try:
             mode = stat.S_IMODE(base.stat().st_mode)
         except OSError as exc:
-            raise RuntimeError(f"E_SESSION_START_TIMEOUT: cannot stat state directory: {exc}") from exc
+            raise RuntimeError(f"E_SESSION_STATE_INVALID: cannot stat state directory: {exc}") from exc
         if os.name == "posix" and mode & 0o022:
             # Group/world writable: refuse to trust.
-            raise RuntimeError("E_SESSION_START_TIMEOUT: state directory must not be group/world writable (expected 0700)")
-        import contextlib as _ctx
-
-        with _ctx.suppress(OSError):
+            raise RuntimeError("E_SESSION_STATE_INVALID: state directory must not be group/world writable (expected 0700)")
+        with contextlib.suppress(OSError):
             os.chmod(base, 0o700)
     else:
         base.mkdir(parents=True, exist_ok=True)
-        import contextlib as _ctx2
-
-        with _ctx2.suppress(OSError):
+        with contextlib.suppress(OSError):
             os.chmod(base, 0o700)
     return base
 
@@ -153,6 +196,47 @@ def _apply_winsize(fd: int, cols: int, rows: int) -> None:
         return
     with contextlib.suppress(OSError):
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+
+_SENSITIVE_ARG_NAMES = frozenset(
+    {
+        "token",
+        "api-key",
+        "apikey",
+        "api_key",
+        "access-token",
+        "access_token",
+        "refresh-token",
+        "refresh_token",
+        "password",
+        "passwd",
+        "secret",
+        "client-secret",
+        "client_secret",
+        "auth",
+        "authorization",
+    }
+)
+
+
+def _command_display(command: tuple[str, ...]) -> str:
+    """Redacted one-line description safe for metadata (never raw secrets).
+
+    Masks values following sensitive flags (``--token value``) in addition
+    to the repository's standard inline credential patterns.
+    """
+    scrubbed: list[str] = []
+    mask_next = False
+    for part in command:
+        if mask_next:
+            scrubbed.append("<redacted>")
+            mask_next = False
+            continue
+        name = part.lstrip("-").lower().replace("_", "-")
+        if name in _SENSITIVE_ARG_NAMES or name.endswith(("token", "password", "secret")):
+            mask_next = True
+        scrubbed.append(part)
+    return redact_sensitive(" ".join(scrubbed))
 
 
 class SessionHost:
@@ -175,7 +259,14 @@ class SessionHost:
         self._master_fd: int | None = None
         self._root_pid: int | None = None
         self._exit_code: int | None = None
+        # _exit_seen: waitpid() observed child death (authoritative liveness).
+        self._exit_seen = threading.Event()
+        # _pty_eof: reader drained the PTY to EOF/EIO.
+        self._pty_eof = threading.Event()
+        # _child_exited: session fully finalized (drained + metadata written).
         self._child_exited = threading.Event()
+        self._finalize_lock = threading.Lock()
+        self._finalized = False
         self._shutdown = threading.Event()
         self._stream_clients: list[queue.Queue[bytes | None]] = []
         self._stream_lock = threading.Lock()
@@ -200,7 +291,8 @@ class SessionHost:
                 "backend": "pty",
                 "host_pid": os.getpid(),
                 "root_pid": self._root_pid,
-                "command": list(self.config.command),
+                "executable": self.config.command[0] if self.config.command else "",
+                "command_display": _command_display(self.config.command),
                 "cwd": self.config.cwd,
                 "started_at": self.started_at,
                 "state": state,
@@ -219,6 +311,17 @@ class SessionHost:
         with contextlib.suppress(OSError):
             os.chmod(token_path, 0o600)
 
+    def _remove_known_artifacts(self, base: Path) -> None:
+        # Only the three files this host owns; never directories, never
+        # anything outside the resolved state directory.
+        for name in (SESSION_SOCKET_NAME, SESSION_METADATA_NAME, SESSION_TOKEN_NAME):
+            try:
+                target = _resolved_inside(base, name)
+                if target.is_symlink() or target.is_file() or _is_socket_path(target):
+                    target.unlink()
+            except (OSError, ValueError):
+                pass
+
     # -- lifecycle -----------------------------------------------------
     def run(self) -> int:
         if os.name != "posix":
@@ -234,23 +337,21 @@ class SessionHost:
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
             return 2
-        # Duplicate / stale handling before we own anything.
-        meta_path = _resolved_inside(base, SESSION_METADATA_NAME)
-        if meta_path.is_file():
-            live = _try_authenticated_status(str(base))
-            if live and live.get("session_id"):
-                print("E_SESSION_ALREADY_ACTIVE: A healthy managed session already exists for this state directory.", file=sys.stderr)
-                return 2
-            # Stale: remove only known session artifacts inside the state dir.
-            for name in (SESSION_SOCKET_NAME, SESSION_METADATA_NAME, SESSION_TOKEN_NAME):
-                try:
-                    p = _resolved_inside(base, name)
-                    if p.is_symlink() or p.is_file() or _is_socket_path(p):
-                        p.unlink()
-                except (OSError, ValueError):
-                    pass
-            # If host PID from stale metadata is still alive but unauthenticated,
-            # do not kill it; we simply take over the state dir slot.
+        # Ownership decision before we own anything.
+        decision, _meta = classify_startup_state(str(base))
+        if decision == "live":
+            print("E_SESSION_ALREADY_ACTIVE: A healthy managed session already exists for this state directory.", file=sys.stderr)
+            return 2
+        if decision == "uncertain":
+            print(
+                "E_SESSION_OWNERSHIP_UNCERTAIN: Managed session metadata exists but no authenticated live host is available "
+                "while the recorded host process may still be alive. Refusing to start a second agent for this state directory.",
+                file=sys.stderr,
+            )
+            return 2
+        if decision == "stale":
+            # Previous host provably dead: safe to clean only our artifacts.
+            self._remove_known_artifacts(base)
         if not self.config.command:
             print("E_MANAGED_COMMAND_REQUIRED: The pty backend requires a non-empty agent command.", file=sys.stderr)
             return 2
@@ -281,6 +382,9 @@ class SessionHost:
             listener.listen(16)
         except OSError as exc:
             print(f"E_SESSION_START_TIMEOUT: cannot bind control socket: {exc}", file=sys.stderr)
+            self._terminate_group()
+            with contextlib.suppress(OSError):
+                listener.close()
             return 2
         with contextlib.suppress(OSError):
             os.chmod(sock_path, 0o600)
@@ -294,20 +398,46 @@ class SessionHost:
         try:
             self._accept_loop(listener)
         finally:
-            self._shutdown.set()
+            self._finalize()
+        return 0
+
+    def _finalize(self) -> None:
+        """Record final state exactly once: wake streams, close down, persist."""
+        with self._finalize_lock:
+            if self._finalized:
+                return
+            self._finalized = True
+        self._child_exited.set()
+        self._shutdown.set()
+        with self._stream_lock:
+            for watch in list(self._stream_clients):
+                with _suppress():
+                    watch.put_nowait(None)
+        if self._listener is not None:
             with _suppress():
-                listener.close()
+                self._listener.shutdown(socket.SHUT_RDWR)
+            with _suppress():
+                self._listener.close()
+        try:
+            _, _, sock_path = self._paths()
+        except ValueError:
+            sock_path = None
+        if sock_path is not None:
             with _suppress():
                 if sock_path.exists():
                     sock_path.unlink()
-            # Record final state; keep metadata with exit code for reconnectors.
-            try:
-                state = "exited" if self._child_exited.is_set() else "stopped"
-                self._write_metadata(state)
-            except OSError:
-                pass
-            self._close_master()
-        return 0
+        try:
+            state = "exited" if self._exit_seen.is_set() else "stopped"
+            self._write_metadata(state)
+        except OSError:
+            pass
+        self._close_master()
+
+    def _maybe_finalize(self) -> None:
+        # Finalize once the child death was observed AND the PTY drained, or
+        # once shutdown was requested (explicit terminate path).
+        if self._shutdown.is_set() or (self._exit_seen.is_set() and self._pty_eof.is_set()):
+            self._finalize()
 
     def _fork_child(self, cwd: str) -> tuple[int, int]:
         import pty
@@ -342,20 +472,23 @@ class SessionHost:
         try:
             sel.register(self._master_fd, selectors.EVENT_READ)
         except (OSError, ValueError):
-            self._child_exited.set()
+            self._pty_eof.set()
+            self._maybe_finalize()
             return
+        drained = False
         while not self._shutdown.is_set() and not self._child_exited.is_set():
             try:
                 events = sel.select(timeout=0.2)
             except (OSError, ValueError):
                 break
             if not events:
-                # Poll child liveness so EOF without readable bytes still ends.
-                if self._root_pid is not None and not _pid_alive(self._root_pid):
+                # No readable bytes and child provably gone: PTY is drained.
+                if self._root_pid is not None and (self._exit_seen.is_set() or not _pid_alive(self._root_pid)):
+                    drained = True
                     break
                 continue
             try:
-                chunk = os.read(self._master_fd, 65536)
+                chunk = os.read(self._master_fd, SNAPSHOT_CHUNK_BYTES)
             except BlockingIOError:
                 continue
             except OSError:
@@ -366,9 +499,16 @@ class SessionHost:
                 self._replay.append(chunk)
             self.last_output_at = now_iso()
             self._fanout(chunk)
+        else:
+            drained = self._pty_eof.is_set()
         with _suppress():
             sel.close()
-        # Do not set _child_exited here; reaper owns exit bookkeeping.
+        if drained or self._shutdown.is_set():
+            self._pty_eof.set()
+        else:
+            # EOF/EIO path: the PTY is drained by definition.
+            self._pty_eof.set()
+        self._maybe_finalize()
 
     def _reaper_loop(self) -> None:
         assert self._root_pid is not None
@@ -390,38 +530,27 @@ class SessionHost:
                     exit_code = 1
                 break
         self._exit_code = exit_code if exit_code is not None else 1
-        self._child_exited.set()
-        self._shutdown.set()
-        # Wake stream consumers with an exit sentinel.
-        with self._stream_lock:
-            for q in list(self._stream_clients):
-                with _suppress():
-                    q.put_nowait(None)
-        # Close listener so accept loop ends promptly.
-        if self._listener is not None:
-            with _suppress():
-                self._listener.shutdown(socket.SHUT_RDWR)
-            with _suppress():
-                self._listener.close()
-        with contextlib.suppress(OSError):
-            self._write_metadata("exited")
+        # Record death first so status() stops reporting alive, but keep the
+        # session open until the reader drains final PTY output.
+        self._exit_seen.set()
+        self._maybe_finalize()
 
     def _fanout(self, chunk: bytes) -> None:
         dead: list[queue.Queue[bytes | None]] = []
         with self._stream_lock:
             clients = list(self._stream_clients)
-        for q in clients:
+        for watch in clients:
             try:
-                q.put_nowait(chunk)
+                watch.put_nowait(chunk)
             except queue.Full:
-                dead.append(q)
+                dead.append(watch)
         if dead:
             with self._stream_lock:
-                for q in dead:
-                    if q in self._stream_clients:
-                        self._stream_clients.remove(q)
+                for watch in dead:
+                    if watch in self._stream_clients:
+                        self._stream_clients.remove(watch)
                         with _suppress():
-                            q.put_nowait(None)
+                            watch.put_nowait(None)
 
     # -- control plane -------------------------------------------------
     def _accept_loop(self, listener: socket.socket) -> None:
@@ -480,9 +609,11 @@ class SessionHost:
         with _suppress():
             conn.close()
 
+    def _is_live(self) -> bool:
+        return self._root_pid is not None and not self._exit_seen.is_set() and _pid_alive(self._root_pid)
+
     def _handle_status(self, conn: socket.socket) -> None:
         try:
-            alive = self._root_pid is not None and not self._child_exited.is_set() and _pid_alive(self._root_pid)
             send_message(
                 conn,
                 {
@@ -490,7 +621,7 @@ class SessionHost:
                     "session_id": self.session_id,
                     "host_pid": os.getpid(),
                     "root_pid": self._root_pid,
-                    "alive": bool(alive),
+                    "alive": self._is_live(),
                     "exit_code": self._exit_code,
                     "started_at": self.started_at,
                     "last_output_at": self.last_output_at,
@@ -499,6 +630,17 @@ class SessionHost:
         finally:
             with _suppress():
                 conn.close()
+
+    def _replay_snapshot(self, limit_bytes: int) -> bytes:
+        with self._replay_lock:
+            return self._replay.snapshot(limit_bytes)
+
+    def _send_snapshot_frames(self, conn: socket.socket, data: bytes) -> None:
+        send_message(conn, {"event": "snapshot_start", "total_bytes": len(data)})
+        chunks = [data[offset : offset + SNAPSHOT_CHUNK_BYTES] for offset in range(0, len(data), SNAPSHOT_CHUNK_BYTES)]
+        for seq, chunk in enumerate(chunks):
+            send_message(conn, {"event": "snapshot_chunk", "seq": seq, "data_b64": base64.b64encode(chunk).decode("ascii")})
+        send_message(conn, {"event": "snapshot_end", "total_bytes": len(data)})
 
     def _handle_snapshot(self, conn: socket.socket, request: dict[str, Any]) -> None:
         try:
@@ -509,9 +651,18 @@ class SessionHost:
                 self._send_error(conn, "E_SESSION_PROTOCOL_INVALID: Managed session control message is invalid.")
                 return
             limit_int = max(0, min(limit_int, 4 * 1024 * 1024))
-            with self._replay_lock:
-                data = self._replay.snapshot(limit_int if limit_int > 0 else 0)
-            send_message(conn, {"ok": True, "data_b64": base64.b64encode(data).decode("ascii")})
+            data = self._replay_snapshot(limit_int if limit_int > 0 else 0)
+            if request.get("chunked") is True:
+                with contextlib.suppress(OSError, SessionProtocolError):
+                    self._send_snapshot_frames(conn, data)
+                return
+            try:
+                send_message(conn, {"ok": True, "data_b64": base64.b64encode(data).decode("ascii")})
+            except SessionProtocolError:
+                self._send_error(
+                    conn,
+                    "E_SNAPSHOT_TOO_LARGE: snapshot exceeds the single-frame budget; retry with chunked snapshot.",
+                )
         finally:
             with _suppress():
                 conn.close()
@@ -580,13 +731,14 @@ class SessionHost:
             self._stream_clients.append(stream_q)
         try:
             conn.settimeout(None)
-            with self._replay_lock:
-                initial = self._replay.snapshot()
-            with _suppress_send():
-                send_message(conn, {"event": "snapshot", "data_b64": base64.b64encode(initial).decode("ascii")})
+            initial = self._replay_snapshot(self.config.replay_bytes)
+            try:
+                self._send_snapshot_frames(conn, initial)
                 if self._child_exited.is_set():
                     send_message(conn, {"event": "exit", "exit_code": self._exit_code})
                     return
+            except (OSError, SessionProtocolError):
+                return
             while True:
                 try:
                     item = stream_q.get(timeout=60.0)
@@ -600,11 +752,15 @@ class SessionHost:
                         break
                     continue
                 if item is None:
-                    with _suppress_send():
+                    with contextlib.suppress(OSError, SessionProtocolError, ValueError):
                         send_message(conn, {"event": "exit", "exit_code": self._exit_code})
                     break
+                raw_item = bytes(item)
                 try:
-                    send_message(conn, {"event": "output", "data_b64": base64.b64encode(bytes(item)).decode("ascii")})
+                    # Keep every frame under the protocol budget.
+                    for offset in range(0, len(raw_item), SNAPSHOT_CHUNK_BYTES):
+                        piece = raw_item[offset : offset + SNAPSHOT_CHUNK_BYTES]
+                        send_message(conn, {"event": "output", "data_b64": base64.b64encode(piece).decode("ascii")})
                 except (OSError, SessionProtocolError):
                     break
         finally:
@@ -615,19 +771,24 @@ class SessionHost:
                 conn.close()
 
     def _handle_terminate(self, conn: socket.socket) -> None:
+        # Acknowledge FIRST so the client always observes a deterministic
+        # response even though termination tears the host down.
         try:
-            self._terminate_group()
-            with _suppress():
-                send_message(conn, {"ok": True})
+            send_message(conn, {"ok": True, "accepted": True})
+        except (OSError, SessionProtocolError):
+            pass
         finally:
             with _suppress():
                 conn.close()
+        self._terminate_group()
 
     def _terminate_group(self) -> None:
         pid = self._root_pid
         if pid is None:
-            self._child_exited.set()
+            self._exit_code = 1 if self._exit_code is None else self._exit_code
+            self._exit_seen.set()
             self._shutdown.set()
+            self._maybe_finalize()
             return
         try:
             os.killpg(pid, signal.SIGTERM)
@@ -643,6 +804,10 @@ class SessionHost:
             except (ProcessLookupError, PermissionError, OSError):
                 with contextlib.suppress(OSError):
                     os.kill(pid, signal.SIGKILL)
+        # The reaper observes real death and finalizes after the PTY drains;
+        # unblock shutdown here so a wedged child cannot hang termination.
+        self._shutdown.set()
+        self._maybe_finalize()
 
 
 class _SuppressSend:

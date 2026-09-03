@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import runpy
+import shutil
 import socket
 import stat
 import sys
@@ -38,7 +39,7 @@ from terminal_monitor.session_host import (  # noqa: E402
     build_arg_parser,
 )
 from terminal_monitor.session_protocol import PROTOCOL_VERSION, receive_message, send_message  # noqa: E402
-from terminal_monitor.shell_online import ShellOnlineProvider, _looks_like_shell_online, _resolve_binary  # noqa: E402
+from terminal_monitor.shell_online import ShellOnlineProvider, _resolve_binary, parse_shell_version  # noqa: E402
 
 
 def _wait_for(predicate, timeout=15.0, interval=0.05):
@@ -209,9 +210,15 @@ class SessionHostUnitTests(unittest.TestCase):
             try:
                 with contextlib.suppress(OSError):
                     send_message(client_sock, {"version": PROTOCOL_VERSION, "token": host.token, "op": "stream"})
-                    first = receive_message(client_sock)
-                    self.assertEqual(first.get("event"), "snapshot")
-                    self.assertEqual(base64.b64decode(first["data_b64"].encode()), b"bye")
+                    start = receive_message(client_sock)
+                    self.assertEqual(start.get("event"), "snapshot_start")
+                    self.assertEqual(start.get("total_bytes"), 3)
+                    chunk = receive_message(client_sock)
+                    self.assertEqual(chunk.get("event"), "snapshot_chunk")
+                    self.assertEqual(chunk.get("seq"), 0)
+                    self.assertEqual(base64.b64decode(chunk["data_b64"].encode()), b"bye")
+                    end = receive_message(client_sock)
+                    self.assertEqual(end.get("event"), "snapshot_end")
                     second = receive_message(client_sock)
                     self.assertEqual(second.get("event"), "exit")
                     self.assertEqual(second.get("exit_code"), 3)
@@ -223,7 +230,6 @@ class SessionHostUnitTests(unittest.TestCase):
 @unittest.skipIf(os.name != "posix", "managed PTY requires POSIX")
 class InProcessHostRunTests(unittest.TestCase):
     def test_full_lifecycle_in_process(self):
-        import base64
 
         child = (
             sys.executable,
@@ -260,16 +266,18 @@ class InProcessHostRunTests(unittest.TestCase):
                 self.assertEqual(status.session_id, "covtest")
                 client.send_bytes(b"hello\n")
                 client.resize(100, 30)
-                # Raw stream read: one snapshot event, then disconnect.
+                # Raw stream read: snapshot sequence, then disconnect.
                 token = pathlib.Path(tmp, "session-token").read_text(encoding="utf-8").strip()
                 raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 raw.settimeout(10.0)
                 try:
                     raw.connect(str(pathlib.Path(tmp, "session-control.sock")))
                     send_message(raw, {"version": PROTOCOL_VERSION, "token": token, "op": "stream"})
-                    event = receive_message(raw)
-                    self.assertEqual(event.get("event"), "snapshot")
-                    self.assertIn(b"READY", base64.b64decode(event["data_b64"].encode()))
+                    from terminal_monitor.managed_pty import _read_chunked_snapshot
+                    from terminal_monitor.session_protocol import FramedReader
+
+                    initial = _read_chunked_snapshot(FramedReader(raw))
+                    self.assertIn(b"READY", initial)
                 finally:
                     raw.close()
                 client.terminate_session()
@@ -371,15 +379,15 @@ class ShellOnlineUnitTests(unittest.TestCase):
         return str(path)
 
     def test_looks_like(self):
-        self.assertTrue(_looks_like_shell_online("shell.online v1.0"))
-        self.assertFalse(_looks_like_shell_online("totally different tool"))
+        self.assertEqual(parse_shell_version("shell 0.7.3\n"), "0.7.3")
+        self.assertIsNone(parse_shell_version("totally different tool"))
 
     def test_resolve_binary_explicit_missing(self):
         self.assertIsNone(_resolve_binary("/nonexistent-shell-binary-xyz"))
 
     def test_available_success_and_failures(self):
         with tempfile.TemporaryDirectory() as tmp:
-            good = self._script(tmp, 'echo "shell.online v1.2.3"')
+            good = self._script(tmp, 'echo "shell 0.7.3"')
             ok, _ = ShellOnlineProvider(binary=good).available()
             self.assertTrue(ok)
         with tempfile.TemporaryDirectory() as tmp:
@@ -396,7 +404,7 @@ class ShellOnlineUnitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             script = self._script(
                 tmp,
-                'if [ "$1" = "--version" ]; then echo "shell.online v1"; elif [ "$1" = "kill" ]; then exit 0; else exit 1; fi',
+                'if [ "$1" = "--version" ]; then echo "shell 0.7.3"; elif [ "$1" = "kill" ]; then exit 0; else exit 1; fi',
             )
             ok, _ = ShellOnlineProvider(binary=script).stop("abc123")
             self.assertTrue(ok)
@@ -407,8 +415,8 @@ class ShellOnlineUnitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             script = self._script(
                 tmp,
-                'if [ "$1" = "--version" ]; then echo "shell.online v1"; else '
-                "echo '{\"share_url\":\"https://x\",\"session_id\":\"s1\",\"e2ee_password\":\"pw\",\"read_only\":true,\"encrypted\":true}'; fi",
+                'if [ "$1" = "--version" ]; then echo "shell 0.7.3"; else '
+                "echo '{\"type\":\"session\",\"share_url\":\"https://x\",\"session_id\":\"s1\",\"e2ee_password\":\"pw\",\"read_only\":true,\"encrypted\":true}'; fi",
             )
             result = ShellOnlineProvider(binary=script).share_read_only_with_password(state_dir=tmp)
             self.assertEqual(result.share.session_id, "s1")
@@ -511,27 +519,31 @@ class ManagedClientUnitTests(unittest.TestCase):
             "-c",
             "import time; print('READY', flush=True); time.sleep(30)",
         )
-        with tempfile.TemporaryDirectory() as tmp:
-            first = ManagedSessionClient.start(state_dir=tmp, command=child, cwd=tmp)
-            self.addCleanup(self._quiet_client, first)
-            self.assertTrue(_wait_for(lambda: b"READY" in first.snapshot(), timeout=10.0))
-            before = first.status()
-            config = MonitorConfig(
-                process="opencode",
-                backend="pty",
-                agent_command=child,
-                state_dir=tmp,
-                project_dir=tmp,
-                web_ui=False,
-                desktop_notifications=False,
-            )
-            monitor = TerminalMonitor(config)
-            after = monitor.backend._client.status()
-            self.assertEqual(before.session_id, after.session_id)
-            self.assertEqual(before.root_pid, after.root_pid)
-            monitor._stop_status("test_stop")
-            time.sleep(0.3)
-            self.assertTrue(first.status().alive)
+        # Cleanups run LIFO, so the state dir is registered first and therefore
+        # removed last: the control socket must outlive the session teardown or
+        # the detached host can no longer be terminated.
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        first = ManagedSessionClient.start(state_dir=tmp, command=child, cwd=tmp)
+        self.addCleanup(self._quiet_client, first)
+        self.assertTrue(_wait_for(lambda: b"READY" in first.snapshot(), timeout=10.0))
+        before = first.status()
+        config = MonitorConfig(
+            process="opencode",
+            backend="pty",
+            agent_command=child,
+            state_dir=tmp,
+            project_dir=tmp,
+            web_ui=False,
+            desktop_notifications=False,
+        )
+        monitor = TerminalMonitor(config)
+        after = monitor.backend._client.status()
+        self.assertEqual(before.session_id, after.session_id)
+        self.assertEqual(before.root_pid, after.root_pid)
+        monitor._stop_status("test_stop")
+        time.sleep(0.3)
+        self.assertTrue(first.status().alive)
 
     def _quiet_client(self, client):
         with contextlib.suppress(OSError, ValueError, RuntimeError, ConnectionError, PermissionError):

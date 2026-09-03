@@ -286,7 +286,7 @@ class TerminalMonitor:
                     last_output_at = live.last_output_at
                     exit_code = live.exit_code
                 finally:
-                    with contextlib.suppress(Exception):
+                    with contextlib.suppress(OSError, ValueError, RuntimeError):
                         client.close()
             except (OSError, ValueError, RuntimeError):
                 connected = False
