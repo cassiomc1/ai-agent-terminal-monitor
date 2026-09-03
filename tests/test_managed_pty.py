@@ -24,6 +24,16 @@ CHILD_ECHO = (
     "line=sys.stdin.readline(); print('ECHO:'+line.strip(), flush=True); "
     "time.sleep(0.5)",
 )
+# Key-vocabulary fixture: must survive ctrl+c (which reaches the foreground
+# process group as SIGINT) and must not exit on its own, so every send is
+# tested against a live session rather than a teardown race.
+CHILD_KEYS = (
+    sys.executable,
+    "-u",
+    "-c",
+    "import signal,time; signal.signal(signal.SIGINT, signal.SIG_IGN); "
+    "print('READY', flush=True); time.sleep(30)",
+)
 
 
 def _wait_for(predicate, timeout=10.0, interval=0.05):
@@ -143,7 +153,7 @@ class ManagedPTYTests(unittest.TestCase):
     def test_backend_send_key_maps_vocabulary(self):
         tmp = self._state_dir()
         backend = ManagedPTYBackend(state_dir=tmp)
-        backend.start_managed(CHILD_ECHO, cwd=tmp, state_dir=tmp)
+        backend.start_managed(CHILD_KEYS, cwd=tmp, state_dir=tmp)
         self.addCleanup(self._cleanup_backend, backend, tmp)
         ok, _ = backend.send_key("ignored", None, "enter")
         self.assertTrue(ok)

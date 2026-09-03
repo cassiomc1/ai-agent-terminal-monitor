@@ -43,6 +43,12 @@ SESSION_SOCKET_NAME = "session-control.sock"
 SCHEMA_VERSION = 1
 STREAM_QUEUE_MAX_ITEMS = 64
 TERMINATE_GRACE_SECONDS = 5.0
+# Bounded grace for in-flight control connections to flush their final frame
+# (notably the stream "exit" event) before the host process exits.
+FINAL_FLUSH_SECONDS = 2.0
+# Bounded wait for the reaper/reader to record the exit code and drain the PTY
+# before an explicit terminate forces finalization.
+REAPER_HANDOFF_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -261,7 +267,7 @@ class SessionHost:
         self._exit_code: int | None = None
         # _exit_seen: waitpid() observed child death (authoritative liveness).
         self._exit_seen = threading.Event()
-        # _pty_eof: reader drained the PTY to EOF/EIO.
+        # _pty_eof: reader stopped — EOF/EIO, drained dead child, or shutdown.
         self._pty_eof = threading.Event()
         # _child_exited: session fully finalized (drained + metadata written).
         self._child_exited = threading.Event()
@@ -271,6 +277,8 @@ class SessionHost:
         self._stream_clients: list[queue.Queue[bytes | None]] = []
         self._stream_lock = threading.Lock()
         self._listener: socket.socket | None = None
+        self._workers: list[threading.Thread] = []
+        self._workers_lock = threading.Lock()
 
     # -- paths ---------------------------------------------------------
     def _paths(self) -> tuple[Path, Path, Path]:
@@ -399,39 +407,71 @@ class SessionHost:
             self._accept_loop(listener)
         finally:
             self._finalize()
+            self._flush_workers(FINAL_FLUSH_SECONDS)
         return 0
 
     def _finalize(self) -> None:
-        """Record final state exactly once: wake streams, close down, persist."""
+        """Record final state exactly once: wake streams, persist, close down.
+
+        The lock is held for the whole body, so a second caller BLOCKS until
+        the first finished instead of returning early. That matters because
+        ``run()`` returns as soon as the accept loop sees ``_child_exited``:
+        without the wait, the process (or the in-process host thread) could
+        exit while the daemon thread that observed the exit was still between
+        "stop the loops" and "write final metadata", losing the exit code and
+        leaving ``state: running`` on disk forever.
+
+        Final metadata is written BEFORE the control socket is removed, so the
+        durable record always exists by the time clients can no longer connect.
+        """
         with self._finalize_lock:
             if self._finalized:
                 return
-            self._finalized = True
-        self._child_exited.set()
-        self._shutdown.set()
-        with self._stream_lock:
-            for watch in list(self._stream_clients):
+            self._child_exited.set()
+            self._shutdown.set()
+            with self._stream_lock:
+                for watch in list(self._stream_clients):
+                    with _suppress():
+                        watch.put_nowait(None)
+            try:
+                state = "exited" if self._exit_seen.is_set() else "stopped"
+                self._write_metadata(state)
+            except (OSError, ValueError):
+                pass
+            if self._listener is not None:
                 with _suppress():
-                    watch.put_nowait(None)
-        if self._listener is not None:
-            with _suppress():
-                self._listener.shutdown(socket.SHUT_RDWR)
-            with _suppress():
-                self._listener.close()
-        try:
-            _, _, sock_path = self._paths()
-        except ValueError:
-            sock_path = None
-        if sock_path is not None:
-            with _suppress():
-                if sock_path.exists():
-                    sock_path.unlink()
-        try:
-            state = "exited" if self._exit_seen.is_set() else "stopped"
-            self._write_metadata(state)
-        except OSError:
-            pass
-        self._close_master()
+                    self._listener.shutdown(socket.SHUT_RDWR)
+                with _suppress():
+                    self._listener.close()
+            try:
+                _, _, sock_path = self._paths()
+            except ValueError:
+                sock_path = None
+            if sock_path is not None:
+                with _suppress():
+                    if sock_path.exists():
+                        sock_path.unlink()
+            self._close_master()
+            self._finalized = True
+
+    def _flush_workers(self, timeout: float) -> None:
+        """Wait briefly for control-connection workers to send their last frame.
+
+        Stream viewers learn the session ended from the ``exit`` event queued
+        by ``_finalize``; without this bounded join the host process could exit
+        first and the viewer would see a truncated frame instead.
+        """
+        deadline = time.monotonic() + timeout
+        with self._workers_lock:
+            workers = list(self._workers)
+        current = threading.current_thread()
+        for worker in workers:
+            if worker is current:
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            worker.join(timeout=remaining)
 
     def _maybe_finalize(self) -> None:
         # Finalize once the child death was observed AND the PTY drained, or
@@ -475,7 +515,6 @@ class SessionHost:
             self._pty_eof.set()
             self._maybe_finalize()
             return
-        drained = False
         while not self._shutdown.is_set() and not self._child_exited.is_set():
             try:
                 events = sel.select(timeout=0.2)
@@ -484,7 +523,6 @@ class SessionHost:
             if not events:
                 # No readable bytes and child provably gone: PTY is drained.
                 if self._root_pid is not None and (self._exit_seen.is_set() or not _pid_alive(self._root_pid)):
-                    drained = True
                     break
                 continue
             try:
@@ -499,15 +537,11 @@ class SessionHost:
                 self._replay.append(chunk)
             self.last_output_at = now_iso()
             self._fanout(chunk)
-        else:
-            drained = self._pty_eof.is_set()
         with _suppress():
             sel.close()
-        if drained or self._shutdown.is_set():
-            self._pty_eof.set()
-        else:
-            # EOF/EIO path: the PTY is drained by definition.
-            self._pty_eof.set()
+        # Every exit path leaves nothing readable: EOF/EIO (drained by
+        # definition), a drained dead child, or a requested shutdown.
+        self._pty_eof.set()
         self._maybe_finalize()
 
     def _reaper_loop(self) -> None:
@@ -536,21 +570,45 @@ class SessionHost:
         self._maybe_finalize()
 
     def _fanout(self, chunk: bytes) -> None:
-        dead: list[queue.Queue[bytes | None]] = []
+        """Deliver output to viewers, coalescing instead of dropping laggards.
+
+        Line-by-line agent output arrives as many small chunks, so an item
+        bounded queue fills long before the viewer is actually wedged. Dropping
+        it there silently truncated the stream: the viewer lost the final bytes
+        AND never received the ``exit`` event, surfacing as a closed connection
+        mid-frame. A behind viewer now gets its backlog merged into a single
+        newest-wins buffer capped at the replay budget, so memory stays bounded
+        while the byte stream stays gap-free at the tail.
+        """
         with self._stream_lock:
             clients = list(self._stream_clients)
+        budget = max(1, int(self.config.replay_bytes))
         for watch in clients:
             try:
                 watch.put_nowait(chunk)
+                continue
             except queue.Full:
-                dead.append(watch)
-        if dead:
-            with self._stream_lock:
-                for watch in dead:
-                    if watch in self._stream_clients:
-                        self._stream_clients.remove(watch)
-                        with _suppress():
-                            watch.put_nowait(None)
+                pass
+            merged = bytearray()
+            ended = False
+            while True:
+                try:
+                    pending = watch.get_nowait()
+                except queue.Empty:
+                    break
+                if pending is None:
+                    ended = True
+                    break
+                merged += pending
+            merged += chunk
+            if len(merged) > budget:
+                del merged[: len(merged) - budget]
+            with _suppress():
+                watch.put_nowait(bytes(merged))
+            if ended:
+                # Preserve the end-of-session sentinel behind the backlog.
+                with _suppress():
+                    watch.put_nowait(None)
 
     # -- control plane -------------------------------------------------
     def _accept_loop(self, listener: socket.socket) -> None:
@@ -564,6 +622,10 @@ class SessionHost:
                 break
             worker = threading.Thread(target=self._handle_connection, args=(conn,), name="host-conn", daemon=True)
             worker.start()
+            with self._workers_lock:
+                # Drop finished workers so a long session cannot grow the list.
+                self._workers = [thread for thread in self._workers if thread.is_alive()]
+                self._workers.append(worker)
 
     def _handle_connection(self, conn: socket.socket) -> None:
         try:
@@ -804,8 +866,14 @@ class SessionHost:
             except (ProcessLookupError, PermissionError, OSError):
                 with contextlib.suppress(OSError):
                     os.kill(pid, signal.SIGKILL)
-        # The reaper observes real death and finalizes after the PTY drains;
-        # unblock shutdown here so a wedged child cannot hang termination.
+        # Let the reaper record the exit code and the reader drain the final
+        # output before shutdown forces finalization. Without this wait the
+        # terminating thread can reach _finalize() first and persist
+        # "stopped" with no exit code even though the child is already dead.
+        self._exit_seen.wait(timeout=REAPER_HANDOFF_SECONDS)
+        self._pty_eof.wait(timeout=REAPER_HANDOFF_SECONDS)
+        # Unblock shutdown unconditionally so a wedged child cannot hang
+        # termination.
         self._shutdown.set()
         self._maybe_finalize()
 

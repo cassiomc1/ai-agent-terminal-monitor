@@ -20,7 +20,7 @@ REPO_ROOT = pathlib.Path(__file__).parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from terminal_monitor.managed_pty import ManagedSessionClient, managed_session_is_reconnectable  # noqa: E402
-from terminal_monitor.session_host import classify_startup_state  # noqa: E402
+from terminal_monitor.session_host import SessionHost, SessionHostConfig, classify_startup_state  # noqa: E402
 from terminal_monitor.session_protocol import (  # noqa: E402
     MAX_CONTROL_MESSAGE_BYTES,
     PROTOCOL_VERSION,
@@ -332,8 +332,68 @@ class TerminateTests(ManagedTestBase):
         self.assertEqual(leftovers, [])
 
 
+class FinalizeCompletionTests(StateDirMixin, unittest.TestCase):
+    """``run()`` must not return before the final state is durable.
+
+    ``_finalize`` runs in whichever thread observes the exit (reader, reaper,
+    or the terminate worker), while ``run()`` returns as soon as the accept
+    loop sees the session ended. If the second caller returned early instead
+    of waiting, the process could exit mid-finalize and leave ``state:
+    running`` with no exit code on disk — an exit no client can ever observe.
+    """
+
+    def _run_host(self, command, session_id="finaltest"):
+        tmp = self._state_dir()
+        host = SessionHost(
+            SessionHostConfig(
+                session_id=session_id,
+                command=command,
+                cwd=tmp,
+                state_dir=tmp,
+                cols=80,
+                rows=24,
+                replay_bytes=65536,
+            )
+        )
+        results = []
+        thread = threading.Thread(target=lambda: results.append(host.run()), daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 20.0)
+        return tmp, host, thread, results
+
+    def test_metadata_is_final_when_run_returns(self):
+        brief = (sys.executable, "-u", "-c", "import time; print('READY', flush=True); time.sleep(1)")
+        tmp, _host, thread, results = self._run_host(brief)
+        thread.join(timeout=30.0)
+        self.assertFalse(thread.is_alive(), "host thread did not exit after the child exited")
+        self.assertEqual(results, [0])
+        # No polling: the invariant is that finalization already completed.
+        meta = _read_meta(tmp)
+        self.assertEqual(meta.get("state"), "exited")
+        self.assertEqual(meta.get("exit_code"), 0)
+
+    def test_terminate_records_exit_code_not_stopped(self):
+        tmp, _host, thread, results = self._run_host(LONG_CHILD)
+        client = _wait_for(
+            lambda: ManagedSessionClient.connect(tmp) if pathlib.Path(tmp, "session-control.sock").exists() else None,
+            timeout=15.0,
+        )
+        self.assertIsNotNone(client)
+        assert client is not None
+        self.assertTrue(_wait_for(lambda: b"READY" in client.snapshot(), timeout=10.0))
+        client.terminate_session()
+        thread.join(timeout=30.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results, [0])
+        meta = _read_meta(tmp)
+        # The reaper hands the exit code over before shutdown forces finalize,
+        # so a killed child is never recorded as "stopped" with no exit code.
+        self.assertEqual(meta.get("state"), "exited")
+        self.assertIsNotNone(meta.get("exit_code"))
+
+
 class DrainTests(ManagedTestBase):
-    def _collect_stream(self, tmp, token):
+    def _collect_stream(self, tmp, token, delay=0.0, after_connect=None):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(15.0)
         collected = bytearray()
@@ -342,6 +402,11 @@ class DrainTests(ManagedTestBase):
             send_message(sock, {"version": PROTOCOL_VERSION, "token": token, "op": "stream"})
             from terminal_monitor.session_protocol import FramedReader
 
+            if after_connect is not None:
+                after_connect()
+            if delay:
+                # Read nothing for a while so the host's per-viewer backlog fills.
+                time.sleep(delay)
             reader = FramedReader(sock)
             first = reader.read_message()
             self.assertEqual(first.get("event"), "snapshot_start")
@@ -380,6 +445,31 @@ class DrainTests(ManagedTestBase):
             token = pathlib.Path(tmp, "session-token").read_text(encoding="utf-8").strip()
             data = self._collect_stream(tmp, token)
             self.assertIn(b"FINAL_MARKER", data)
+
+    def test_slow_viewer_keeps_tail_and_exit_event(self):
+        """A viewer that falls behind must still get the tail and the exit event.
+
+        Many small writes overflow the per-viewer item queue. Dropping the
+        viewer there truncated the stream mid-frame with no exit event; the
+        backlog is coalesced instead, so the tail survives.
+        """
+        child = (
+            sys.executable,
+            "-u",
+            "-c",
+            "import sys; print('READY', flush=True); sys.stdin.readline(); "
+            "[print(f'row{i}', flush=True) for i in range(4000)]; "
+            "print('TAIL_MARKER', flush=True)",
+        )
+        tmp = self._state_dir()
+        client = ManagedSessionClient.start(state_dir=tmp, command=child, cwd=tmp)
+        self.addCleanup(self._cleanup_client, client, tmp)
+        self.assertTrue(_wait_for(lambda: b"READY" in client.snapshot(), timeout=10.0))
+        token = pathlib.Path(tmp, "session-token").read_text(encoding="utf-8").strip()
+        # Start the burst only once the viewer is attached, then read nothing
+        # for long enough that the per-viewer queue overflows.
+        data = self._collect_stream(tmp, token, delay=1.5, after_connect=lambda: client.send_bytes(b"go\n"))
+        self.assertIn(b"TAIL_MARKER", data)
 
     def test_large_final_burst_drains(self):
         child = (

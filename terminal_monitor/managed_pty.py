@@ -467,8 +467,10 @@ class ManagedSessionClient:
         """Terminate the managed session; already-exited sessions succeed silently."""
         try:
             self._checked({"op": "terminate"}, timeout=TERMINATE_REAP_SECONDS)
-        except (ConnectionError, OSError) as failure:
-            # The host is unreachable. A host this process spawned proves the
+        except (ConnectionError, OSError, SessionProtocolError) as failure:
+            # The host is unreachable: either gone, or torn down mid-frame
+            # (a connection left in the backlog of a closing listener reads as
+            # a truncated message). A host this process spawned proves the
             # outcome by exiting; otherwise durable metadata must show that the
             # session finished. Anything else is reported as a failure, without
             # waiting on a host that was never asked to stop.
