@@ -3,6 +3,7 @@ import base64
 import contextlib
 import gc
 import hashlib
+import io
 import json
 import os
 import pathlib
@@ -902,6 +903,7 @@ class RemoteLifecycleTests(StateDirMixin, unittest.TestCase):
             self.assertEqual(calls[0][1], "old")
             self.assertEqual(result.browser_password, "pw-new")
             saved = json.loads(pathlib.Path(tmp, "remote-share.json").read_text(encoding="utf-8"))
+            self.assertTrue(saved["active"])
             self.assertEqual(saved["session_id"], "new")
             self.assertNotIn("pw-new", json.dumps(saved))
 
@@ -924,15 +926,150 @@ class RemoteLifecycleTests(StateDirMixin, unittest.TestCase):
             result = _create_share(_FakeProvider(), tmp)
             self.assertEqual(result.share.session_id, "s")
 
+    def test_create_share_refuses_replacement_when_previous_stop_fails(self):
+        """Fail closed: a second remote link must never be created."""
+        from terminal_monitor.cli import _create_share
+
+        with tempfile.TemporaryDirectory() as tmp:
+            original = {"provider": "shell.online", "active": True, "read_only": True, "encrypted": True, "session_id": "old", "share_url": "https://old"}
+            pathlib.Path(tmp, "remote-share.json").write_text(json.dumps(original), encoding="utf-8")
+            provider = _StopFailsProvider()
+            with self.assertRaisesRegex(RuntimeError, "E_REMOTE_SHARE_PREVIOUS_ACTIVE"):
+                _create_share(provider, tmp)
+            self.assertEqual(provider.stop_calls, ["old"])
+            self.assertFalse(provider.share_calls, "share_read_only_with_password must not be called")
+            saved = json.loads(pathlib.Path(tmp, "remote-share.json").read_text(encoding="utf-8"))
+            self.assertTrue(saved["active"], "previous share must stay marked active")
+            self.assertEqual(saved["session_id"], "old")
+            self.assertEqual(saved, original, "previous metadata must be preserved verbatim")
+            self.assertNotIn("new", saved["share_url"])
+
+    def test_create_share_failure_never_leaks_provider_detail(self):
+        from terminal_monitor.cli import _create_share
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pathlib.Path(tmp, "remote-share.json").write_text(
+                json.dumps({"provider": "shell.online", "active": True, "read_only": True, "session_id": "old"}),
+                encoding="utf-8",
+            )
+            provider = _StopFailsProvider(detail="kill failed: e2ee password=secret-value token=abcd1234 (stderr)")
+            with self.assertRaises(RuntimeError) as ctx:
+                _create_share(provider, tmp)
+            message = str(ctx.exception)
+            for leaked in ("secret-value", "password=", "token=", "stderr"):
+                self.assertNotIn(leaked, message)
+            persisted = pathlib.Path(tmp, "remote-share.json").read_text(encoding="utf-8")
+            self.assertNotIn("secret-value", persisted)
+            self.assertNotIn("password", persisted)
+
+    @unittest.skipIf(os.name != "posix", "managed PTY requires POSIX")
+    def test_run_share_returns_nonzero_when_previous_stop_fails(self):
+        import argparse
+
+        from terminal_monitor.cli import _run_share
+        from terminal_monitor.shell_online import ShellOnlineProvider
+
+        tmp, client = self._live_session()
+        pathlib.Path(tmp, "remote-share.json").write_text(
+            json.dumps({"provider": "shell.online", "active": True, "read_only": True, "session_id": "old-share"}),
+            encoding="utf-8",
+        )
+
+        def _stop_fails(self, session_id):
+            return (False, "provider kill failed: password=secret-value")
+
+        def _never_share(self, *, state_dir):
+            raise AssertionError("must not be called")
+
+        with mock.patch.object(ShellOnlineProvider, "stop", _stop_fails), mock.patch.object(ShellOnlineProvider, "share_read_only_with_password", _never_share):
+            args = argparse.Namespace(state_dir=tmp, project_dir=tmp, provider="shell-online")
+            config = argparse.Namespace(state_dir=tmp, project_dir=tmp)
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = _run_share(args, config)
+        self.assertNotEqual(code, 0)
+        self.assertIn("E_REMOTE_SHARE_PREVIOUS_ACTIVE", stderr.getvalue())
+        self.assertNotIn("secret-value", stderr.getvalue() + stdout.getvalue())
+        self.assertNotIn("URL:", stdout.getvalue())
+        self.assertNotIn("Browser password", stdout.getvalue())
+        saved = json.loads(pathlib.Path(tmp, "remote-share.json").read_text(encoding="utf-8"))
+        self.assertTrue(saved["active"])
+        self.assertEqual(saved["session_id"], "old-share")
+        self.assertTrue(client.status().alive, "share failure must not touch the managed agent")
+
+    @unittest.skipIf(os.name != "posix", "managed PTY requires POSIX")
+    def test_automatic_remote_provider_failure_is_non_fatal(self):
+        """`--remote-provider shell-online` aborts sharing but keeps supervising."""
+        import shlex
+
+        from terminal_monitor import cli as cli_module
+        from terminal_monitor.monitor import TerminalMonitor
+        from terminal_monitor.shell_online import ShellOnlineProvider
+
+        tmp = self._state_dir()
+        pathlib.Path(tmp, "remote-share.json").write_text(
+            json.dumps({"provider": "shell.online", "active": True, "read_only": True, "session_id": "old-share"}),
+            encoding="utf-8",
+        )
+        run_calls: list = []
+
+        def _fake_run(self):
+            run_calls.append(self.state_dir)
+            return 0
+
+        def _stop_fails(self, session_id):
+            return (False, "provider kill failed: password=secret-value")
+
+        def _never_share(self, *, state_dir):
+            raise AssertionError("must not be called")
+
+        argv = [
+            "terminal-monitor",
+            "supervise",
+            "--backend",
+            "pty",
+            "--state-dir",
+            tmp,
+            "--project-dir",
+            tmp,
+            "--agent-command",
+            shlex.join(LONG_CHILD),
+            "--remote-provider",
+            "shell-online",
+            "--no-web-ui",
+        ]
+        self.addCleanup(self._cleanup_state_dir_session, tmp)
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(TerminalMonitor, "run", _fake_run),
+            mock.patch.object(ShellOnlineProvider, "stop", _stop_fails),
+            mock.patch.object(ShellOnlineProvider, "share_read_only_with_password", _never_share),
+        ):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = cli_module.main()
+        errors = stderr.getvalue()
+        self.assertIn("REMOTE_PROVIDER_ERROR", errors)
+        self.assertIn("E_REMOTE_SHARE_PREVIOUS_ACTIVE", errors)
+        self.assertNotIn("secret-value", errors + stdout.getvalue())
+        # Local supervision continued despite the remote failure.
+        self.assertEqual(code, 0)
+        self.assertEqual(run_calls, [tmp])
+        saved = json.loads(pathlib.Path(tmp, "remote-share.json").read_text(encoding="utf-8"))
+        self.assertTrue(saved["active"])
+        self.assertEqual(saved["session_id"], "old-share")
+        # The managed agent started and survived the remote-provider failure.
+        client = ManagedSessionClient.connect(tmp)
+        self.addCleanup(self._cleanup_client, client, tmp)
+        self.assertTrue(client.status().alive)
+        self.assertTrue(_wait_for(lambda: b"READY" in client.snapshot(), timeout=10.0))
+
     @unittest.skipIf(os.name != "posix", "managed PTY requires POSIX")
     def test_unshare_keeps_agent_alive(self):
         from terminal_monitor.cli import _run_unshare
         from terminal_monitor.shell_online import ShellOnlineProvider
 
-        tmp = self._state_dir()
-        client = ManagedSessionClient.start(state_dir=tmp, command=LONG_CHILD, cwd=tmp)
-        self.addCleanup(self._cleanup_client, client, tmp)
-        self.assertTrue(_wait_for(lambda: b"READY" in client.snapshot(), timeout=10.0))
+        tmp, client = self._live_session()
         pathlib.Path(tmp, "remote-share.json").write_text(
             json.dumps({"provider": "shell.online", "active": True, "read_only": True, "session_id": "old-share"}),
             encoding="utf-8",
@@ -946,17 +1083,100 @@ class RemoteLifecycleTests(StateDirMixin, unittest.TestCase):
 
             args = argparse.Namespace(state_dir=tmp, project_dir=tmp, session_id=None)
             config = argparse.Namespace(state_dir=tmp, project_dir=tmp)
-            code = _run_unshare(args, config)
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = _run_unshare(args, config)
         self.assertEqual(code, 0)
         saved = json.loads(pathlib.Path(tmp, "remote-share.json").read_text(encoding="utf-8"))
         self.assertFalse(saved.get("active"))
         self.assertTrue(client.status().alive)
+
+    @unittest.skipIf(os.name != "posix", "managed PTY requires POSIX")
+    def test_unshare_failure_preserves_active_metadata(self):
+        """A failed provider stop must never be recorded as a stopped share."""
+        import argparse
+
+        from terminal_monitor.cli import _run_unshare
+        from terminal_monitor.shell_online import ShellOnlineProvider
+
+        tmp, client = self._live_session()
+        pathlib.Path(tmp, "remote-share.json").write_text(
+            json.dumps({"provider": "shell.online", "active": True, "read_only": True, "session_id": "old-share"}),
+            encoding="utf-8",
+        )
+
+        def _stop_fails(self, session_id):
+            return (False, "provider kill failed: password=secret-value")
+
+        with mock.patch.object(ShellOnlineProvider, "stop", _stop_fails):
+            args = argparse.Namespace(state_dir=tmp, project_dir=tmp, session_id=None)
+            config = argparse.Namespace(state_dir=tmp, project_dir=tmp)
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = _run_unshare(args, config)
+        self.assertNotEqual(code, 0)
+        self.assertNotIn("stopped", stdout.getvalue())
+        self.assertNotIn("secret-value", stdout.getvalue() + stderr.getvalue())
+        saved = json.loads(pathlib.Path(tmp, "remote-share.json").read_text(encoding="utf-8"))
+        self.assertTrue(saved["active"], "a failed stop must keep the share marked active")
+        self.assertEqual(saved["session_id"], "old-share")
+        self.assertTrue(client.status().alive, "unshare failure must not stop the agent")
+
+    @unittest.skipIf(os.name != "posix", "managed PTY requires POSIX")
+    def test_unshare_failure_without_saved_metadata_invents_nothing(self):
+        import argparse
+
+        from terminal_monitor.cli import _run_unshare
+        from terminal_monitor.shell_online import ShellOnlineProvider
+
+        def _stop_fails(self, session_id):
+            return (False, "provider kill failed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(ShellOnlineProvider, "stop", _stop_fails):
+                args = argparse.Namespace(state_dir=tmp, project_dir=tmp, session_id="explicit-id")
+                config = argparse.Namespace(state_dir=tmp, project_dir=tmp)
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    code = _run_unshare(args, config)
+            self.assertNotEqual(code, 0)
+            self.assertFalse(pathlib.Path(tmp, "remote-share.json").exists(), "no inactive record may be invented")
+
+    def _live_session(self):
+        tmp = self._state_dir()
+        client = ManagedSessionClient.start(state_dir=tmp, command=LONG_CHILD, cwd=tmp)
+        self.addCleanup(self._cleanup_client, client, tmp)
+        self.assertTrue(_wait_for(lambda: b"READY" in client.snapshot(), timeout=10.0))
+        return tmp, client
+
+    def _cleanup_state_dir_session(self, tmp):
+        with contextlib.suppress(OSError, ValueError, RuntimeError, SessionProtocolError, ConnectionError, PermissionError):
+            client = ManagedSessionClient.connect(tmp)
+            with contextlib.suppress(OSError, ValueError, RuntimeError, SessionProtocolError, ConnectionError, PermissionError):
+                client.terminate_session()
+            with contextlib.suppress(OSError, ValueError, RuntimeError):
+                client.close()
 
     def _cleanup_client(self, client, tmp):
         with contextlib.suppress(OSError, ValueError, RuntimeError, SessionProtocolError, ConnectionError, PermissionError):
             client.terminate_session()
         with contextlib.suppress(OSError, ValueError, RuntimeError):
             client.close()
+
+
+class _StopFailsProvider:
+    """Provider whose stop always fails; sharing is forbidden."""
+
+    def __init__(self, detail="provider kill failed"):
+        self._detail = detail
+        self.stop_calls: list = []
+        self.share_calls: list = []
+
+    def stop(self, session_id):
+        self.stop_calls.append(session_id)
+        return (False, self._detail)
+
+    def share_read_only_with_password(self, *, state_dir):
+        self.share_calls.append(state_dir)
+        raise AssertionError("must not be called")
 
 
 if __name__ == "__main__":

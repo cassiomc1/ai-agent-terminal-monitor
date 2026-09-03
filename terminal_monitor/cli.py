@@ -413,10 +413,13 @@ def _read_saved_share(state_dir: str) -> dict[str, Any]:
 def _create_share(provider: Any, state_dir: str) -> Any:
     """Create a read-only share, stopping a previously saved one first.
 
-    Prevents duplicate remote links across monitor restarts: a saved active
-    session is stopped (best-effort) before a new share is created. Only
-    non-secret metadata is persisted; the browser password stays ephemeral.
-    Remote lifecycle never touches the monitor, SessionHost, or agent.
+    Fail closed on the previous share: a saved active session must be stopped
+    before a replacement is created. If the provider cannot stop it, no new
+    share is created and the saved metadata is left untouched (still
+    ``active``), so an old browser link is never joined by a second live link.
+    Only non-secret metadata is persisted; the browser password stays
+    ephemeral. Remote lifecycle never touches the monitor, SessionHost, or
+    agent.
     """
     import contextlib as _contextlib_share
 
@@ -427,7 +430,13 @@ def _create_share(provider: Any, state_dir: str) -> Any:
     if previous_id:
         ok, _detail = provider.stop(previous_id)
         if not ok:
-            print(f"REMOTE_SHARE_ORPHANED: previous remote session {previous_id} could not be stopped; creating a new share.", file=sys.stderr)
+            # No replacement share: the provider detail may carry secrets, so
+            # it is dropped entirely and the saved record stays active.
+            raise RuntimeError(
+                "E_REMOTE_SHARE_PREVIOUS_ACTIVE: previous remote session could not be stopped; "
+                "refusing to create another remote share. The earlier remote link may still be "
+                "active; local supervision, the managed session, and the agent are unaffected."
+            )
     result = provider.share_read_only_with_password(state_dir=state_dir)
     with _contextlib_share.suppress(OSError):
         _write_share(
@@ -457,7 +466,17 @@ def _run_unshare(args: argparse.Namespace, config: Any) -> int:
         return 2
     from .shell_online import ShellOnlineProvider
 
-    ok, detail = ShellOnlineProvider().stop(session_id)
+    ok, _detail = ShellOnlineProvider().stop(session_id)
+    if not ok:
+        # Fail closed: never claim the share stopped and never rewrite saved
+        # metadata to inactive while the provider session may still be live.
+        # Provider detail is dropped because it may carry secrets.
+        print(
+            "E_REMOTE_SHARE_FAILED: remote session could not be stopped; the remote share may still "
+            "be active. Saved share metadata was left unchanged; the monitor and agent are unaffected.",
+            file=sys.stderr,
+        )
+        return 1
     # Clearing saved metadata must not stop monitor/host/agent.
     import contextlib as _contextlib2
 
@@ -466,8 +485,8 @@ def _run_unshare(args: argparse.Namespace, config: Any) -> int:
             Path(state_dir) / "remote-share.json",
             {"provider": "shell.online", "active": False, "read_only": True, "session_id": session_id},
         )
-    print(detail)
-    return 0 if ok else 1
+    print("stopped")
+    return 0
 
 
 def _run_terminate_session(args: argparse.Namespace, config: Any) -> int:
@@ -653,8 +672,8 @@ def main() -> int:
 
     # Optional read-only remote sharing starts only after managed startup
     # succeeds. Provider failure is non-fatal: local supervision continues.
-    # A previously saved share is stopped first so restarts do not multiply
-    # remote links.
+    # A previously saved active share must be stopped first; if that stop
+    # fails, share creation is aborted rather than multiplying remote links.
     remote_provider = str(getattr(config, "remote_provider", "") or "").lower().strip()
     if remote_provider in ("shell-online", "shell.online", "shell_online"):
         try:

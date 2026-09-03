@@ -612,6 +612,12 @@ The provider shares `terminal-monitor attach --read-only`, not the agent
 command. Remote-share failure never terminates the agent; unsharing never
 stops the monitor, host, or agent.
 
+Remote share lifecycle is fail-closed: when saved metadata already records an
+active share, that session must be stopped before a replacement is created. If
+the provider cannot stop it, no second share is created, the previous metadata
+stays `active`, and the command exits non-zero. A failed `unshare` likewise
+never records the share as stopped.
+
 ## Trust Boundaries
 
 ```text
@@ -661,7 +667,11 @@ The browser password is printed once to the invoking operator.
   could not be verified as shell.online; check `PATH`.
 - `E_REMOTE_SHARE_FAILED`: the provider did not return JSON metadata;
   retry `share` after verifying the managed session is live
-  (`attach --read-only`).
+  (`attach --read-only`). From `unshare`, it means the provider session could
+  not be stopped: the saved share stays `active` and may still be live.
+- `E_REMOTE_SHARE_PREVIOUS_ACTIVE`: a previously created share could not be
+  stopped, so no replacement was created (no duplicate remote links). Stop the
+  old session (`shell kill <id>`) and retry; local supervision is unaffected.
 - Stopping the share (`unshare` / `shell kill <id>`) never stops the agent.
 
 ## Migration / Compatibility
