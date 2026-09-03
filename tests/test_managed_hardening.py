@@ -2,6 +2,7 @@
 import base64
 import contextlib
 import gc
+import hashlib
 import json
 import os
 import pathlib
@@ -23,8 +24,11 @@ from terminal_monitor.managed_pty import ManagedSessionClient, managed_session_i
 from terminal_monitor.session_host import SessionHost, SessionHostConfig, classify_startup_state  # noqa: E402
 from terminal_monitor.session_protocol import (  # noqa: E402
     MAX_CONTROL_MESSAGE_BYTES,
+    MAX_SEND_BYTES,
     PROTOCOL_VERSION,
+    SEND_CHUNK_BYTES,
     SessionProtocolError,
+    receive_message,
     send_message,
 )
 
@@ -57,6 +61,29 @@ EXITING_CHILD = (
     # instead of immediately.
     "import time; print('READY', flush=True); time.sleep(2)",
 )
+INPUT_REPORT_CHILD = (
+    sys.executable,
+    "-u",
+    "-c",
+    # Raw mode disables echo and canonical buffering, so the child reports only
+    # what actually reached the PTY.
+    "import sys,tty\n"
+    "tty.setraw(0)\n"
+    "sys.stdout.write('READY\\n'); sys.stdout.flush()\n"
+    "while True:\n"
+    "    part=sys.stdin.buffer.read1(65536)\n"
+    "    if not part: break\n"
+    "    sys.stdout.write('GOT:%d\\n' % len(part)); sys.stdout.flush()\n",
+)
+
+
+def _authed_socket(tmp, timeout=15.0):
+    """Connected control socket plus the session token for hand-built frames."""
+    token = pathlib.Path(tmp, "session-token").read_text(encoding="utf-8").strip()
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    sock.connect(str(pathlib.Path(tmp, "session-control.sock")))
+    return sock, token
 
 
 def _wait_for(predicate, timeout=15.0, interval=0.05):
@@ -625,6 +652,224 @@ class RedactionTests(ManagedTestBase):
         self.assertNotIn(secret, str(meta.get("command_display", "")))
         status = client.status()
         self.assertNotIn(secret, str(status))
+
+
+class LargeInputTests(ManagedTestBase):
+    """PTY input must survive Base64 expansion up to the documented bound.
+
+    A single 64 KiB frame cannot carry 64 KiB of raw bytes (Base64 adds 4/3),
+    so anything past one chunk streams as send_start/send_chunk*/send_end.
+    """
+
+    @staticmethod
+    def _payload(total):
+        # Full byte range, deterministic: proves the transfer is byte-exact and
+        # not just newline-safe text.
+        return bytes((index * 37 + 11) % 256 for index in range(total))
+
+    @staticmethod
+    def _digest_child(total):
+        return (
+            sys.executable,
+            "-u",
+            "-c",
+            # Raw mode: no echo, no canonical line limit, no byte translation.
+            "import sys,tty,hashlib,time\n"
+            "tty.setraw(0)\n"
+            "sys.stdout.write('READY\\n'); sys.stdout.flush()\n"
+            f"expected={total}\n"
+            "buf=b''\n"
+            "while len(buf)<expected:\n"
+            "    part=sys.stdin.buffer.read1(expected-len(buf))\n"
+            "    if not part: break\n"
+            "    buf+=part\n"
+            "sys.stdout.write('DIGEST:'+hashlib.sha256(buf).hexdigest()+':'+str(len(buf))+'\\n')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(30)\n",
+        )
+
+    def _expect_digest(self, client, payload):
+        want = f"DIGEST:{hashlib.sha256(payload).hexdigest()}:{len(payload)}".encode()
+        got = _wait_for(lambda: client.snapshot() if want in client.snapshot() else None, timeout=20.0)
+        self.assertIsNotNone(got, f"child never reported {want!r}")
+
+    def test_boundary_sizes_arrive_byte_for_byte(self):
+        for total in (1, 1024, 32 * 1024, 48 * 1024, 50 * 1024, 60 * 1024, 64 * 1024):
+            with self.subTest(total=total):
+                tmp = self._state_dir()
+                payload = self._payload(total)
+                client = self._start(tmp, command=self._digest_child(total))
+                self.assertTrue(_wait_for(lambda client=client: b"READY" in client.snapshot(), timeout=10.0))
+                client.send_bytes(payload)
+                self._expect_digest(client, payload)
+
+    def test_oversize_rejected_before_any_pty_write(self):
+        tmp = self._state_dir()
+        client = self._start(tmp, command=INPUT_REPORT_CHILD)
+        self.assertTrue(_wait_for(lambda: b"READY" in client.snapshot(), timeout=10.0))
+        with self.assertRaises(ValueError) as caught:
+            client.send_bytes(self._payload(MAX_SEND_BYTES + 1))
+        self.assertIn("E_SESSION_MESSAGE_TOO_LARGE", str(caught.exception))
+        time.sleep(0.3)
+        self.assertNotIn(b"GOT:", client.snapshot(), "oversize input must not reach the PTY")
+        # Session stays usable after the rejection.
+        client.send_bytes(b"ok\n")
+        self.assertTrue(_wait_for(lambda: b"GOT:" in client.snapshot(), timeout=10.0))
+
+    def test_host_enforces_bound_independently_of_client(self):
+        tmp = self._state_dir()
+        client = self._start(tmp, command=INPUT_REPORT_CHILD)
+        self.assertTrue(_wait_for(lambda: b"READY" in client.snapshot(), timeout=10.0))
+        sock, token = _authed_socket(tmp)
+        try:
+            send_message(
+                sock,
+                {
+                    "version": PROTOCOL_VERSION,
+                    "token": token,
+                    "op": "send_start",
+                    "transfer_id": "t-oversize",
+                    "total_bytes": MAX_SEND_BYTES + 1,
+                },
+            )
+            resp = receive_message(sock)
+        finally:
+            sock.close()
+        self.assertFalse(resp.get("ok"))
+        self.assertIn("E_SESSION_MESSAGE_TOO_LARGE", str(resp.get("error")))
+        time.sleep(0.3)
+        self.assertNotIn(b"GOT:", client.snapshot())
+        self.assertTrue(client.status().alive)
+
+    def test_backend_send_carries_large_text(self):
+        from terminal_monitor.managed_pty import ManagedPTYBackend
+
+        text = "x" * (60 * 1024)
+        expected = (text + "\n").encode("utf-8")
+        tmp = self._state_dir()
+        backend = ManagedPTYBackend(state_dir=tmp)
+        backend.start_managed(self._digest_child(len(expected)), cwd=tmp, state_dir=tmp)
+        client = backend._client
+        self.addCleanup(self._cleanup_client, client, tmp)
+        self.assertTrue(_wait_for(lambda: b"READY" in client.snapshot(), timeout=10.0))
+        ok, detail = backend.send("ignored", None, text)
+        self.assertTrue(ok, detail)
+        self._expect_digest(client, expected)
+
+
+class ChunkedInputTransferTests(ManagedTestBase):
+    """Malformed chunked transfers must fail closed with zero PTY bytes."""
+
+    def _session(self):
+        tmp = self._state_dir()
+        client = self._start(tmp, command=INPUT_REPORT_CHILD)
+        self.assertTrue(_wait_for(lambda: b"READY" in client.snapshot(), timeout=10.0))
+        return tmp, client
+
+    @staticmethod
+    def _start_frame(token, transfer_id, total):
+        return {
+            "version": PROTOCOL_VERSION,
+            "token": token,
+            "op": "send_start",
+            "transfer_id": transfer_id,
+            "total_bytes": total,
+        }
+
+    @staticmethod
+    def _chunk_frame(transfer_id, seq, data):
+        return {
+            "op": "send_chunk",
+            "transfer_id": transfer_id,
+            "seq": seq,
+            "data_b64": base64.b64encode(data).decode("ascii"),
+        }
+
+    def test_valid_multi_frame_transfer_is_accepted(self):
+        tmp, client = self._session()
+        payload = bytes((index * 11 + 3) % 256 for index in range(SEND_CHUNK_BYTES + 777))
+        sock, token = _authed_socket(tmp)
+        try:
+            send_message(sock, self._start_frame(token, "t-ok", len(payload)))
+            for seq, offset in enumerate(range(0, len(payload), SEND_CHUNK_BYTES)):
+                send_message(sock, self._chunk_frame("t-ok", seq, payload[offset : offset + SEND_CHUNK_BYTES]))
+            send_message(sock, {"op": "send_end", "transfer_id": "t-ok", "total_bytes": len(payload)})
+            resp = receive_message(sock)
+        finally:
+            sock.close()
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertTrue(_wait_for(lambda: b"GOT:" in client.snapshot(), timeout=10.0))
+
+    def test_malformed_transfers_write_nothing(self):
+        tmp, client = self._session()
+        cases = {
+            "out_of_order": lambda token: [
+                self._start_frame(token, "t1", 8),
+                self._chunk_frame("t1", 1, b"abcd"),
+            ],
+            "duplicate_seq": lambda token: [
+                self._start_frame(token, "t2", 8),
+                self._chunk_frame("t2", 0, b"abcd"),
+                self._chunk_frame("t2", 0, b"efgh"),
+            ],
+            "missing_chunk": lambda token: [
+                self._start_frame(token, "t3", 8),
+                self._chunk_frame("t3", 0, b"abcd"),
+                {"op": "send_end", "transfer_id": "t3", "total_bytes": 8},
+            ],
+            "malformed_base64": lambda token: [
+                self._start_frame(token, "t4", 8),
+                {"op": "send_chunk", "transfer_id": "t4", "seq": 0, "data_b64": "!!!!"},
+            ],
+            "wrong_total_at_end": lambda token: [
+                self._start_frame(token, "t5", 4),
+                self._chunk_frame("t5", 0, b"abcd"),
+                {"op": "send_end", "transfer_id": "t5", "total_bytes": 9},
+            ],
+            "chunk_exceeds_total": lambda token: [
+                self._start_frame(token, "t6", 4),
+                self._chunk_frame("t6", 0, b"abcdefghij"),
+            ],
+            "foreign_transfer_id": lambda token: [
+                self._start_frame(token, "t7", 4),
+                self._chunk_frame("other", 0, b"abcd"),
+            ],
+            "unknown_op_mid_transfer": lambda token: [
+                self._start_frame(token, "t8", 4),
+                {"op": "resize", "cols": 10, "rows": 10},
+            ],
+        }
+        for name, build in cases.items():
+            with self.subTest(case=name):
+                sock, token = _authed_socket(tmp)
+                try:
+                    for frame in build(token):
+                        send_message(sock, frame)
+                    try:
+                        resp = receive_message(sock)
+                    except SessionProtocolError:
+                        resp = {"ok": False, "error": "closed"}
+                finally:
+                    sock.close()
+                self.assertFalse(resp.get("ok"), f"{name} should be rejected")
+                time.sleep(0.2)
+                self.assertNotIn(b"GOT:", client.snapshot(), f"{name} must not reach the PTY")
+                self.assertTrue(client.status().alive, f"host must survive {name}")
+
+    def test_eof_before_send_end_writes_nothing(self):
+        tmp, client = self._session()
+        sock, token = _authed_socket(tmp)
+        try:
+            send_message(sock, self._start_frame(token, "t-eof", 2 * SEND_CHUNK_BYTES))
+            send_message(sock, self._chunk_frame("t-eof", 0, b"z" * SEND_CHUNK_BYTES))
+        finally:
+            sock.close()
+        time.sleep(0.4)
+        self.assertNotIn(b"GOT:", client.snapshot(), "an unfinished transfer must not reach the PTY")
+        self.assertTrue(client.status().alive)
+        # Still usable afterwards.
+        client.send_bytes(b"after\n")
+        self.assertTrue(_wait_for(lambda: b"GOT:" in client.snapshot(), timeout=10.0))
 
 
 class RemoteLifecycleTests(StateDirMixin, unittest.TestCase):

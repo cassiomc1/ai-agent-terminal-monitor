@@ -6,6 +6,7 @@ import binascii
 import contextlib
 import json
 import os
+import secrets
 import socket
 import subprocess
 import sys
@@ -19,8 +20,9 @@ from typing import Any
 from .backends import BaseTerminalBackend, TerminalIdentity
 from .safety import SPECIAL_KEY_CODES
 from .session_protocol import (
-    MAX_CONTROL_MESSAGE_BYTES,
+    MAX_SEND_BYTES,
     PROTOCOL_VERSION,
+    SEND_CHUNK_BYTES,
     SNAPSHOT_CHUNK_BYTES,
     FramedReader,
     SessionProtocolError,
@@ -386,7 +388,10 @@ class ManagedSessionClient:
                 sock.close()
 
     def _checked(self, payload: dict[str, Any], timeout: float = 10.0) -> dict[str, Any]:
-        resp = self._request(payload, timeout=timeout)
+        return self._raise_for_response(self._request(payload, timeout=timeout))
+
+    @staticmethod
+    def _raise_for_response(resp: Any) -> dict[str, Any]:
         if not isinstance(resp, dict) or not resp.get("ok"):
             error = str(resp.get("error", "unknown error")) if isinstance(resp, dict) else "invalid response"
             if "E_SESSION_AUTH_FAILED" in error:
@@ -454,9 +459,70 @@ class ManagedSessionClient:
                 sock.close()
 
     def send_bytes(self, payload: bytes) -> None:
-        if len(payload) > MAX_CONTROL_MESSAGE_BYTES:
-            raise ValueError(f"E_SESSION_MESSAGE_TOO_LARGE: Managed session control message exceeds {MAX_CONTROL_MESSAGE_BYTES} bytes.")
-        self._checked({"op": "send", "data_b64": base64.b64encode(bytes(payload)).decode("ascii")})
+        """Write raw bytes to the managed PTY, chunking past one frame's capacity.
+
+        Base64 expands the payload by 4/3, so a single frame cannot carry the
+        full decoded bound. Payloads that still fit keep using the one-shot
+        ``send`` op; larger ones stream as ``send_start``/``send_chunk``/
+        ``send_end`` on one authenticated connection. The host stages and
+        validates the whole transfer before writing anything to the PTY.
+        """
+        data = bytes(payload)
+        if len(data) > MAX_SEND_BYTES:
+            raise ValueError(f"E_SESSION_MESSAGE_TOO_LARGE: Managed session input exceeds {MAX_SEND_BYTES} bytes.")
+        if len(data) <= SEND_CHUNK_BYTES:
+            self._checked({"op": "send", "data_b64": base64.b64encode(data).decode("ascii")})
+            return
+        self._send_chunked(data)
+
+    def _send_chunked(self, data: bytes) -> None:
+        if self._closed:
+            raise ValueError("E_SESSION_STALE: client is closed")
+        _, _, socket_path = _state_paths(self._state_dir)
+        transfer_id = secrets.token_hex(8)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(30.0)
+        try:
+            try:
+                sock.connect(str(socket_path))
+                send_message(
+                    sock,
+                    {
+                        "version": PROTOCOL_VERSION,
+                        "token": self._token,
+                        "op": "send_start",
+                        "transfer_id": transfer_id,
+                        "total_bytes": len(data),
+                    },
+                )
+                for seq, offset in enumerate(range(0, len(data), SEND_CHUNK_BYTES)):
+                    piece = data[offset : offset + SEND_CHUNK_BYTES]
+                    send_message(
+                        sock,
+                        {
+                            "op": "send_chunk",
+                            "transfer_id": transfer_id,
+                            "seq": seq,
+                            "data_b64": base64.b64encode(piece).decode("ascii"),
+                        },
+                    )
+                send_message(sock, {"op": "send_end", "transfer_id": transfer_id, "total_bytes": len(data)})
+            except SessionProtocolError as exc:
+                # The host rejected the transfer and closed mid-stream; prefer
+                # its reason (it may still be buffered) over the write failure.
+                pending: Any = None
+                with contextlib.suppress(OSError, SessionProtocolError, ValueError):
+                    pending = receive_message(sock)
+                if isinstance(pending, dict):
+                    self._raise_for_response(pending)
+                raise ConnectionError(f"E_SESSION_STALE: cannot reach managed session host: {exc}") from exc
+            resp = receive_message(sock)
+        except OSError as exc:
+            raise ConnectionError(f"E_SESSION_STALE: cannot reach managed session host: {exc}") from exc
+        finally:
+            with _suppress():
+                sock.close()
+        self._raise_for_response(resp)
 
     def resize(self, cols: int, rows: int) -> None:
         if not isinstance(cols, int) or not isinstance(rows, int) or not 1 <= cols <= 1000 or not 1 <= rows <= 1000:

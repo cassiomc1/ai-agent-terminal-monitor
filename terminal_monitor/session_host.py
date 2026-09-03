@@ -28,9 +28,11 @@ from typing import Any
 from .replay import ReplayBuffer
 from .safety import redact_sensitive
 from .session_protocol import (
-    MAX_CONTROL_MESSAGE_BYTES,
+    MAX_SEND_BYTES,
     PROTOCOL_VERSION,
+    SEND_CHUNK_BYTES,
     SNAPSHOT_CHUNK_BYTES,
+    FramedReader,
     SessionProtocolError,
     receive_message,
     send_message,
@@ -653,6 +655,8 @@ class SessionHost:
                 self._handle_snapshot(conn, request)
             elif op == "send":
                 self._handle_send(conn, request)
+            elif op == "send_start":
+                self._handle_send_transfer(conn, request)
             elif op == "resize":
                 self._handle_resize(conn, request)
             elif op == "stream":
@@ -740,33 +744,107 @@ class SessionHost:
             except (binascii.Error, ValueError, UnicodeEncodeError):
                 self._send_error(conn, "E_SESSION_PROTOCOL_INVALID: Managed session control message is invalid.")
                 return
-            if len(payload) > MAX_CONTROL_MESSAGE_BYTES:
-                self._send_error(conn, f"E_SESSION_MESSAGE_TOO_LARGE: Managed session control message exceeds {MAX_CONTROL_MESSAGE_BYTES} bytes.")
+            if len(payload) > MAX_SEND_BYTES:
+                self._send_error(conn, f"E_SESSION_MESSAGE_TOO_LARGE: Managed session input exceeds {MAX_SEND_BYTES} bytes.")
                 return
-            if self._master_fd is None or self._child_exited.is_set():
-                self._send_error(conn, "E_SESSION_STALE: Managed session metadata exists but no authenticated live host is available.")
-                return
-            try:
-                # PTY master is non-blocking; retry briefly on EAGAIN.
-                view = memoryview(payload)
-                deadline = time.monotonic() + 5.0
-                while view:
-                    try:
-                        written = os.write(self._master_fd, view)
-                        view = view[written:]
-                    except BlockingIOError:
-                        if time.monotonic() >= deadline:
-                            self._send_error(conn, "E_SESSION_PROTOCOL_INVALID: PTY input buffer is full.")
-                            return
-                        time.sleep(0.01)
-            except OSError as exc:
-                self._send_error(conn, f"E_SESSION_STALE: cannot write to managed session: {exc}")
-                return
-            with _suppress():
-                send_message(conn, {"ok": True})
+            if self._write_pty_payload(conn, payload):
+                with _suppress():
+                    send_message(conn, {"ok": True})
         finally:
             with _suppress():
                 conn.close()
+
+    def _handle_send_transfer(self, conn: socket.socket, request: dict[str, Any]) -> None:
+        """Assemble a chunked PTY input transfer, then write it atomically.
+
+        Nothing reaches the PTY until the whole transfer validates, so a
+        malformed or truncated transfer can never inject a partial payload.
+        The staged buffer is bounded by MAX_SEND_BYTES, and the frame count is
+        bounded too, so a hostile client cannot stream without limit.
+        """
+        try:
+            transfer_id = request.get("transfer_id")
+            total = request.get("total_bytes")
+            if not isinstance(transfer_id, str) or not transfer_id or len(transfer_id) > 128:
+                self._send_error(conn, "E_SESSION_PROTOCOL_INVALID: Managed session control message is invalid.")
+                return
+            if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+                self._send_error(conn, "E_SESSION_PROTOCOL_INVALID: Managed session control message is invalid.")
+                return
+            if total > MAX_SEND_BYTES:
+                self._send_error(conn, f"E_SESSION_MESSAGE_TOO_LARGE: Managed session input exceeds {MAX_SEND_BYTES} bytes.")
+                return
+            reader = FramedReader(conn)
+            staged = bytearray()
+            expected_seq = 0
+            # send_chunk frames needed for the maximum payload, plus send_end
+            # and slack for a short final chunk.
+            max_frames = MAX_SEND_BYTES // SEND_CHUNK_BYTES + 3
+            for _ in range(max_frames):
+                try:
+                    frame = reader.read_message()
+                except SessionProtocolError:
+                    # Truncated transfer (peer closed or oversized frame):
+                    # discard everything staged, write nothing.
+                    return
+                op = frame.get("op")
+                if op == "send_chunk":
+                    seq = frame.get("seq")
+                    chunk_b64 = frame.get("data_b64")
+                    if frame.get("transfer_id") != transfer_id or not isinstance(chunk_b64, str):
+                        self._send_error(conn, "E_SESSION_PROTOCOL_INVALID: Managed session control message is invalid.")
+                        return
+                    if not isinstance(seq, int) or isinstance(seq, bool) or seq != expected_seq:
+                        self._send_error(conn, "E_SESSION_PROTOCOL_INVALID: Managed session input chunk is out of order.")
+                        return
+                    try:
+                        piece = base64.b64decode(chunk_b64.encode("ascii"), validate=True)
+                    except (binascii.Error, ValueError, UnicodeEncodeError):
+                        self._send_error(conn, "E_SESSION_PROTOCOL_INVALID: Managed session control message is invalid.")
+                        return
+                    if len(staged) + len(piece) > total:
+                        self._send_error(conn, f"E_SESSION_MESSAGE_TOO_LARGE: Managed session input exceeds {total} bytes.")
+                        return
+                    staged += piece
+                    expected_seq += 1
+                    continue
+                if op == "send_end":
+                    if frame.get("transfer_id") != transfer_id or frame.get("total_bytes") != total or len(staged) != total:
+                        self._send_error(conn, "E_SESSION_PROTOCOL_INVALID: Managed session input transfer is incomplete.")
+                        return
+                    if self._write_pty_payload(conn, bytes(staged)):
+                        with _suppress():
+                            send_message(conn, {"ok": True, "total_bytes": total})
+                    return
+                self._send_error(conn, "E_SESSION_PROTOCOL_INVALID: Managed session control message is invalid.")
+                return
+            self._send_error(conn, "E_SESSION_PROTOCOL_INVALID: Managed session input transfer is incomplete.")
+        finally:
+            with _suppress():
+                conn.close()
+
+    def _write_pty_payload(self, conn: socket.socket, payload: bytes) -> bool:
+        """Write a fully validated payload to the PTY; report errors to the peer."""
+        if self._master_fd is None or self._child_exited.is_set():
+            self._send_error(conn, "E_SESSION_STALE: Managed session metadata exists but no authenticated live host is available.")
+            return False
+        try:
+            # PTY master is non-blocking; retry briefly on EAGAIN.
+            view = memoryview(payload)
+            deadline = time.monotonic() + 5.0
+            while view:
+                try:
+                    written = os.write(self._master_fd, view)
+                    view = view[written:]
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        self._send_error(conn, "E_SESSION_PROTOCOL_INVALID: PTY input buffer is full.")
+                        return False
+                    time.sleep(0.01)
+        except OSError as exc:
+            self._send_error(conn, f"E_SESSION_STALE: cannot write to managed session: {exc}")
+            return False
+        return True
 
     def _handle_resize(self, conn: socket.socket, request: dict[str, Any]) -> None:
         try:

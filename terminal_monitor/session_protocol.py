@@ -15,6 +15,14 @@ MAX_CONTROL_MESSAGE_BYTES = 64 * 1024
 # Base64 chars + ~80 bytes of JSON envelope, well under the 64 KiB limit.
 SNAPSHOT_CHUNK_BYTES = 32 * 1024
 
+# PTY input is chunked for the same reason, in the request direction: a single
+# frame cannot carry 64 KiB of raw bytes once Base64 expands them by 4/3. Input
+# therefore streams as send_start / send_chunk* / send_end on one authenticated
+# connection, each frame holding at most SEND_CHUNK_BYTES raw bytes.
+SEND_CHUNK_BYTES = 32 * 1024
+# Largest decoded PTY input accepted in one logical send, regardless of framing.
+MAX_SEND_BYTES = 64 * 1024
+
 # recv() block size for the framed reader. Large enough to be cheap, small
 # enough to stay far below any buffer concern.
 _FRAME_READ_BYTES = 64 * 1024
