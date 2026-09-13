@@ -13,10 +13,44 @@ from typing import Any
 
 from .backends import validate_web_port
 from .config import DEFAULT_STATE_DIR
+from .safety import SPECIAL_KEY_CODES
 from .state import debug_swallow
 from .status import _public_event_line, _public_status
 
 WEB_POST_BODY_LIMIT_BYTES = 64 * 1024
+# Allowlist for explicitly typed dashboard key actions.  Mirrors the monitor's
+# manual-key allowlist so unsupported names are rejected at the HTTP boundary
+# instead of being stored and later misdelivered as agent text.
+WEB_KEY_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "tab",
+        "enter",
+        "return",
+        "esc",
+        "escape",
+        "up",
+        "down",
+        "left",
+        "right",
+        "space",
+        "backspace",
+        "delete",
+        "ctrl+c",
+        "ctrl_c",
+        "ctrl+p",
+        "ctrl_p",
+        "ctrl+d",
+        "ctrl_d",
+    }
+    | {str(item).lower() for item in SPECIAL_KEY_CODES}
+)
+
+
+def _is_supported_web_key(key: str) -> bool:
+    clean = key.strip()
+    if len(clean) == 1 and clean.isprintable():
+        return True
+    return clean.lower() in WEB_KEY_ALLOWLIST
 # SSE loop tuning: bounded lifetime with an explicit reconnect hint so the
 # dashboard never dies silently; log tails are only re-read on file change.
 SSE_MAX_ITERATIONS = 3600
@@ -41,7 +75,7 @@ DASHBOARD_HTML = """<!doctype html>
   <div style="display:flex;align-items:center;gap:10px">
     <div id="instances-box" style="display:flex;align-items:center;gap:6px">
       <span style="font:600 10px var(--font-mono);color:var(--dim)">INSTANCE:</span>
-      <select id="instance-picker" style="background:var(--paper-site);color:var(--ink-site);border:1px solid var(--line);border-radius:4px;font:11px var(--font-mono);padding:4px 8px;outline:none" onchange="switchInstance(this.value)"><option value="">Default Instance</option></select>
+      <select id="instance-picker" style="background:var(--paper-site);color:var(--ink-site);border:1px solid var(--line);border-radius:4px;font:11px var(--font-mono);padding:4px 8px;outline:none"><option value="">Default Instance</option></select>
     </div>
     <div class="live-badge" id="connection">LIVE ●</div>
   </div>
@@ -78,12 +112,12 @@ DASHBOARD_HTML = """<!doctype html>
 
 <div class="action-bar">
 <div class="action-pills">
-<button class="act-btn primary" type="button" onclick="sendAction('answer','yes')">✓ Approve (yes)</button>
-<button class="act-btn" type="button" onclick="sendAction('answer','proceed')">▶ Continue</button>
-<button class="act-btn" type="button" onclick="sendAction('key','tab')">⇥ Mode (Tab)</button>
-<button class="act-btn" type="button" onclick="sendAction('answer','proceed with the next task')">⚡ Nudge</button>
+<button class="act-btn primary" type="button" data-send-action="answer" data-send-payload="yes">✓ Approve (yes)</button>
+<button class="act-btn" type="button" data-send-action="answer" data-send-payload="proceed">▶ Continue</button>
+<button class="act-btn" type="button" data-send-action="key" data-send-payload="tab">⇥ Mode (Tab)</button>
+<button class="act-btn" type="button" data-send-action="answer" data-send-payload="proceed with the next task">⚡ Nudge</button>
 </div>
-<form class="cmd-box" onsubmit="event.preventDefault();submitCommand();">
+<form class="cmd-box" id="cmd-form">
 <input class="cmd-input" id="cmd-input" type="text" placeholder="Type prompt or operator instruction…"/>
 <button class="cmd-submit" type="submit">Send</button>
 </form>
@@ -122,12 +156,12 @@ DASHBOARD_HTML = """<!doctype html>
 
 <div class="filter-bar">
 <div class="filter-pills">
-<button class="fpill active" onclick="filterTasks('all')">ALL (<span id="fc-all">0</span>)</button>
-<button class="fpill" onclick="filterTasks('active')">ACTIVE (<span id="fc-act">0</span>)</button>
-<button class="fpill" onclick="filterTasks('pending')">PENDING (<span id="fc-pen">0</span>)</button>
-<button class="fpill" onclick="filterTasks('completed')">DONE (<span id="fc-don">0</span>)</button>
+<button class="fpill active" type="button" data-filter="all">ALL (<span id="fc-all">0</span>)</button>
+<button class="fpill" type="button" data-filter="active">ACTIVE (<span id="fc-act">0</span>)</button>
+<button class="fpill" type="button" data-filter="pending">PENDING (<span id="fc-pen">0</span>)</button>
+<button class="fpill" type="button" data-filter="completed">DONE (<span id="fc-don">0</span>)</button>
 </div>
-<input class="cmd-input" id="task-search" type="text" placeholder="Filter task titles…" oninput="renderTaskList()" style="max-width:240px"/>
+<input class="cmd-input" id="task-search" type="text" placeholder="Filter task titles…" style="max-width:240px"/>
 </div>
 
 <div class="task-grid" id="task-items"><div class="task-card"><div class="task-idx">—</div><div class="task-badge TODO">WAIT</div><div class="task-label">Waiting for task data…</div></div></div>
@@ -165,7 +199,12 @@ async function sendAction(action,payload){try{const res=await fetch('/api/send',
 function submitCommand(){const el=document.getElementById('cmd-input');if(el&&el.value.trim()){sendAction('answer',el.value.trim());el.value=''}}
 function showView(view){document.querySelectorAll('[data-view-panel]').forEach(p=>{p.hidden=p.dataset.viewPanel!==view});document.querySelectorAll('[data-view]').forEach(b=>{const a=b.dataset.view===view;b.classList.toggle('active',a);b.setAttribute('aria-selected',String(a))})}
 document.querySelectorAll('[data-view]').forEach(button=>button.addEventListener('click',()=>showView(button.dataset.view)));
-function filterTasks(f){currentFilter=f;document.querySelectorAll('.fpill').forEach(p=>p.classList.remove('active'));event&&event.target&&event.target.classList.add('active');renderTaskList()}
+function filterTasks(f,el){currentFilter=f;document.querySelectorAll('.fpill').forEach(p=>p.classList.remove('active'));const activeEl=el||document.querySelector('.fpill[data-filter="'+f+'"]');if(activeEl)activeEl.classList.add('active');renderTaskList()}
+document.querySelectorAll('[data-send-action]').forEach(button=>button.addEventListener('click',()=>sendAction(button.dataset.sendAction,button.dataset.sendPayload||'')));
+document.querySelectorAll('.fpill[data-filter]').forEach(button=>button.addEventListener('click',()=>filterTasks(button.dataset.filter,button)));
+document.getElementById('cmd-form')?.addEventListener('submit',e=>{e.preventDefault();submitCommand()});
+document.getElementById('task-search')?.addEventListener('input',()=>renderTaskList());
+document.getElementById('instance-picker')?.addEventListener('change',e=>switchInstance(e.target.value));
 function ansiToHtml(text){
   if(!text)return'';
   const c={'30':'#555','31':'#ff5c5c','32':'#00c758','33':'#edb200','34':'#4daafc','35':'#d180ff','36':'#00e5ff','37':'#e6e1d6','90':'#777','91':'#ff8a80','92':'#69f0ae','93':'#ffe57f','94':'#82b1ff','95':'#ea80fc','96':'#84ffff','97':'#ffffff'};
@@ -641,7 +680,10 @@ class MonitorWebServer:
                         target_path = owner.answer_path or str(Path(DEFAULT_STATE_DIR, "answer.txt"))
                         Path(target_path).parent.mkdir(parents=True, mode=0o700, exist_ok=True)
                         if action == "key" and key:
-                            Path(target_path).write_text(f"KEY:{key}\n", encoding="utf-8")
+                            if not _is_supported_web_key(key):
+                                self._reply(400, "application/json", json.dumps({"ok": False, "error": f"unsupported key: {key!r}"}).encode())
+                                return
+                            Path(target_path).write_text(f"KEY:{key.strip()}\n", encoding="utf-8")
                             self._reply(200, "application/json", b'{"ok":true,"dispatched":"key"}')
                             return
                         if payload:

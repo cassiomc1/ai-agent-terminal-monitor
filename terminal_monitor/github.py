@@ -141,7 +141,14 @@ class FinalVerificationReport:
 
 
 def evaluate_final_state(evidence: dict[str, Any]) -> FinalVerificationReport:
-    """Evaluate post-merge evidence without weakening any required invariant."""
+    """Evaluate post-merge evidence without weakening any required invariant.
+
+    Three-state logic: each invariant must be positively verified.  Missing
+    evidence (``evidence_complete is False`` or an explicit unknown marker)
+    blocks success even when the boolean checks happen to look clean, so a
+    failed query can never be mistaken for a clean tree, absent releases, or
+    absent publication.
+    """
     checks = {
         "pr_merged": bool(evidence.get("pr_merged")),
         "checks_exact_head": bool(evidence.get("checks_green")) and bool(evidence.get("pr_head")) and evidence.get("pr_head") == evidence.get("checked_head"),
@@ -152,12 +159,35 @@ def evaluate_final_state(evidence: dict[str, Any]) -> FinalVerificationReport:
         "no_publish_process": bool(evidence.get("no_publish_process")),
     }
     failures = tuple(name for name, passed in checks.items() if not passed)
+    # Fail closed when the collector reports incomplete/unknown evidence.
+    # Missing key (older callers) means "no provenance info" and keeps the
+    # legacy boolean verdict; an explicit False blocks conclusion.
+    if evidence.get("evidence_complete") is False:
+        if "evidence_incomplete" not in failures:
+            failures = (*failures, "evidence_incomplete")
+        checks["evidence_complete"] = False
+    unknown = evidence.get("evidence_unknown") or evidence.get("unknown_checks") or []
+    if isinstance(unknown, (list, tuple, set)):
+        for name in unknown:
+            key = str(name)
+            if key and key not in failures and key in checks:
+                failures = (*failures, key)
     return FinalVerificationReport(ok=not failures, checks=checks, failures=failures)
 
 
 def _command_value(command: list[str], cwd: str) -> str:
     code, output, _ = run_command(command, cwd=cwd)
     return output.strip() if code == 0 else ""
+
+
+def _command_result(command: list[str], cwd: str | None = None) -> tuple[bool, str, str]:
+    """Run a command returning (ok, stdout_stripped, stderr_stripped).
+
+    ``ok`` is True only when the process exits 0.  Callers use it to
+    distinguish "verified empty" from "query failed, value unknown".
+    """
+    code, output, error = run_command(command, cwd=cwd) if cwd is not None else run_command(command)
+    return (code == 0, output.strip(), error.strip())
 
 
 def git_activity_fingerprint(project_dir: str) -> str:
@@ -168,35 +198,100 @@ def git_activity_fingerprint(project_dir: str) -> str:
 
 
 def collect_final_evidence(project_dir: str, state: TaskState, pr_number: int | None = None) -> dict[str, Any]:
-    """Collect live evidence used by `verify-final-state`."""
-    local_head = _command_value(["git", "rev-parse", "HEAD"], project_dir)
-    main_head = _command_value(["git", "rev-parse", "main"], project_dir)
-    origin_main_head = _command_value(["git", "rev-parse", "origin/main"], project_dir)
-    status = _command_value(["git", "status", "--porcelain"], project_dir)
+    """Collect live evidence used by `verify-final-state`.
+
+    Fail-closed: every boolean is True only after its underlying query
+    succeeds.  Query failures are recorded in ``evidence_errors`` and flip
+    ``evidence_complete`` to False so :func:`evaluate_final_state` blocks
+    conclusion instead of interpreting empty results as clean.
+    """
+    errors: list[str] = []
+    unknown: list[str] = []
+
+    local_ok, local_head, _ = _command_result(["git", "rev-parse", "HEAD"], project_dir)
+    main_ok, main_head, _ = _command_result(["git", "rev-parse", "main"], project_dir)
+    origin_ok, origin_main_head, _ = _command_result(["git", "rev-parse", "origin/main"], project_dir)
+    if not local_ok:
+        errors.append("local_head_query_failed")
+    if not main_ok:
+        errors.append("main_head_query_failed")
+    if not origin_ok:
+        errors.append("origin_main_head_query_failed")
+    status_ok, status, _ = _command_result(["git", "status", "--porcelain"], project_dir)
+    if not status_ok:
+        errors.append("git_status_query_failed")
+        unknown.append("worktree_clean")
+    worktree_clean = bool(status_ok) and not status
+
     pr_ref = str(pr_number or state.pr.get("number") or state.branch or "")
     pr_data: dict[str, Any] = {}
+    pr_ok = False
     if pr_ref and shutil.which("gh"):
-        code, output, _ = run_command(
+        code, output, error = run_command(
             ["gh", "pr", "view", pr_ref, "--json", "state,headRefOid,statusCheckRollup"],
             cwd=project_dir,
         )
         if code == 0:
             with contextlib.suppress(json.JSONDecodeError, TypeError):
-                pr_data = json.loads(output)
+                parsed = json.loads(output)
+                if isinstance(parsed, dict):
+                    pr_data = parsed
+                    pr_ok = True
+        if not pr_ok:
+            errors.append("github_pr_query_failed")
+    elif pr_ref:
+        errors.append("github_cli_missing_for_pr")
+    else:
+        errors.append("pr_reference_missing")
+    if not pr_ok:
+        unknown.extend(["pr_merged", "checks_exact_head"])
     rollup = list(pr_data.get("statusCheckRollup") or [])
     conclusions = [str(item.get("conclusion") or item.get("state") or "").lower() for item in rollup]
-    checks_green = bool(rollup) and all(item in {"success", "neutral", "skipped"} for item in conclusions)
-    head = str(pr_data.get("headRefOid") or state.pr.get("head") or "")
+    checks_green = bool(pr_ok) and bool(rollup) and all(item in {"success", "neutral", "skipped"} for item in conclusions)
+    head = str(pr_data.get("headRefOid") or "")
+    # Fall back to saved head only for display; verification requires a live query.
+    if not head:
+        head = str(state.pr.get("head") or "")
+        if pr_ok and rollup:
+            pass
+        elif head:
+            unknown.append("checks_exact_head")
     tags_before = set(state.pr.get("tagsBefore") or [])
     releases_before = set(state.pr.get("releasesBefore") or [])
-    tags_now = set(filter(None, _command_value(["git", "tag", "--list"], project_dir).splitlines()))
+    tags_ok, tags_output, _ = _command_result(["git", "tag", "--list"], project_dir)
+    if not tags_ok:
+        errors.append("git_tag_query_failed")
+        unknown.append("no_new_tag_or_release")
+        tags_now: set[str] = set()
+    else:
+        tags_now = set(filter(None, tags_output.splitlines()))
     releases_now: set[str] = set()
+    releases_ok = False
     if shutil.which("gh"):
-        code, output, _ = run_command(["gh", "release", "list", "--limit", "100", "--json", "tagName"], cwd=project_dir)
+        code, output, error = run_command(["gh", "release", "list", "--limit", "100", "--json", "tagName"], cwd=project_dir)
         if code == 0:
-            with contextlib.suppress(json.JSONDecodeError, TypeError):
-                releases_now = {str(item["tagName"]) for item in json.loads(output)}
-    publish_code, publish_output, _ = run_command(["pgrep", "-af", r"(?:^|/)(?:npm|pnpm|yarn)(?:\s|$)"])
+            try:
+                parsed_releases = json.loads(output)
+                if isinstance(parsed_releases, list):
+                    releases_now = {str(item["tagName"]) for item in parsed_releases if isinstance(item, dict) and item.get("tagName")}
+                    releases_ok = True
+                else:
+                    errors.append("github_release_query_failed")
+            except (json.JSONDecodeError, TypeError, KeyError):
+                errors.append("github_release_query_failed")
+        else:
+            errors.append("github_release_query_failed")
+    else:
+        errors.append("github_cli_missing_for_releases")
+    if not releases_ok:
+        unknown.append("no_new_tag_or_release")
+    baseline_known = bool(state.pr.get("safetyBaselineCaptured"))
+    if not baseline_known:
+        errors.append("safety_baseline_missing")
+        unknown.append("no_new_tag_or_release")
+    no_new_tag_or_release = bool(baseline_known and tags_ok and releases_ok and tags_now == tags_before and releases_now == releases_before)
+
+    publish_code, publish_output, publish_error = run_command(["pgrep", "-af", r"(?:^|/)(?:npm|pnpm|yarn)(?:\s|$)"])
     publish_processes = []
     for line in publish_output.splitlines():
         parts = line.split(None, 1)
@@ -204,27 +299,75 @@ def collect_final_evidence(project_dir: str, state: TaskState, pr_number: int | 
         executable = command.split(None, 1)[0] if command else ""
         if Path(executable).name in {"npm", "pnpm", "yarn"} and re.search(r"\bpublish\b", command):
             publish_processes.append(line)
+    # pgrep exit 1 with empty stderr means "no match" (verified clean).
+    # Exit 0 means matches found (check for publish). Any other code, or
+    # stderr output, means the query itself failed -> unknown.
+    if publish_code == 0:
+        publish_verified = True
+        no_publish_process = not publish_processes
+    elif publish_code == 1 and not publish_error:
+        publish_verified = True
+        no_publish_process = True
+    else:
+        errors.append("publish_process_query_failed")
+        unknown.append("no_publish_process")
+        publish_verified = False
+        no_publish_process = False
+
     package_json = Path(project_dir, "package.json")
-    npm_unchanged = True
+    npm_unchanged = False
+    npm_verified = False
     expected_npm = state.pr.get("npmVersionBefore")
-    if package_json.is_file() and expected_npm is not None:
-        with contextlib.suppress(OSError, json.JSONDecodeError, KeyError):
-            package_name = json.loads(package_json.read_text(encoding="utf-8"))["name"]
-            current_npm = _command_value(["npm", "view", str(package_name), "version"], project_dir)
-            npm_unchanged = current_npm == str(expected_npm)
-    baseline_known = bool(state.pr.get("safetyBaselineCaptured"))
+    if not package_json.is_file():
+        npm_unchanged = True
+        npm_verified = True
+    else:
+        try:
+            package = json.loads(package_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, KeyError):
+            package = {}
+        if package.get("private"):
+            npm_unchanged = True
+            npm_verified = True
+        elif expected_npm is None or (isinstance(expected_npm, str) and not expected_npm.strip()):
+            errors.append("npm_baseline_missing_or_unknown")
+            unknown.append("npm_registry_unchanged")
+            npm_unchanged = False
+        else:
+            try:
+                package_name = str(package["name"])
+            except KeyError:
+                errors.append("npm_package_name_missing")
+                unknown.append("npm_registry_unchanged")
+                package_name = ""
+            if package_name:
+                npm_ok, current_npm, _ = _command_result(["npm", "view", package_name, "version"], project_dir)
+                if not npm_ok or not current_npm:
+                    errors.append("npm_registry_query_failed")
+                    unknown.append("npm_registry_unchanged")
+                    npm_unchanged = False
+                else:
+                    npm_verified = True
+                    npm_unchanged = current_npm == str(expected_npm)
+    if not npm_verified:
+        # npm_unchanged already False in unknown paths; keep explicit.
+        pass
+    evidence_complete = not errors
     return {
-        "pr_merged": str(pr_data.get("state", "")).upper() == "MERGED",
+        "pr_merged": bool(pr_ok) and str(pr_data.get("state", "")).upper() == "MERGED",
         "pr_head": head,
-        "checked_head": head if rollup else "",
+        "checked_head": head if (pr_ok and rollup) else "",
         "checks_green": checks_green,
-        "local_head": local_head,
-        "main_head": main_head,
-        "origin_main_head": origin_main_head,
-        "worktree_clean": not status,
+        "local_head": local_head if local_ok else "",
+        "main_head": main_head if main_ok else "",
+        "origin_main_head": origin_main_head if origin_ok else "",
+        "worktree_clean": worktree_clean,
         "npm_registry_unchanged": npm_unchanged,
-        "no_new_tag_or_release": baseline_known and tags_now == tags_before and releases_now == releases_before,
-        "no_publish_process": publish_code != 0 or not publish_processes,
+        "no_new_tag_or_release": no_new_tag_or_release,
+        "no_publish_process": no_publish_process,
+        "evidence_errors": errors,
+        "evidence_unknown": sorted(set(unknown)),
+        "evidence_complete": evidence_complete,
     }
 
 
@@ -424,8 +567,14 @@ def write_final_report(
     _atomic_json_write(path, payload)
 
 
-def retry_infrastructure_checks(project_dir: str, pr: dict[str, Any]) -> list[int]:
-    """Retry only workflow runs whose check outcome is infrastructure-like."""
+def retry_infrastructure_checks(project_dir: str, pr: dict[str, Any], *, dry_run: bool = False) -> list[int]:
+    """Retry only workflow runs whose check outcome is infrastructure-like.
+
+    ``dry_run=True`` never contacts GitHub: it returns [] so simulation
+    cannot cause external side effects at this boundary either.
+    """
+    if dry_run:
+        return []
     retried: list[int] = []
     for check in pr.get("statusCheckRollup") or pr.get("checks") or []:
         classification = classify_check_result(check)

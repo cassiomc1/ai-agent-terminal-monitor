@@ -190,9 +190,11 @@ class SessionTracker:
 
     interaction_history: str = ""
     generation: int = 0
+    interaction_history_len: int = 0
 
     def mark_interaction(self, history: str) -> None:
         self.interaction_history = normalize_snapshot(history)
+        self.interaction_history_len = len(history)
         self.generation += 1
 
     def current_segment(self, history: str) -> str:
@@ -201,8 +203,33 @@ class SessionTracker:
         normalized = normalize_snapshot(history)
         if normalized == self.interaction_history:
             return ""
-        position = normalized.rfind(self.interaction_history) if self.interaction_history else -1
-        return normalized[position + len(self.interaction_history):].lstrip("\r\n") if position >= 0 else normalized
+        marker = self.interaction_history
+        position = normalized.rfind(marker) if marker else -1
+        if position >= 0:
+            return normalized[position + len(marker):].lstrip("\r\n")
+        # The 30-line normalization window drops the marker prefix after
+        # ~30 lines of new output.  Recover the incremental suffix via
+        # line overlap: longest tail of the marker that is still a prefix
+        # of the current window.  This keeps small appends working while
+        # old completion text inside the overlap is correctly excluded.
+        marker_lines = marker.splitlines()
+        current_lines = normalized.splitlines()
+        max_overlap = min(len(marker_lines), len(current_lines))
+        for width in range(max_overlap, 0, -1):
+            if marker_lines[-width:] == current_lines[:width]:
+                if width >= len(current_lines):
+                    return ""
+                return "\n".join(current_lines[width:]).lstrip("\r\n")
+        # No recognizable overlap: distinguish large appends (current window
+        # plausibly all new) from truncation/clear (marker lost).  Without an
+        # incremental length baseline, or when history shrank, treat marker
+        # loss as insufficient evidence and return nothing (fail closed) so
+        # an old conclusion can never be revalidated after truncation.
+        if self.interaction_history_len and len(history) >= self.interaction_history_len:
+            growth = len(history) - self.interaction_history_len
+            if growth >= len(normalized) and len(normalized) > 0:
+                return normalized
+        return ""
 
     def matches_current_completion(self, history: str, patterns: list[str] | tuple[str, ...]) -> bool:
         segment = self.current_segment(history)
