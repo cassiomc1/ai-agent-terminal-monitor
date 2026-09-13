@@ -1,127 +1,202 @@
-# Melhorias sugeridas para o monitoramento
+# Suggested improvements for monitoring
 
-Estas sugestões vieram do uso do monitor acompanhando o OpenCode em um
-projeto real, com tarefas que exigiram retomada, permissões, CI, PRs e
-mesclagens.
+These suggestions came from using the monitor alongside OpenCode on a real
+project, with tasks that required resumption, permissions, CI, PRs, and merges.
+All ten items below are implemented; the verification notes describe how.
 
-## Prioridade alta
+## High priority
 
-### 1. Separar “inatividade visual” de “processo trabalhando”
+### 1. Separate "visual idleness" from "working process"
 
-O terminal pode permanecer em `Thinking`, `Preparing edit` ou `gh ... --watch`
-por vários minutos enquanto há processos filhos consumindo CPU. O monitor deve
-correlacionar o snapshot do terminal com processos descendentes, CPU e idade do
-comando antes de enviar uma retomada. Isso evita interromper testes ou workflows
-válidos.
+The terminal can stay on `Thinking`, `Preparing edit`, or `gh ... --watch`
+for several minutes while child processes consume CPU. The monitor must
+correlate the terminal snapshot with descendant processes, CPU, and command
+age before sending a resumption. This avoids interrupting valid tests or
+workflows.
 
-### 2. Tornar a retomada idempotente e observável
+Implemented: `ProcessActivity` observes descendant commands, CPU percent, and
+command age; an active child counts as `thinking` and suppresses idle/question
+automation.
 
-Cada envio automático deve receber um `attempt_id`, motivo, timestamp e estado
-observado. O estado deve distinguir `queued`, `sent`, `accepted`, `completed` e
-`ignored`, com cooldown por tentativa. Assim uma mensagem não fica presa na fila
-sem que o monitor saiba se foi processada.
+### 2. Make resumption idempotent and observable
 
-### 3. Adicionar um protocolo explícito de “bloqueado por CI”
+Every automatic send must carry an `attempt_id`, reason, timestamp, and
+observed state. The state must distinguish `queued`, `sent`, `accepted`,
+`completed`, and `ignored`, with a per-attempt cooldown. That way a message
+never gets stuck in the queue without the monitor knowing whether it was
+processed.
 
-Cancelamentos no limite de tempo, falhas de rede e respostas `429`/timeout de
-sites externos não são equivalentes a falhas do código. O monitor deve
-classificar cada check como `passed`, `failed`, `cancelled-infra` ou
-`failed-external`, repetir somente o job afetado e registrar a evidência usada
-para a decisão.
+Implemented: `AttemptLedger` persists the full lifecycle with IDs and
+timestamps; a visible `QUEUED` marker stays pending, duplicates are
+suppressed, and a stale queue escalates to human attention.
 
-### 4. Impor o gate de mesclagem no próprio monitor
+### 3. Add an explicit "blocked on CI" protocol
 
-Antes de mesclar, consultar novamente o SHA completo de `headRefOid` e exigir
-que todos os checks daquele SHA estejam concluídos com sucesso. Cancelamentos
-não devem ser tratados como sucesso nem permitir merge automático. Depois da
-mesclagem, verificar o SHA de `main`, workflows pós-merge e árvore limpa.
+Timeout cancellations, network failures, and `429`/timeout responses from
+external sites are not equivalent to code failures. The monitor must classify
+each check as `passed`, `failed`, `cancelled-infra`, or `failed-external`,
+retry only the affected job, and record the evidence used for the decision.
 
-## Prioridade média
+Implemented: `classify_check_result` with external-failure markers; only
+retryable runs are re-run and every classification is recorded as a CI event.
 
-### 5. Detectar alterações fora do branch esperado
+### 4. Enforce the merge gate inside the monitor itself
 
-Se o agente voltar para `main` com mudanças locais, ou mudar de branch durante a
-execução, o monitor deve pausar o fluxo e solicitar uma ação segura: preservar,
-commitar em branch, ou descartar somente com autorização explícita. O status
-deve mostrar branch, SHA, arquivos modificados e PR associado.
+Before merging, re-query the full `headRefOid` SHA and require every check on
+that SHA to be successfully completed. Cancellations must neither count as
+success nor allow automatic merging. After the merge, verify the `main` SHA,
+post-merge workflows, and a clean tree.
 
-### 6. Usar uma política de permissões por risco
+Implemented: `verify_merge_gate` + `merge_pull_request` with
+`--match-head-commit`; `verify-final-state` covers the post-merge invariants.
 
-Permissões seguras e repetíveis podem ser aprovadas automaticamente, mas ações
-irreversíveis (publicação npm, criação de release, exclusões e mudanças fora do
-projeto) devem ser bloqueadas por uma regra independente do texto enviado ao
-agente. A proibição de npm deve aparecer também no estado persistido e no
-relatório final.
+## Medium priority
 
-### 7. Dar suporte a retomada após reinício do monitor
+### 5. Detect changes outside the expected branch
 
-Persistir a sessão do agente, último prompt, branch, PR, SHA e etapa do
-workflow. Ao reiniciar, reconstruir o estado a partir do GitHub e do terminal,
-em vez de enviar novamente uma instrução que pode já estar em processamento.
+If the agent returns to `main` with local changes, or switches branches
+mid-run, the monitor must pause the flow and request a safe action: preserve,
+commit on a branch, or discard only with explicit authorization. The status
+must show branch, SHA, modified files, and the associated PR.
 
-## Prioridade baixa
+Implemented: repository-safety snapshots (`protected_branch_dirty`,
+`branch_mismatch`, `not_a_repository`) pause supervision with the snapshot in
+`attention.txt`; feature branches are auto-tracked (`BRANCH_TRACK`).
 
-### 8. Melhorar o relatório final
+### 6. Use a risk-based permission policy
 
-Gerar um resumo estruturado com tarefas concluídas, prompts enviados,
-permissões decididas, PRs/commits mesclados, checks pós-merge, eventuais
-cancelamentos de infraestrutura e confirmação explícita de que não houve
-publicação npm.
+Safe, repeatable permissions may be approved automatically, but irreversible
+actions (npm publication, release creation, deletions, and changes outside the
+project) must be blocked by a rule independent of the text sent to the agent.
+The npm prohibition must also appear in the persisted state and in the final
+report.
 
-### 9. Cobrir o supervisor com testes de cenários
+Implemented: `PolicyEnvelope.authorize_action` / `compose` plus an independent
+risk classifier; `npm_publish_allowed` defaults to `false` and is recorded in
+`task-state.json` and `final-report.json`.
 
-Adicionar testes simulados para: agente parado, comando longo ativo, prompt de
-permissão, mensagem enfileirada, check cancelado, `429` externo, SHA alterado,
-PR já mesclado e reinício do monitor. Esses cenários são mais importantes que
-apenas testar a extração de texto do terminal.
+### 7. Support resumption after a monitor restart
 
-### 10. Expor um modo de simulação
+Persist the agent session, last prompt, branch, PR, SHA, and workflow stage.
+On restart, rebuild the state from GitHub and the terminal instead of
+re-sending an instruction that may already be in flight.
 
-Um modo `--dry-run` deve mostrar qual ação o monitor tomaria, sem enviar teclas,
-aprovar permissões ou alterar o GitHub. Isso facilita validar políticas antes de
-usar o supervisor em um projeto novo.
+Implemented: atomic `task-state.json` (identity, policy, stage, PR metadata,
+attempts, interaction marker, generation); restart rebuilds from disk, GitHub,
+and the live tab; corrupt state fails closed with `StateFileError`.
 
-## Protecoes operacionais implementadas
+## Low priority
 
-- O ledger diferencia entrega aceita de mensagem ainda visivelmente `QUEUED`, impede reenvio duplicado e escala filas vencidas para atencao humana.
-- O supervisor detecta suites/builds caros duplicados, repeticoes sem progresso observavel e comandos de reescrita de historico Git.
-- A interrupcao validada encerra a arvore inteira do comando, dos descendentes mais profundos ao processo solicitado, sem sinalizar o agente raiz; a recuperacao aguarda a saida, escala para `SIGTERM` e nao injeta um prompt enquanto qualquer descendente ainda estiver vivo.
-- As deteccoes sao exportadas no status estruturado e podem ser ajustadas por configuracao, mantendo defaults fail-closed.
-- O painel web local expõe somente projeções seguras, mostra um snapshot de terminal mascarado e mantém o log rotacionado para evitar vazamento ou crescimento ilimitado.
+### 8. Improve the final report
 
-## Implementação desta rodada
+Generate a structured summary with completed tasks, sent prompts, decided
+permissions, merged PRs/commits, post-merge checks, any infrastructure
+cancellations, and explicit confirmation that no npm publication happened.
 
-As cinco melhorias priorizadas a partir do uso real e o hardening observado na
-revisão do command center foram implementados:
+Implemented: `final-report.json` with evidence, attempts, CI events, policy
+decisions, prohibitions, and the npm-publication invariant.
 
-- desligamento por sinal com heartbeat final, PID lock e detecção de estado
-  obsoleto;
-- inspeção `--once` JSON-safe, limitada e com mascaramento de credenciais;
-- painel `status` colorido com tarefa, progresso, comando atual, Git, CI e
-  política npm;
-- command center web escuro com snapshot de terminal redigido, status sem
-  prompts/comandos e inicialização que libera o lock mesmo quando a porta
-  escolhida não pode ser usada;
-- documentação operacional dos endpoints `/api/status`, `/api/events` e
-  `/api/terminal`, dos arquivos de estado redigidos/rotacionados e do ciclo
-  `SIGINT` → espera → `SIGTERM` da recuperação de loops;
-- comandos `stop`, `status` e `resume` que nunca sinalizam o processo do
-  agente;
-- testes de regressão e documentação no README/ABOUT para o novo ciclo de vida.
+### 9. Cover the supervisor with scenario tests
 
-## Implementação da rodada de revisão (v1.1.0)
+Add mocked tests for: stalled agent, long-running active command, permission
+prompt, queued message, cancelled check, external `429`, changed SHA,
+already-merged PR, and monitor restart. These scenarios matter more than just
+testing terminal text extraction.
 
-- Corrigido bug real: `PullRequestStateMachine` guardava `stage` e
-  `seen_pr_number` como atributos de classe, compartilhando o ciclo de vida do
-  PR entre todas as instâncias no mesmo processo (SDK com múltiplos monitores e
-  suíte de testes). Agora o estado é por instância, restaurável a partir do
-  estágio persistido.
-- O endpoint `/api/instances` do command center não depende mais do caminho
-  fixo `/tmp/terminal-monitor`: o servidor recebe a raiz de estado do monitor
-  (`--state-dir` customizado passa a ser descoberto pelo seletor de instâncias).
-- `POST /api/send` rejeita corpos acima de 64 KiB com HTTP `413`, impedindo que
-  uma aba mal comportada despeje dados ilimitados no canal de respostas.
-- Novo flag `--version` alinhado ao `pyproject.toml` (1.1.0).
-- Testes de regressão cobrindo: isolamento entre instâncias da máquina de
-  estados, restauração de estágio persistido, `/api/instances` com raiz de
-  estado customizada, rejeição 413 e saída de `--version`.
+Implemented: scenario coverage in `tests/test_terminal_monitor.py` for all of
+the above, including active-command suppression, stale-completion rejection,
+and restart recovery.
+
+### 10. Expose a simulation mode
+
+A `--dry-run` mode must show which action the monitor would take without
+sending keystrokes, approving permissions, or touching GitHub. This makes it
+easy to validate policies before using the supervisor on a new project.
+
+Implemented: `--dry-run` blocks terminal sends/keys, permission approvals,
+agent restarts, merges, and CI workflow re-runs (`CI_RETRY_REQUIRED` stays put
+and is logged instead of dispatching `gh run rerun`).
+
+## Operational protections implemented
+
+- The ledger distinguishes accepted delivery from a still-visibly `QUEUED`
+  message, prevents duplicate resends, and escalates expired queues to human
+  attention.
+- The supervisor detects duplicate expensive suites/builds, repetitions
+  without observable progress, and Git history-rewrite commands.
+- Validated interruption shuts down the command's whole tree, from the
+  deepest descendants to the requested process, without signaling the agent
+  root; recovery waits for the exit, escalates to `SIGTERM`, and never injects
+  a prompt while any descendant is still alive.
+- Detections are exported in the structured status and can be tuned by
+  configuration, keeping fail-closed defaults.
+- The local web panel exposes only safe projections, shows a masked terminal
+  snapshot, and keeps the log rotated to avoid leaks or unbounded growth.
+
+## Implementation of this round
+
+The five improvements prioritized from real usage plus the hardening observed
+in the command-center review were implemented:
+
+- signal-driven shutdown with final heartbeat, PID lock, and stale-state
+  detection;
+- JSON-safe, bounded, credential-masked `--once` inspection;
+- colored `status` panel with task, progress, current command, Git, CI, and
+  npm policy;
+- dark web command center with redacted terminal snapshot, prompt/command-free
+  status, and startup that releases the lock even when the chosen port cannot
+  be used;
+- operational documentation for the `/api/status`, `/api/events`, and
+  `/api/terminal` endpoints, the redacted/rotated state files, and the
+  `SIGINT` → wait → `SIGTERM` loop-recovery cycle;
+- `stop`, `status`, and `resume` commands that never signal the agent
+  process;
+- regression tests and documentation in README/ABOUT for the new lifecycle.
+
+## Implementation of the review round (v1.1.0)
+
+- Fixed a real bug: `PullRequestStateMachine` kept `stage` and
+  `seen_pr_number` as class attributes, sharing the PR lifecycle across all
+  instances in the same process (SDK with multiple monitors and the test
+  suite). State is now per instance, restorable from the persisted stage.
+- The command-center `/api/instances` endpoint no longer depends on the fixed
+  `/tmp/terminal-monitor` path: the server receives the monitor's state root
+  (a custom `--state-dir` is now discovered by the instance picker).
+- `POST /api/send` rejects bodies over 64 KiB with HTTP `413`, preventing a
+  misbehaving tab from dumping unbounded data into the answer channel.
+- New `--version` flag aligned with `pyproject.toml` (1.1.0).
+- Regression tests covering: state-machine isolation between instances,
+  persisted-stage restoration, `/api/instances` with a custom state root,
+  413 rejection, and `--version` output.
+
+## Implementation of the six-findings hardening round
+
+A follow-up review produced six concrete findings; all are fixed and covered
+by reproduction checks:
+
+1. Mode-switch bypass: the post-`Tab` `continue_text` used to go straight to
+   the backend with no policy check or ledger entry. It now flows through
+   `policy.compose` + `authorize_action` + `_dispatch("mode_switch_continue")`,
+   so an `npm publish` continuation is blocked with `ATTENTION_REQUIRED`
+   instead of being typed into the agent.
+2. Fail-closed final verification: empty results from failed queries used to
+   read as a clean tree / no releases / no publication. Every invariant is
+   now `True` only after its query succeeds (`evidence_complete` /
+   `evidence_unknown` provenance), and completion is blocked while evidence is
+   missing — no more synthetic `ok=True` reports.
+3. Dry-run side effects: CI synchronization re-ran workflows even with
+   `--dry-run`. The retry boundary now returns early (logged + recorded) and
+   `retry_infrastructure_checks(..., dry_run=True)` is a no-op.
+4. Truncated-history revalidation: losing the interaction marker made the
+   whole current window look new, so an old completion message could finish a
+   new task. `SessionTracker` now recovers small appends via line overlap on
+   top of an incremental raw-length baseline and returns no segment (not the
+   full window) when the marker is unrecognizably lost.
+5. Dashboard controls vs CSP: inline `onclick`/`onchange`/`onsubmit`/`oninput`
+   handlers conflicted with the nonce-based `script-src` policy, so Continue
+   and DONE filtering silently did nothing. All controls now use
+   `addEventListener` with `data-*` attributes.
+6. Key-as-text: the panel's `KEY:tab` action was delivered as literal agent
+   text. The answer channel is now explicitly typed — `KEY:<name>` routes to
+   `send_key` (allowlisted, `manual_key` ledger reason) and unsupported names
+   are rejected (HTTP `400` at `/api/send`, attention in the monitor).

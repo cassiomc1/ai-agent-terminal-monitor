@@ -4,6 +4,8 @@
 
 **Goal:** Deliver session-aware, policy-safe terminal supervision through verified PR merge without npm publication.
 
+**Status:** Implemented in the `terminal_monitor` package (see `README.md` for the module layout); the plan below is kept as the historical record.
+
 **Architecture:** Extend the existing dependency-free monitor with persistent task/session models, descendant-process activity, robust terminal identity, explicit operational commands, a PR/CI state machine, and a structured final verifier. Preserve all current APIs and configuration behavior.
 
 **Tech Stack:** Python 3.10+, standard library, git and GitHub CLI integrations, unittest, Ruff.
@@ -24,7 +26,7 @@
 ### Task 1: Session, activity, question, and policy behavior
 
 **Files:**
-- Modify: `terminal_monitor.py`
+- Modify: `terminal_monitor/` package (`state.py`, `monitor.py`, `github.py`, `cli.py`, …)
 - Test: `tests/test_terminal_monitor.py`
 
 **Interfaces:**
@@ -38,7 +40,7 @@
 ### Task 2: Persistent state, terminal identity, and safe commands
 
 **Files:**
-- Modify: `terminal_monitor.py`
+- Modify: `terminal_monitor/` package (`state.py`, `monitor.py`, `github.py`, `cli.py`, …)
 - Test: `tests/test_terminal_monitor.py`
 
 **Interfaces:**
@@ -52,7 +54,7 @@
 ### Task 3: PR/CI lifecycle and final verification
 
 **Files:**
-- Modify: `terminal_monitor.py`
+- Modify: `terminal_monitor/` package (`state.py`, `monitor.py`, `github.py`, `cli.py`, …)
 - Test: `tests/test_terminal_monitor.py`
 
 **Interfaces:**
@@ -66,7 +68,7 @@
 ### Task 4: Event-oriented waiting and documentation
 
 **Files:**
-- Modify: `terminal_monitor.py`
+- Modify: `terminal_monitor/` package (`state.py`, `monitor.py`, `github.py`, `cli.py`, …)
 - Modify: `README.md`
 - Modify: `.terminal-monitor.example.json`
 - Modify: `.terminal-monitor.example.toml`
