@@ -86,6 +86,62 @@ SNAPSHOT_MAX_CHARS = 6000
 # Pause between a mode-switch key and the follow-up continuation text.
 MODE_SWITCH_SLEEP_SECONDS = 0.5
 
+# Explicitly typed manual key actions written by the dashboard as "KEY:<name>".
+# Single printable characters are always routable via send_key; named keys must
+# belong to this allowlist so an unknown multi-char name can never fall back to
+# being delivered as literal agent text.
+MANUAL_KEY_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "tab",
+        "enter",
+        "return",
+        "esc",
+        "escape",
+        "up",
+        "down",
+        "left",
+        "right",
+        "space",
+        "backspace",
+        "delete",
+        "ctrl+c",
+        "ctrl_c",
+        "ctrl+p",
+        "ctrl_p",
+        "ctrl+d",
+        "ctrl_d",
+    }
+)
+
+
+def _parse_manual_key_action(value: str) -> str | None:
+    """Return the key name for an explicit "KEY:<name>" action, else None.
+
+    Only a single-token payload with the exact uppercase "KEY:" prefix is
+    treated as a key action; anything else (including user text that merely
+    mentions keys) stays a normal text answer.
+    """
+    stripped = value.strip()
+    if not stripped.startswith("KEY:"):
+        return None
+    key_name = stripped[4:].strip()
+    if not key_name or any(ch.isspace() for ch in key_name):
+        return None
+    return key_name
+
+
+def _is_supported_manual_key(key_name: str) -> bool:
+    normalized = key_name.lower().strip()
+    if len(key_name) == 1 and key_name.isprintable():
+        return True
+    try:
+        from .safety import SPECIAL_KEY_CODES as _KEY_CODES
+    except ImportError:
+        _KEY_CODES = {}
+    if normalized in {str(item).lower() for item in _KEY_CODES}:
+        return True
+    return normalized in MANUAL_KEY_ALLOWLIST
+
 
 @dataclass
 class StepContext:
@@ -904,10 +960,14 @@ class TerminalMonitor:
             "checkClassifications": classifications,
         })
         if stage == "CI_RETRY_REQUIRED":
-            retried = retry_infrastructure_checks(self.config.project_dir, pr_snapshot)
-            if retried:
-                metadata["retriedRuns"] = retried
-                stage = "CI_PENDING"
+            if self.config.dry_run:
+                self.log("DRY_RUN kind=ci_retry skipped_infrastructure_rerun")
+                self._record_policy_decision("ci_retry", "ignored", "dry_run")
+            else:
+                retried = retry_infrastructure_checks(self.config.project_dir, pr_snapshot, dry_run=self.config.dry_run)
+                if retried:
+                    metadata["retriedRuns"] = retried
+                    stage = "CI_PENDING"
         self.task_state = replace(self.task_state, last_known_stage=stage, pr=metadata)
         self.task_state.save(self.task_state_path)
         return None
@@ -1070,6 +1130,31 @@ class TerminalMonitor:
         manual_answer = consume_manual_answer(self.answer_path)
         if not manual_answer:
             return None
+        # Explicitly typed operator actions: "KEY:<name>" routes to send_key
+        # instead of being delivered as literal agent text.
+        key_name = _parse_manual_key_action(manual_answer)
+        if key_name is not None:
+            if not _is_supported_manual_key(key_name):
+                self._record_policy_decision(manual_answer, "blocked", f"unsupported key: {key_name!r}")
+                with open(self.attention_path, "w", encoding="utf-8") as handle:
+                    handle.write(ctx.safe_snapshot + "\n")
+                self.log(f"PAUSE kind=policy_conflict reason=unsupported_key key={key_name!r}")
+                return 3, f"ATTENTION_REQUIRED kind=policy_conflict file={self.attention_path}"
+            ok, attempt_id, detail = self._dispatch("manual_key", key_name, ctx.state, use_key=True)
+            if detail == "dry_run":
+                return 0, f"DRY_RUN kind=manual_key key={key_name}"
+            self.export_status_json(ctx.pids, ctx.state, {"last_attempt_id": attempt_id})
+            self.last_action = f"send:manual_key:{'accepted' if ok else 'failed'}"
+            self.session_tracker.mark_interaction(ctx.history)
+            self.task_state = replace(
+                self.task_state,
+                session_generation=self.session_tracker.generation,
+                interaction_marker=self.session_tracker.interaction_history,
+            )
+            self.task_state.save(self.task_state_path)
+            if self.on_send:
+                self.on_send("manual_key", key_name, ok)
+            return (None, f"SENT kind=manual_key n={self.sends}") if ok else (1, f"SEND_FAILED kind=manual_key n={self.sends}")
         allowed, policy_reason = self.policy.authorize_action(
             manual_answer,
             unsafe_phrases=tuple(dict.fromkeys([*UNSAFE_PHRASES, *self.config.unsafe_phrases])),
@@ -1116,10 +1201,30 @@ class TerminalMonitor:
                     return 0, "DRY_RUN kind=final_verification"
                 self.last_action = f"send:final_verification:{'accepted' if ok else 'failed'}"
                 return (None, "SENT kind=final_verification") if ok else (1, "SEND_FAILED kind=final_verification")
+            # Verified: persist the real evidence-backed report (never a
+            # synthetic ok=True) before declaring completion.
+            verified_evidence = collect_final_evidence(self.config.project_dir, self.task_state)
+            verified_report = evaluate_final_state(verified_evidence)
+            if not verified_report.ok:
+                # Evidence changed between the gate check and the final
+                # snapshot (or queries flaked): fail closed, do not complete.
+                if time.monotonic() - self.last_send < self.config.cooldown_seconds:
+                    return None, "WAITING_FINAL_VERIFICATION"
+                instruction = "Resolve the remaining final-verification checks: " + ", ".join(verified_report.failures)
+                payload = self.policy.compose(instruction, "POST_MERGE_VERIFY")
+                ok, _attempt_id, detail = self._dispatch("final_verification", payload, ctx.state)
+                if detail == "dry_run":
+                    return 0, "DRY_RUN kind=final_verification"
+                self.last_action = f"send:final_verification:{'accepted' if ok else 'failed'}"
+                return (None, "SENT kind=final_verification") if ok else (1, "SEND_FAILED kind=final_verification")
+            write_final_report(self.report_path, self.task_state, verified_evidence, verified_report)
         self.log("SUCCESS: Completion indicators detected. Work complete.")
-        if self.config.supervise:
+        if self.config.supervise and not merge_required:
+            # Merge not required (e.g. required_outcome != "merged"): still
+            # persist an honest evidence-backed report instead of a synthetic
+            # ok=True, but do not block completion on merge-only invariants.
             evidence = collect_final_evidence(self.config.project_dir, self.task_state)
-            write_final_report(self.report_path, self.task_state, evidence, FinalVerificationReport(True, {"completion_detected": True}, ()))
+            write_final_report(self.report_path, self.task_state, evidence, evaluate_final_state(evidence))
         if self.on_complete:
             self.on_complete(ctx.snapshot)
         self.export_status_json(ctx.pids, "completed", {"done": True})
@@ -1146,9 +1251,52 @@ class TerminalMonitor:
             self._record_policy_decision("mode_switch", "ignored", "dry_run")
             return 0, "DRY_RUN kind=mode_switch"
         self.last_action = "mode_switch:accepted" if ok else "mode_switch:failed"
+        if not ok:
+            return 1, "SEND_FAILED kind=mode_switch"
         if self.config.continue_text:
+            raw_continue = self.config.continue_text
+            composed_continue = raw_continue
+            if self.policy.objective or self.policy.prohibitions:
+                try:
+                    composed_continue = self.policy.compose(raw_continue, self.task_state.last_known_stage)
+                except ValueError as exc:
+                    self._record_policy_decision(raw_continue, "blocked", str(exc))
+                    with open(self.attention_path, "w", encoding="utf-8") as handle:
+                        handle.write(ctx.safe_snapshot + "\n")
+                    self.log(f"PAUSE kind=policy_conflict reason={exc}")
+                    return 3, f"ATTENTION_REQUIRED kind=policy_conflict file={self.attention_path}"
+            allowed, policy_reason = self.policy.authorize_action(
+                composed_continue,
+                unsafe_phrases=tuple(dict.fromkeys([*UNSAFE_PHRASES, *self.config.unsafe_phrases])),
+                npm_publish_allowed=self.task_state.npm_publish_allowed,
+            )
+            if not allowed:
+                self._record_policy_decision(composed_continue, "blocked", policy_reason)
+                with open(self.attention_path, "w", encoding="utf-8") as handle:
+                    handle.write(ctx.safe_snapshot + "\n")
+                self.log(f"PAUSE kind=policy_conflict reason={policy_reason}")
+                return 3, f"ATTENTION_REQUIRED kind=policy_conflict file={self.attention_path}"
             time.sleep(MODE_SWITCH_SLEEP_SECONDS)
-            self.backend.send(self.config.process, self.config.title, self.config.continue_text)
+            ok_continue, attempt_continue, detail_continue = self._dispatch("mode_switch_continue", composed_continue, ctx.state)
+            if detail_continue == "dry_run":
+                self._record_policy_decision("mode_switch_continue", "ignored", "dry_run")
+                return 0, "DRY_RUN kind=mode_switch_continue"
+            self.export_status_json(ctx.pids, ctx.state, {"last_attempt_id": attempt_continue})
+            self.last_action = f"send:mode_switch_continue:{'accepted' if ok_continue else 'failed'}"
+            if ok_continue:
+                self.session_tracker.mark_interaction(ctx.history)
+                self.task_state = replace(
+                    self.task_state,
+                    session_generation=self.session_tracker.generation,
+                    interaction_marker=self.session_tracker.interaction_history,
+                )
+                self.task_state.save(self.task_state_path)
+                if self.on_send:
+                    self.on_send("mode_switch_continue", composed_continue, ok_continue)
+                if self.sends >= self.config.max_sends:
+                    return 0, "MAX_SENDS_REACHED"
+            else:
+                return 1, "SEND_FAILED kind=mode_switch_continue"
         return None, "MODE_SWITCH_SENT"
 
     def _handle_prompt_decision(self, ctx: StepContext) -> tuple[int | None, str] | None:
