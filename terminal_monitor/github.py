@@ -227,7 +227,7 @@ def collect_final_evidence(project_dir: str, state: TaskState, pr_number: int | 
     pr_data: dict[str, Any] = {}
     pr_ok = False
     if pr_ref and shutil.which("gh"):
-        code, output, error = run_command(
+        code, output, _error = run_command(
             ["gh", "pr", "view", pr_ref, "--json", "state,headRefOid,statusCheckRollup"],
             cwd=project_dir,
         )
@@ -268,7 +268,7 @@ def collect_final_evidence(project_dir: str, state: TaskState, pr_number: int | 
     releases_now: set[str] = set()
     releases_ok = False
     if shutil.which("gh"):
-        code, output, error = run_command(["gh", "release", "list", "--limit", "100", "--json", "tagName"], cwd=project_dir)
+        code, output, _error = run_command(["gh", "release", "list", "--limit", "100", "--json", "tagName"], cwd=project_dir)
         if code == 0:
             try:
                 parsed_releases = json.loads(output)
@@ -303,15 +303,12 @@ def collect_final_evidence(project_dir: str, state: TaskState, pr_number: int | 
     # Exit 0 means matches found (check for publish). Any other code, or
     # stderr output, means the query itself failed -> unknown.
     if publish_code == 0:
-        publish_verified = True
         no_publish_process = not publish_processes
     elif publish_code == 1 and not publish_error:
-        publish_verified = True
         no_publish_process = True
     else:
         errors.append("publish_process_query_failed")
         unknown.append("no_publish_process")
-        publish_verified = False
         no_publish_process = False
 
     package_json = Path(project_dir, "package.json")
