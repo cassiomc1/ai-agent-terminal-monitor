@@ -21,7 +21,6 @@ from .backends import BaseTerminalBackend, TerminalIdentity, get_backend
 from .classify import classify_state, decide_question, extract_todo_progress, infer_current_task_id, redact_snapshot
 from .config import DEFAULT_STATE_DIR, MonitorConfig
 from .github import (
-    FinalVerificationReport,
     PullRequestStateMachine,
     _parent_pid,
     capture_safety_baseline,

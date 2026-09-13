@@ -31,7 +31,7 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
 ## ✨ Key Features
 
 - 🧠 **Multi-Agent Profile Engine**: Built-in specialized detection heuristics for **Claude Code**, **OpenCode**, **Aider**, and **Goose**, with zero-config support for any custom CLI (`generic`).
-- 🎛️ **TUI Mode Awareness & Auto-Transition**: Automatically detects agent interactive modes (e.g. `Plan` vs `Build` in OpenCode). When plan generation finishes, dispatches native switch keystrokes (`Tab`) and start approvals without human intervention.
+- 🎛️ **TUI Mode Awareness & Auto-Transition**: Automatically detects agent interactive modes (e.g. `Plan` vs `Build` in OpenCode). When plan generation finishes, dispatches native switch keystrokes (`Tab`) and then routes the follow-up continuation through the same policy check and attempt ledger as every other send (`mode_switch` → `mode_switch_continue`), so a prohibited continuation (e.g. `npm publish`) is blocked with `ATTENTION_REQUIRED` instead of bypassing safety.
 - ⌨️ **Native Special Keys & Control Sequences**: Direct native dispatch for special characters (`Tab`, `Esc`, `Enter`, `Ctrl+C`, `Ctrl+P`) via native backend character codes without macOS Accessibility permission hurdles.
 - 🌿 **Git-Aware Context Smart Nudges**: Inspects repository status dynamically to send targeted prompts:
   - *Uncommitted changes:* Prompts agent to run targeted tests and commit the task.
@@ -39,7 +39,7 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
   - *Open PRs:* Prompts agent to verify CI checks and merge into `main`.
 - 🏁 **Completion Engine & Stop Conditions**: Detects when all plan tasks are 100% completed and merged, gracefully stopping the supervisor and firing completion events.
 - 🧾 **Task Summary Reconciliation**: Prefers an affirmative agent summary such as `35/35 COMPLETE` over stale checklist markers left by an overlaid TUI Todo pane, while rejecting question-shaped text as completion evidence.
-- 🧭 **Session Generations**: Separates terminal scrollback from the current interaction and rejects stale completion evidence after new work is assigned.
+- 🧭 **Session Generations**: Separates terminal scrollback from the current interaction and rejects stale completion evidence after new work is assigned. Small appends past the 30-line normalization window are recovered via line overlap on an incremental length baseline; an unrecognizably lost marker yields no segment (fail-closed) so an old “done” message can never finish a newly assigned task.
 - ⚙️ **Real Process Activity**: Observes descendant commands, command age and CPU data, preventing a quiet terminal from being treated as stalled while tests or builds are still running.
 - 🔂 **Agent Loop Guard**: Detects expensive commands relaunched repeatedly without task or Git progress, duplicate full test/build roots running concurrently, and monitored Git history rewrites. A changed task count, worktree, or commit resets the repetition counter; recoverable command loops are contained in-session while unsafe mutations pause for attention.
 - 🧯 **In-session Loop Recovery**: For repeated test/build loops, interrupts only verified expensive child trees, waits for the complete tree to exit, escalates to `SIGTERM` when needed, keeps the root agent session alive, and sends a corrective prompt only after the child work has stopped. Unsafe history rewrites still fail closed for human attention.
@@ -48,10 +48,10 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
 - 📜 **Durable Policy Envelope**: Stores the objective, prohibitions, task ID, required outcome, current stage, PR metadata, and session ID in `task-state.json`. Smart nudges are wrapped in permanent policy and cannot override an npm-publication prohibition.
 - 🔁 **Native PR/CI Lifecycle**: Tracks `PR_CREATED → CI_PENDING → FIX_REQUIRED` or `CI_RETRY_REQUIRED → CI_GREEN → POST_MERGE_VERIFY`; checks are classified as `passed`, `failed`, `cancelled-infra`, or `failed-external` before retry decisions.
 - 🔒 **Exact-Head Merge Gate**: `merge-pr` re-queries the full PR head SHA and every check immediately before calling `gh pr merge --match-head-commit`; changed heads, pending checks, cancellations, and failures fail closed.
-- ✅ **Final-State Verifier**: Verifies merged PR, checks for the exact PR head, synchronized clean `main`, unchanged npm registry state, no new tag/release, and no active publish process.
+- ✅ **Final-State Verifier**: Verifies merged PR, checks for the exact PR head, synchronized clean `main`, unchanged npm registry state, no new tag/release, and no active publish process. Fail-closed by construction: every invariant is `True` only after its query succeeds (provenance in `evidence_complete` / `evidence_unknown` / `evidence_errors`), failed queries read as unknown rather than clean, and completion is blocked — never a synthetic `ok=True` — while evidence is missing.
 - 🔍 **Refined Question vs Table Disambiguation**: Excludes Markdown/Unicode summary tables and code blocks from option parsing, eliminating false-positive dialog loops.
 - 📊 **Real-time Status JSON Export**: Continuously exports live structured JSON (`status.json`) with PIDs, state, mode, git details, uptime, and send counts for IDE or dashboard integrations.
-- 🖥️ **Automatic Web Command Center (Archify Proof Web App Visual System)**: Every continuous monitor starts a localhost-only dark operations console (`--paper-site: #0b0908;`), streams Server-Sent Events (`/api/stream`), renders ANSI-colored terminal logs with auto-scroll lock, displays horizontal stage architecture pipelines (`TASK_RECEIVED` → `EXECUTING` → `VERIFYING` → `PR_CREATED` → `CI_CHECKS` → `MERGED`), filterable task cards, and quick operator action buttons (`/api/send`).
+- 🖥️ **Automatic Web Command Center (Archify Proof Web App Visual System)**: Every continuous monitor starts a localhost-only dark operations console (`--paper-site: #0b0908;`), streams Server-Sent Events (`/api/stream`), renders ANSI-colored terminal logs with auto-scroll lock, displays horizontal stage architecture pipelines (`TASK_RECEIVED` → `EXECUTING` → `VERIFYING` → `PR_CREATED` → `CI_CHECKS` → `MERGED`), filterable task cards, and quick operator action buttons (`/api/send`). All controls are wired with `addEventListener` (no inline event handlers), keeping them functional under the nonce-based Content Security Policy.
 - ⏱️ **Per-Task Timing & Velocity Tracking**: Automatically tracks `started_at`, `completed_at`, `duration_seconds` for every plan task and computes overall plan velocity and remaining completion ETA.
 - 🧪 **Live Test Progress Extractor**: Automatically captures test suite executions (`✔ passed`, `✖ failed`, totals) in `activity.test_progress` and displays a real-time progress bar in the web console.
 - 🔔 **Desktop Notifications & Webhooks**: Supports native desktop alerts (`osascript` / `notify-send`) and asynchronous HTTP webhook dispatch (`--webhook-url <url>`) for `ATTENTION_REQUIRED`, `PR_CREATED`, and `COMPLETED`.
@@ -69,7 +69,7 @@ When running autonomous AI coding agents (such as **Anthropic Claude Code**, **O
 - 🔐 **Input Validation**: Process names and window-title filters are validated/sanitized before being embedded into AppleScript or shell commands.
 - 📁 **Hierarchical Project Configuration**: Reads project settings from `.terminal-monitor.json` or `.terminal-monitor.toml` in your repository root, or globally from `~/.config/terminal-monitor/`. Unsafe phrases from CLI flags (`--unsafe-phrase`) are merged with the ones from the config file instead of replacing them.
 - 🗂️ **Cached Git Context**: Repository status is cached with a 30-second TTL and short-lived status-export refreshes, keeping the polling loop cheap even with live status JSON export enabled.
-- ✍️ **Live Human-in-the-Loop Override**: Write a message into `<state-dir>/answer.txt` — it is consumed, dispatched, and cleaned up automatically.
+- ✍️ **Live Human-in-the-Loop Override**: Write a message into `<state-dir>/answer.txt` — it is consumed, dispatched, and cleaned up automatically. Actions are explicitly typed: a `KEY:<name>` payload (e.g. `KEY:tab` from the dashboard's Mode button) is routed to `send_key` and recorded as a `manual_key` ledger entry instead of being delivered as literal agent text; unsupported key names are rejected rather than misdelivered.
 - 🐍 **Python SDK & OOP API**: Clean object-oriented library API (`TerminalMonitor`, `MonitorConfig`, `AgentProfile`) with lifecycle hooks (`on_state_change`, `on_mode_change`, `on_send`, `on_attention`, `on_complete`, `on_tick`).
 - ⚡ **Zero External Dependencies**: Pure Python standard library. No pip installation required.
 
@@ -203,7 +203,14 @@ misbehaving browser tab cannot push unbounded data into the answer channel.
 - **DNS-rebinding defense:** the `Host` header must be a loopback name
   (`127.0.0.1`, `localhost`, `[::1]`); rebinding hosts are rejected with `403`.
 - **Hardened CSP:** the dashboard script ships with a per-response CSP nonce
-  instead of `script-src 'unsafe-inline'`, and styles are served from `/app.css`.
+  instead of `script-src 'unsafe-inline'`, styles are served from `/app.css`,
+  and every control uses `addEventListener` with `data-*` attributes — no
+  inline `onclick`/`onchange`/`onsubmit`/`oninput` handlers, so buttons and
+  filters keep working under the strict policy.
+- **Typed key actions:** `POST /api/send` with `{"action": "key", "key": ...}`
+  accepts only allowlisted key names (plus single printable characters) and
+  rejects anything else with HTTP `400`, so an unsupported key can never be
+  stored and later misdelivered as agent text.
 - **Private state directories:** state directories are created with `0o700`,
   the answer channel (`answer.txt`) is never group/world writable, and the
   monitor fails closed when a pre-created state directory is owned by another
@@ -529,8 +536,10 @@ failure requiring a fix.
 - `terminal-snapshot.txt` is the redacted dashboard feed and `monitor.log.1`
   is the single rotated event-log archive. Consumers should use `/api/status`
   rather than exposing `status.json` directly when serving a UI.
-- `--dry-run` never sends terminal text or keys, starts an agent, or merges a
-  PR. `merge-pr --dry-run` only prints the planned exact-head action.
+- `--dry-run` never sends terminal text or keys, starts an agent, retries CI
+  workflows, or merges a PR. `merge-pr --dry-run` only prints the planned
+  exact-head action, and a `CI_RETRY_REQUIRED` stage stays put (logged and
+  recorded) instead of dispatching `gh run rerun`.
 - A malformed `task-state.json` stops initialization with `StateFileError` instead of silently discarding safety policy.
 
 ---

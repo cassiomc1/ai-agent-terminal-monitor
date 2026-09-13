@@ -39,13 +39,15 @@ Different AI agents use distinct visual conventions in the terminal:
 ### 4. TUI Mode Awareness & Lifecycle Management
 - Identifies active agent modes (e.g. `Plan` vs `Build`).
 - Detects when planning is complete and automatically sends mode-switch keystrokes and start authorizations to trigger code implementation.
+- The follow-up continuation travels the single policy-checked send path (`mode_switch` → `mode_switch_continue`) with full ledger recording, so mode transitions cannot bypass the safety policy.
 
 ### 5. Git Context-Aware Smart Nudges
 - Analyzes repository status dynamically (modified files, untracked changes, unpushed branches, open GitHub pull requests via `gh`).
 - Emits intelligent, contextually relevant continuation prompts tailored to the agent's current progress.
 
 ### 6. Completion Engine & Stop Conditions
-- Detects final plan completion indicators (`"100% concluído"`, `"all tasks completed"`, clean working tree).
+- Detects final plan completion indicators (`"100% concluído"`, `"all tasks completed"`, clean working tree) — English and Portuguese patterns are both supported.
+- Completion evidence counts only when produced after the latest sent instruction: small appends past the normalization window are recovered by line overlap, and a lost interaction marker yields no new segment, so stale “done” text can never finish a new task.
 - Gracefully stops the supervisor daemon and triggers completion events (`on_complete`).
 
 ### 7. Pluggable Terminal Backends
@@ -58,7 +60,8 @@ Different AI agents use distinct visual conventions in the terminal:
 - **Blacklist of Destructive Phrases**: Blocks dangerous actions by default.
 - **Unambiguous Resolution**: Automatically chooses an option only when an explicit safe recommendation or preferred keyword exists.
 - **Human-in-the-Loop Attention**: If a choice is ambiguous or potentially unsafe, the monitor halts with exit code `3` and exports the full terminal snapshot to `attention.txt`.
-- **Live Answer Ingestion**: Allows developers to guide the running agent by dropping a message into `answer.txt` without touching the target terminal.
+- **Live Answer Ingestion**: Allows developers to guide the running agent by dropping a message into `answer.txt` without touching the target terminal. Payloads are explicitly typed: `KEY:<name>` is routed to `send_key` as a `manual_key` ledger entry (allowlisted names only); anything else is sent as text through the policy check.
+- **Fail-closed evidence**: final verification treats every failed query as unknown rather than clean, and blocks completion while evidence is missing.
 
 ### 9. Multi-Project & Config Cascading
 - Scans for `.terminal-monitor.json` or `.terminal-monitor.toml` in project directories.
@@ -87,7 +90,7 @@ Different AI agents use distinct visual conventions in the terminal:
 - **Exact-head merge gate**: the `merge-pr` command re-reads the PR head and check rollup immediately before merging and supplies `--match-head-commit` to GitHub CLI.
 - **Protected branch guard**: supervised work pauses on dirty `main`/`master` or a configured unexpected branch, preserving the snapshot in `attention.txt`.
 - **Auditable reports**: `final-report.json` records verification evidence, attempts, CI events, policy decisions, the explicit npm prohibition, and the npm-publication invariant.
-- **Dry-run isolation**: dry-run mode prints decisions without sending terminal input, approving permissions, starting agents, or merging PRs.
+- **Dry-run isolation**: dry-run mode prints decisions without sending terminal input, approving permissions, starting agents, re-running CI workflows, or merging PRs.
 
 ### 12. State Classification Precedence
 - Actionable states (`permission`, `question`, `completed`) are classified before `thinking`.
@@ -114,8 +117,8 @@ The continuous monitor owns a localhost-only web server with a visual system ins
 - **Architecture Stage Pipeline:** Interactive step sequence tracking lifecycle progress across `TASK_RECEIVED → EXECUTING → VERIFYING → PR_CREATED → CI_CHECKS → MERGED`.
 - **Task Plan & Progress:** Categorized task breakdown with live badges (`DONE`, `ACTIVE`, `TODO`), search filter, and category pills (`ALL`, `ACTIVE`, `PENDING`, `DONE`).
 - **Real-Time Streaming:** Server-Sent Events (`/api/stream`) for low-latency, event-driven updates.
-- **Operator Action Dispatch:** Quick buttons (`Approve (yes)`, `Continue`, `Mode (Tab)`, `Nudge`) and custom instruction prompt input dispatched directly to the monitor via `POST /api/send`.
-- **Privacy & Safety Projections:** The JSON projection intentionally masks credentials, prompts, attempt payloads, configured prohibitions, and policy actions while serving status safely over HTTP.
+- **Operator Action Dispatch:** Quick buttons (`Approve (yes)`, `Continue`, `Mode (Tab)`, `Nudge`) and custom instruction prompt input dispatched directly to the monitor via `POST /api/send`. Controls use `addEventListener` with `data-*` attributes so they keep working under the nonce-based Content Security Policy (no inline event handlers).
+- **Privacy & Safety Projections:** The JSON projection intentionally masks credentials, prompts, attempt payloads, configured prohibitions, and policy actions while serving status safely over HTTP. Key actions are allowlisted at the HTTP boundary (`400` on unsupported names).
 
 ### 15. Supervisor Intelligence & State Isolation
 - **Project-Level State Isolation:** Automatically scopes monitor state, logs, and artifacts per project in `~/.cache/terminal-monitor/<project-name>-<hash>/` (per-user and private by construction; an explicit `--state-dir`, including the historical `/tmp/terminal-monitor`, is still honored).

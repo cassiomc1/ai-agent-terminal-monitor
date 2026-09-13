@@ -6,14 +6,15 @@ Make long-running agent supervision session-aware, policy-safe, observable, and 
 
 ## Architecture
 
-The monitor remains a dependency-free Python CLI. New behavior is divided into focused value objects and services inside `terminal_monitor.py` to preserve the existing single-module package contract:
+The monitor remains a dependency-free Python CLI. New behavior is divided into focused value objects and services inside the `terminal_monitor` package (see `README.md` for the module layout) to preserve the existing package contract:
 
 - `TaskState` persists the task identity, policy, stage, PR metadata, and terminal identity in `<state-dir>/task-state.json`.
 - `ProcessActivity` observes descendants of the agent process and distinguishes a quiet terminal from a running child command.
-- `SessionTracker` records an interaction generation and only accepts completion evidence produced after the latest sent instruction.
+- `SessionTracker` records an interaction generation plus an incremental history-length baseline and only accepts completion evidence produced after the latest sent instruction; small appends past the normalization window are recovered by line overlap, and an unrecognizably lost marker yields no segment (fail-closed).
 - `PolicyEnvelope` composes the permanent objective and prohibitions with stage-specific nudges. Dynamic text is rejected if it conflicts with permanent prohibitions.
 - `PullRequestStateMachine` maps GitHub PR/check data into explicit stages and distinguishes code failures from cancelled, timed-out, network, and infrastructure results.
-- `FinalVerifier` produces a structured report for the exact PR head, local/remote branch alignment, worktree cleanliness, registry/tag/release stability, and publish-process absence.
+- `FinalVerifier` produces a structured report for the exact PR head, local/remote branch alignment, worktree cleanliness, registry/tag/release stability, and publish-process absence. Every invariant is `True` only after its query succeeds (`evidence_complete` / `evidence_unknown` provenance); failed queries are unknown, never clean, and block success.
+- Operator answer payloads are explicitly typed: `KEY:<name>` routes to `send_key` as a `manual_key` ledger entry (allowlisted names only). Mode-switch continuations (`mode_switch` → `mode_switch_continue`) and all other sends share the single policy-checked dispatch path, and `--dry-run` additionally blocks CI workflow re-runs.
 
 Backends receive a `TerminalIdentity` containing project path, branch, session id, title, and root PID. Existing `process` and `title` selection remains supported for compatibility.
 
@@ -46,7 +47,8 @@ Every supervision iteration follows this order:
 - Active child work suppresses question/idle automation.
 - A cancelled, timed-out, network, or infrastructure check is retryable and is not reported as a code failure.
 - Merge is permitted only when checks are green for the exact saved PR head.
-- Final success requires merged PR, exact head validation, synchronized clean `main`, unchanged npm registry state, no new tag/release, and no active publish process.
+- Final success requires merged PR, exact head validation, synchronized clean `main`, unchanged npm registry state, no new tag/release, and no active publish process — each positively verified, with missing evidence blocking the verdict.
+- Dashboard controls use `addEventListener` with `data-*` attributes (no inline event handlers) so they remain functional under the nonce-based Content Security Policy; key actions are allowlisted at the HTTP boundary.
 
 ## Compatibility and errors
 

@@ -13,7 +13,7 @@
 ### Task 1: Durable attempts, CI classifications, and risk policy
 
 **Files:**
-- Modify: `terminal_monitor.py`
+- Modify: `terminal_monitor/` package (`state.py`, `monitor.py`, `github.py`, `cli.py`, …)
 - Test: `tests/test_terminal_monitor.py`
 
 - [x] Add failing tests for attempt lifecycle records, explicit CI categories (`passed`, `failed`, `cancelled-infra`, `failed-external`), and blocked npm/release actions.
@@ -26,7 +26,7 @@
 ### Task 2: Merge gate, branch safety, restart recovery, and reports
 
 **Files:**
-- Modify: `terminal_monitor.py`
+- Modify: `terminal_monitor/` package (`state.py`, `monitor.py`, `github.py`, `cli.py`, …)
 - Test: `tests/test_terminal_monitor.py`
 
 - [x] Add failing tests for exact-head merge gating, branch/worktree violations, restart-state persistence, and final report serialization.
@@ -39,8 +39,8 @@
 ### Task 3: Complete dry-run and CLI/config integration
 
 **Files:**
-- Modify: `terminal_monitor.py`
-- Modify: `supervisor.py`
+- Modify: `terminal_monitor/` package (`cli.py`, `config.py`, `monitor.py`, `github.py`)
+- Modify: `supervisor.py` (now `terminal_monitor/supervise.py` + `terminal-monitor-supervise` entry point)
 - Modify: `.terminal-monitor.example.json`
 - Modify: `.terminal-monitor.example.toml`
 - Test: `tests/test_terminal_monitor.py`
