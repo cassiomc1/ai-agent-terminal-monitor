@@ -618,7 +618,12 @@ class SessionHost:
         while not self._shutdown.is_set() and not self._child_exited.is_set():
             try:
                 conn, _ = listener.accept()
-            except TimeoutError:
+            except (TimeoutError, socket.timeout):  # noqa: UP041 -- socket.timeout is NOT TimeoutError below 3.10
+                # socket.timeout aliases TimeoutError only on Python 3.10+; on
+                # older interpreters it subclasses OSError instead, so the
+                # unqualified TimeoutError catch would fall through and kill a
+                # perfectly healthy session after the first poll. Catch both
+                # names: an idle-accept timeout must always keep polling.
                 continue
             except OSError:
                 break

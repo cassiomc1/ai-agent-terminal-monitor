@@ -481,6 +481,12 @@ failure requiring a fix.
 
 ## Migration notes
 
+- **Python floor enforcement:** the CLI now fails closed with
+  `E_PYTHON_UNSUPPORTED` when run on an interpreter older than Python 3.10
+  (the version `requires-python` already declared). Out-of-spec interpreters
+  previously half-worked: e.g. macOS's stock Python 3.9 imported cleanly but
+  broke managed PTY sessions silently. `--version` and `--help` still work on
+  any interpreter so the environment can be diagnosed.
 - **State directory default:** the default root moved from the world-shared
   `/tmp/terminal-monitor` to the per-user `~/.cache/terminal-monitor`; explicit
   `--state-dir` values keep working and every state directory is created with

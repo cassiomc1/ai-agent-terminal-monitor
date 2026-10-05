@@ -1,4 +1,6 @@
 """P0/P1 hardening tests: ownership, concurrency, termination, drain, redaction."""
+from __future__ import annotations
+
 import base64
 import contextlib
 import gc
@@ -1039,6 +1041,11 @@ class RemoteLifecycleTests(StateDirMixin, unittest.TestCase):
         self.assertTrue(client.status().alive, "share failure must not touch the managed agent")
 
     @unittest.skipIf(os.name != "posix", "managed PTY requires POSIX")
+    @unittest.skipIf(
+        sys.version_info[:2] < (3, 10),
+        "the CLI fails closed on <3.10 (E_PYTHON_UNSUPPORTED) by design, so the "
+        "in-process supervise flow cannot be exercised on this interpreter",
+    )
     def test_automatic_remote_provider_failure_is_non_fatal(self):
         """`--remote-provider shell-online` aborts sharing but keeps supervising."""
         import shlex
