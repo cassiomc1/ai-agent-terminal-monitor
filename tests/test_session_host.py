@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import contextlib
 import json
 import os
@@ -24,6 +26,15 @@ CHILD_ECHO = (
     "import sys,time; print('READY', flush=True); "
     "line=sys.stdin.readline(); print('ECHO:'+line.strip(), flush=True); "
     "time.sleep(0.5)",
+)
+
+# Long-lived child: stays alive well past three accept-loop poll windows
+# (0.3s each), so a host that dies early cannot fake liveness.
+CHILD_SLEEP = (
+    sys.executable,
+    "-u",
+    "-c",
+    "import time; print('READY', flush=True); time.sleep(2.5)",
 )
 
 
@@ -104,6 +115,23 @@ class SessionHostTests(unittest.TestCase):
         self.assertTrue(_wait_for(lambda: b"ECHO:hello" in client.snapshot(), timeout=10.0))
         # Child exits ~0.5s after echo; exit becomes observable.
         self.assertTrue(_wait_for(lambda: client.status().exit_code is not None or not client.status().alive, timeout=10.0))
+
+    def test_host_stays_alive_across_idle_accept_polls(self):
+        """Regression: an idle accept poll must never shut the host down.
+
+        The accept loop previously caught only ``TimeoutError``; on
+        interpreters where ``socket.timeout`` is not that alias (Python 3.9),
+        the timeout fell into the ``OSError`` branch, broke the loop, and the
+        host finalized itself (state ``stopped``, socket removed) within the
+        first 0.3s poll while the agent was still alive.
+        """
+        tmp = self._state_dir()
+        client = self._start(tmp, command=CHILD_SLEEP)
+        self.assertTrue(_wait_for(lambda: b"READY" in client.snapshot(), timeout=10.0))
+        # Outlive several 0.3s accept-poll windows.
+        time.sleep(1.0)
+        self.assertTrue(client.status().alive, "host must survive idle accept polls with a live child")
+        self.assertTrue(pathlib.Path(tmp, "session-control.sock").exists(), "control socket must still be bound")
 
     def test_invalid_token_is_rejected(self):
         tmp = self._state_dir()

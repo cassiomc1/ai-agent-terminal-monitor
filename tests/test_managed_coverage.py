@@ -1,4 +1,7 @@
 """Fast in-process coverage for managed PTY, CLI surfaces, and providers."""
+from __future__ import annotations
+
+import collections
 import contextlib
 import json
 import os
@@ -557,6 +560,24 @@ class EntrypointTests(unittest.TestCase):
         with mock.patch.object(sys, "argv", ["terminal_monitor", "--version"]):
             with self.assertRaises(SystemExit) as ctx:
                 runpy.run_module("terminal_monitor.__main__", run_name="__main__")
+            self.assertEqual(ctx.exception.code, 0)
+
+    def test_cli_fails_closed_below_supported_python(self):
+        from terminal_monitor import cli
+
+        # Simulate an out-of-spec interpreter (e.g. macOS stock 3.9): every
+        # real operation must exit loudly instead of half-working.
+        fake_old = collections.namedtuple("version_info", "major minor micro releaselevel serial")(3, 9, 6, "final", 0)
+        with mock.patch.object(cli.sys, "version_info", fake_old), mock.patch.object(sys, "argv", ["terminal_monitor", "--once"]):
+            self.assertEqual(cli.main(), 2)
+
+    def test_cli_accepts_python_at_supported_floor(self):
+        from terminal_monitor import cli
+
+        # At the 3.10 floor the guard must be a no-op: --version still exits 0.
+        with mock.patch.object(cli.sys, "version_info", (3, 10, 0)), mock.patch.object(sys, "argv", ["terminal_monitor", "--version"]):
+            with self.assertRaises(SystemExit) as ctx:
+                cli.main()
             self.assertEqual(ctx.exception.code, 0)
 
     def test_supervise_main_with_mocked_monitor(self):

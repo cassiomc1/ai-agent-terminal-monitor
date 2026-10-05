@@ -32,6 +32,30 @@ from .safety import UNSAFE_PHRASES, PolicyEnvelope
 from .state import StateFileError, TaskState, enable_debug_log, json_safe
 from .status import read_status_snapshot, render_status_dashboard, resume_monitor, stop_monitor
 
+MIN_PYTHON_VERSION = (3, 10)
+
+
+def _require_supported_python() -> bool:
+    """Fail closed on interpreters below the supported floor.
+
+    ``requires-python = ">=3.10"`` only constrains installers, not source
+    runs: under e.g. macOS's stock Python 3.9 the package still imports, but
+    runtime behavior silently degrades (PEP 604 unions fail to evaluate,
+    ``socket.timeout`` is not ``TimeoutError``). Exit loudly instead of
+    half-working; a non-zero status beats a monitor that quietly dies.
+    """
+    if sys.version_info[:2] < MIN_PYTHON_VERSION:
+        print(
+            f"E_PYTHON_UNSUPPORTED: terminal-monitor requires Python "
+            f"{MIN_PYTHON_VERSION[0]}.{MIN_PYTHON_VERSION[1]}+ but is running under "
+            f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}. "
+            "Re-run with a newer interpreter (e.g. python3.11, python3.12, or the "
+            "installed terminal-monitor console script).",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
 
 def build_parser() -> argparse.ArgumentParser:
     """Build comprehensive CLI argument parser."""
@@ -517,7 +541,9 @@ def _run_terminate_session(args: argparse.Namespace, config: Any) -> int:
 def main() -> int:
     """CLI entrypoint."""
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args()  # --version and --help stay available on any interpreter
+    if not _require_supported_python():
+        return 2
 
     debug_log_path = getattr(args, "debug_log", None)
     if debug_log_path:
