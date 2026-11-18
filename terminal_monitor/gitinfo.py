@@ -11,12 +11,13 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .backends import run_command
+from .backends import applescript_escape, run_command
 from .safety import redact_sensitive
 from .state import debug_swallow, json_safe, now_iso
 
@@ -103,18 +104,19 @@ def resolve_project_state_dir(base_state_dir: str, project_dir: str) -> str:
 def send_desktop_notification(title: str, message: str) -> bool:
     """Send a native desktop notification on macOS or Linux without blocking."""
     try:
-        clean_title = redact_sensitive(title).replace('"', '\\"')
-        clean_msg = redact_sensitive(message).replace('"', '\\"')
+        safe_title = re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", redact_sensitive(title)).strip()
+        safe_msg = re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", redact_sensitive(message)).strip()
         if sys.platform == "darwin":
+            script = f'display notification "{applescript_escape(safe_msg)}" with title "{applescript_escape(safe_title)}"'
             subprocess.Popen(
-                ["osascript", "-e", f'display notification "{clean_msg}" with title "{clean_title}"'],
+                ["osascript", "-e", script],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
             return True
         elif shutil.which("notify-send"):
             subprocess.Popen(
-                ["notify-send", clean_title, clean_msg],
+                ["notify-send", "--", safe_title, safe_msg],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -127,6 +129,9 @@ def send_desktop_notification(title: str, message: str) -> bool:
 def dispatch_webhook(webhook_url: str, event_type: str, payload: dict[str, Any]) -> bool:
     """Post an event payload to a configured webhook URL asynchronously in a daemon thread."""
     if not webhook_url:
+        return False
+    parsed = urllib.parse.urlsplit(webhook_url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         return False
 
     def _post() -> None:
@@ -226,7 +231,7 @@ def get_git_status(repo_dir: str = ".", ttl_seconds: float = GIT_STATUS_TTL_SECO
     return status
 
 
-def _get_open_pr_count(repo_dir: str) -> int:
+def _get_open_pr_count(repo_dir: str, *, bypass_cache: bool = False) -> int:
     """Fetch the open-PR count with its own network TTL cache."""
     if not shutil.which("gh"):
         return 0
@@ -236,9 +241,10 @@ def _get_open_pr_count(repo_dir: str) -> int:
         key = repo_dir
     now = time.monotonic()
     with _OPEN_PRS_LOCK:
-        cached = _OPEN_PRS_CACHE.get(key)
-        if cached is not None and now - cached[0] < OPEN_PRS_TTL_SECONDS:
-            return cached[1]
+        if not bypass_cache:
+            cached = _OPEN_PRS_CACHE.get(key)
+            if cached is not None and now - cached[0] < OPEN_PRS_TTL_SECONDS:
+                return cached[1]
         gh_code, gh_out, _ = run_command(["gh", "pr", "list", "--state", "open", "--json", "number"], cwd=repo_dir)
         open_prs = 0
         if gh_code == 0:
@@ -246,6 +252,22 @@ def _get_open_pr_count(repo_dir: str) -> int:
                 open_prs = len(json.loads(gh_out))
         _OPEN_PRS_CACHE[key] = (now, open_prs)
         return open_prs
+
+
+def _parse_porcelain_path(line: str) -> str:
+    """Extract the path from a ``git status --porcelain`` line.
+
+    ``run_command`` strips leading/trailing whitespace on the whole stdout
+    string, which strips the leading status space of the first line (e.g.
+    ``" M file.py"`` becomes ``"M file.py"``). Handle both the intact two-char
+    XY prefix and the single-char stripped prefix so the first character of the
+    filename is never sliced off.
+    """
+    if len(line) >= 4 and line[2] == " " and line[0] in " MADRCU?!" and line[1] in " MADRCU?!":
+        return line[3:].strip()
+    if len(line) >= 3 and line[1] == " " and line[0] in "MADRCU?!":
+        return line[2:].strip()
+    return line.strip()
 
 
 def _get_local_git_fields(repo_dir: str) -> tuple[str, str, bool, int, int, tuple[str, ...], str] | None:
@@ -264,12 +286,16 @@ def _get_local_git_fields(repo_dir: str) -> tuple[str, str, bool, int, int, tupl
         head_code, head_out, _ = run_command(["git", "rev-parse", "HEAD"], cwd=repo_dir)
         head = head_out.strip() if head_code == 0 else ""
 
-        _status_code, status_out, _ = run_command(["git", "status", "--porcelain"], cwd=repo_dir)
-        status_lines = [line for line in status_out.splitlines() if line.strip() and not line.strip().endswith(".DS_Store")]
+        status_code, status_out, _ = run_command(["git", "status", "--porcelain"], cwd=repo_dir)
+        status_lines = (
+            [line for line in status_out.splitlines() if line.strip() and not line.strip().endswith(".DS_Store")]
+            if status_code == 0
+            else []
+        )
         dirty = len(status_lines) > 0
         untracked = sum(1 for line in status_lines if line.startswith("??"))
         modified = len(status_lines) - untracked
-        modified_files = tuple(line[3:].strip() if len(line) > 3 else line.strip() for line in status_lines)
+        modified_files = tuple(_parse_porcelain_path(line) for line in status_lines)
 
         log_code, log_out, _ = run_command(["git", "log", "-n", "1", "--oneline"], cwd=repo_dir)
         last_commit = log_out.strip() if log_code == 0 else ""
@@ -282,14 +308,11 @@ def _get_local_git_fields(repo_dir: str) -> tuple[str, str, bool, int, int, tupl
 def _get_git_status_uncached(repo_dir: str = ".") -> GitStatus:
     """Uncached snapshot; kept for callers that must bypass both TTL caches."""
     try:
-        code, out, _ = run_command(["git", "rev-parse", "--is-inside-work-tree"], cwd=repo_dir)
-        if code != 0 or "true" not in out:
-            return GitStatus(is_repo=False)
         fields = _get_local_git_fields(repo_dir)
         if fields is None:
             return GitStatus(is_repo=False)
         branch, head, dirty, modified, untracked, modified_files, last_commit = fields
-        open_prs = _get_open_pr_count(repo_dir)
+        open_prs = _get_open_pr_count(repo_dir, bypass_cache=True)
         return GitStatus(
             is_repo=True,
             branch=branch,

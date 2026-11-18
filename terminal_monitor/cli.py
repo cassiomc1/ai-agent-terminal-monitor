@@ -88,6 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     stop_parser = subparsers.add_parser("stop", help="Stop the monitor without interrupting the agent")
     stop_parser.add_argument("--state-dir", default=None, help="Monitor state directory")
+    stop_parser.add_argument("--project-dir", "-d", default=None, help="Project directory for state resolution")
     stop_parser.add_argument("--reason", default="cli_stop", help="Reason recorded for the stop")
 
     resume_parser = subparsers.add_parser("resume", help="Resume a monitor from saved launch metadata")
@@ -123,6 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     attach_parser = subparsers.add_parser("attach", help="Follow a managed PTY session (read-only)")
     attach_parser.add_argument("--state-dir", default=None, help="Monitor state directory")
+    attach_parser.add_argument("--project-dir", "-d", default=None, help="Project directory for state resolution")
     attach_parser.add_argument("--read-only", action="store_true", help="Required: attach is output-only")
     attach_parser.add_argument("--limit-bytes", type=int, default=512 * 1024, help="Initial replay snapshot size")
 
@@ -212,10 +214,12 @@ def config_from_args(args: argparse.Namespace) -> MonitorConfig:
             file_cfg = load_config_file(discovered)
 
     continue_text = getattr(args, "continue_text", None) if getattr(args, "continue_text", None) is not None else file_cfg.get("continue_text", "")
-    if getattr(args, "continue_file", None):
-        continue_path = Path(args.continue_file).resolve()
-        if continue_path.is_file():
-            continue_text = continue_path.read_text(encoding="utf-8").strip()
+    continue_file = getattr(args, "continue_file", None) or file_cfg.get("continue_file")
+    if continue_file:
+        continue_path = Path(str(continue_file)).resolve()
+        if not continue_path.is_file():
+            raise FileNotFoundError(f"Continue file not found: {continue_path}")
+        continue_text = continue_path.read_text(encoding="utf-8").strip()
 
     is_supervise = bool(getattr(args, "supervise", False) or getattr(args, "command", "") == "supervise" or file_cfg.get("supervise", False))
     auto_allow = bool(getattr(args, "auto_allow_permissions", None) if getattr(args, "auto_allow_permissions", None) is not None else (is_supervise or file_cfg.get("auto_allow_permissions", False)))
@@ -259,7 +263,7 @@ def config_from_args(args: argparse.Namespace) -> MonitorConfig:
         profile=profile,
         title=_val(getattr(args, "title", None), "title", None),
         continue_text=continue_text,  # type: ignore[arg-type]
-        continue_file=getattr(args, "continue_file", None),
+        continue_file=str(continue_file) if continue_file else None,
         poll_seconds=float(_val(getattr(args, "poll_seconds", None), "poll_seconds", 3.0)),
         idle_seconds=float(_val(getattr(args, "idle_seconds", None), "idle_seconds", 15.0)),
         cooldown_seconds=float(_val(getattr(args, "cooldown_seconds", None), "cooldown_seconds", 20.0)),
@@ -538,6 +542,11 @@ def _run_terminate_session(args: argparse.Namespace, config: Any) -> int:
     return 0
 
 
+def _has_cli_flag(argv: list[str] | tuple[str, ...], *names: str) -> bool:
+    """Return True if any option in ``names`` appears as ``--flag`` or ``--flag=...``."""
+    return any(arg in names or any(arg.startswith(f"{name}=") for name in names) for arg in argv)
+
+
 def main() -> int:
     """CLI entrypoint."""
     parser = build_parser()
@@ -568,11 +577,13 @@ def main() -> int:
         return 0
 
     config = config_from_args(args)
+    if not debug_log_path and config.debug_log_path:
+        enable_debug_log(config.debug_log_path)
     if config.supervise:
         launch = [sys.executable, "-m", "terminal_monitor", *sys.argv[1:]]
-        if "--state-dir" not in launch:
+        if not _has_cli_flag(launch, "--state-dir"):
             launch.extend(["--state-dir", config.state_dir])
-        if "--project-dir" not in launch and "-d" not in launch:
+        if not _has_cli_flag(launch, "--project-dir", "-d"):
             launch.extend(["--project-dir", config.project_dir])
         for prohibition in config.prohibitions:
             if prohibition not in launch:
@@ -621,13 +632,13 @@ def main() -> int:
         if config.dry_run:
             print(json.dumps({"dry_run": True, "action": "send", "payload": args.text, "policy": reason}, indent=2))
             return 0
-        backend = get_backend(config.backend)
+        backend = get_backend(config.backend, state_dir=config.state_dir)
         ok, detail = backend.send(config.process, config.title, args.text)
         print(detail)
         return 0 if ok else 1
 
     if args.command == "interrupt-child":
-        backend = get_backend(config.backend)
+        backend = get_backend(config.backend, state_dir=config.state_dir)
         roots = set(backend.get_pids(config.process))
         ok = interrupt_process_tree(roots, args.pid, parent_of=_parent_pid, children_of=_children_pids)
         print("INTERRUPTED_TREE" if ok else "REFUSED_NOT_VERIFIED_DESCENDANT")
@@ -679,7 +690,7 @@ def main() -> int:
     if args.command == "terminate-session":
         return _run_terminate_session(args, config)
 
-    # Validate managed configuration before supervising.
+    # Validate managed configuration and remote provider before supervising.
     if str(config.backend).lower() in ("pty", "managed", "managed-pty"):
         from .config import validate_managed_config
 
@@ -688,6 +699,11 @@ def main() -> int:
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 2
+
+    remote_provider = str(getattr(config, "remote_provider", "") or "").lower().strip()
+    if remote_provider and remote_provider not in ("shell-online", "shell.online", "shell_online"):
+        print(f"E_REMOTE_PROVIDER_UNAVAILABLE: unknown provider {remote_provider!r}", file=sys.stderr)
+        return 2
 
     monitor = TerminalMonitor(config)
 
@@ -700,7 +716,6 @@ def main() -> int:
     # succeeds. Provider failure is non-fatal: local supervision continues.
     # A previously saved active share must be stopped first; if that stop
     # fails, share creation is aborted rather than multiplying remote links.
-    remote_provider = str(getattr(config, "remote_provider", "") or "").lower().strip()
     if remote_provider in ("shell-online", "shell.online", "shell_online"):
         try:
             from .shell_online import ShellOnlineProvider

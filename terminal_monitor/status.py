@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import textwrap
@@ -12,9 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from .backends import run_command
-from .gitinfo import get_git_status
+from .gitinfo import ensure_private_dir, get_git_status
 from .processes import pid_is_alive
 from .safety import redact_sensitive
+from .state import _atomic_text_write
 
 ANSI_CODES = {
     "reset": "\033[0m",
@@ -58,6 +60,15 @@ def read_status_snapshot(state_dir: str | Path, project_dir: str = ".") -> dict[
             "git": {},
             "task": {},
         }
+    if not (status.get("monitor_pid") or status.get("pid")):
+        try:
+            lock_data = json.loads((state_path / "monitor.pid").read_text(encoding="utf-8"))
+            if isinstance(lock_data, dict) and lock_data.get("pid"):
+                status["monitor_pid"] = lock_data["pid"]
+                if not status_path.exists():
+                    status["running"] = True
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
     monitor_pid = status.get("monitor_pid") or status.get("pid")
     pid_alive = bool(status.get("running") and pid_is_alive(monitor_pid))
     identity_checked = bool(status.get("monitor_instance_id") or status.get("schema_version", 1) >= 2)
@@ -125,11 +136,11 @@ def render_status_dashboard(snapshot: dict[str, Any], *, color: bool = True, wid
     todo_pending = int(todo.get("pending", 0) or 0) + int(todo.get("in_progress", 0) or 0)
     progress = f"{todo_completed}/{todo_total}" if todo_total else "not detected"
     task_id = str(task.get("detected_id") or task.get("task_id") or "-")
-    state_fragment = _ansi(state, state_tone, color)
+    state_fragment = _ansi(f"{state:<10}", state_tone, color)
     mode = str(snapshot.get("mode") or "-")
     lines = [
         _ansi("╭─ AI Agent Terminal Monitor", "cyan", color),
-        _ansi(f"│ Monitor   {monitor_label:<7}  Agent ", monitor_tone, color) + f"{state_fragment:<10}" + _ansi(f"  Mode {mode!s:<6}", monitor_tone, color),
+        _ansi(f"│ Monitor   {monitor_label:<7}  Agent ", monitor_tone, color) + state_fragment + _ansi(f"  Mode {mode!s:<6}", monitor_tone, color),
         _ansi(f"│ Heartbeat {snapshot.get('heartbeat') or snapshot.get('timestamp') or '-'}", "dim", color),
         _ansi("├─ Task", "blue", color),
         f"│ {task_id}  ·  progress {progress}  ·  remaining {todo_pending}",
@@ -150,6 +161,27 @@ def render_status_dashboard(snapshot: dict[str, Any], *, color: bool = True, wid
         lines.append(_ansi("│ Monitor PID is no longer alive; status file is stale.", "red", color))
     lines.append(_ansi("╰────────────────────────────────────────────────────────────────────────────", "cyan", color))
     return "\n".join(lines)
+def _extract_state_dir_arg(command_line: str) -> str | None:
+    """Return the last ``--state-dir`` argument value from a command line, else None."""
+    try:
+        tokens = shlex.split(command_line)
+    except ValueError:
+        matches = re.findall(r"--state-dir(?:=|\s+)([^\s'\"]+)", command_line)
+        return matches[-1] if matches else None
+    found: str | None = None
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--state-dir" and index + 1 < len(tokens):
+            found = tokens[index + 1]
+            index += 2
+            continue
+        if token.startswith("--state-dir="):
+            found = token.split("=", 1)[1]
+        index += 1
+    return found
+
+
 def _monitor_process_matches(pid: int | str | None, state_dir: str | Path) -> bool:
     """Verify a PID belongs to this monitor before sending it a signal."""
     if not pid_is_alive(pid):
@@ -158,25 +190,38 @@ def _monitor_process_matches(pid: int | str | None, state_dir: str | Path) -> bo
     if code != 0:
         return False
     command = output.lower()
-    if "terminal_monitor" not in command:
+    if not any(marker in command for marker in ("terminal_monitor", "terminal-monitor", "supervisor.py")):
         return False
     state_path = Path(state_dir).resolve()
+    explicit_dir = _extract_state_dir_arg(output)
+    if explicit_dir is not None:
+        try:
+            return Path(explicit_dir).resolve() == state_path
+        except OSError:
+            return False
     state_candidates = {
         str(state_path).lower(),
         str(state_path.name).lower(),
-        state_path.name.split("-")[0].lower(),
     }
-    return any(candidate in command for candidate in state_candidates) or "terminal_monitor" in command
+    if any(candidate and candidate in command for candidate in state_candidates):
+        return True
+    try:
+        lock = json.loads((state_path / "monitor.pid").read_text(encoding="utf-8"))
+        if isinstance(lock, dict) and lock.get("pid") is not None:
+            return int(str(lock["pid"])) == int(str(pid))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return False
 
 
 def stop_monitor(state_dir: str | Path, *, reason: str = "cli_stop") -> dict[str, Any]:
     """Stop only a verified monitor process and leave the agent process untouched."""
     state_path = Path(state_dir)
+    ensure_private_dir(state_path)
     status = read_status_snapshot(state_path)
     pid = status.get("monitor_pid") or status.get("pid")
     stop_path = state_path / "stop"
-    stop_path.parent.mkdir(parents=True, exist_ok=True)
-    stop_path.touch()
+    _atomic_text_write(stop_path, "")
     result: dict[str, Any] = {"ok": True, "action": "stop", "state_dir": str(state_path), "pid": pid, "agent_untouched": True}
     if _monitor_process_matches(pid, state_path):
         try:
@@ -187,6 +232,48 @@ def stop_monitor(state_dir: str | Path, *, reason: str = "cli_stop") -> dict[str
     else:
         result.update({"signal": "none", "reason": "no verified live monitor"})
     return result
+
+
+def _is_trusted_resume_command(command: list[str], state_path: Path) -> bool:
+    """Validate an argv list before re-launching a supervisor via Popen."""
+    if not command or any(not isinstance(item, str) or not item.strip() for item in command):
+        return False
+    exe_name = Path(command[0]).name.lower()
+    if exe_name in {"terminal-monitor", "terminal-monitor-supervise"}:
+        supervise_entrypoint = exe_name == "terminal-monitor-supervise"
+        rest = command[1:]
+    elif re.fullmatch(r"(?:python|pypy)(?:\d+(?:\.\d+)*)?", exe_name):
+        if len(command) >= 3 and command[1] == "-m" and command[2] in {"terminal_monitor", "terminal_monitor.supervise"}:
+            supervise_entrypoint = command[2] == "terminal_monitor.supervise"
+            rest = command[3:]
+        elif len(command) >= 2 and not command[1].startswith("-") and Path(command[1]).name.lower() in {"terminal_monitor.py", "supervisor.py"}:
+            supervise_entrypoint = Path(command[1]).name.lower() == "supervisor.py"
+            rest = command[2:]
+        else:
+            return False
+    else:
+        return False
+
+    if not supervise_entrypoint and not any(token in {"supervise", "--supervise", "-S"} for token in rest):
+        return False
+
+    state_dir_val: str | None = None
+    index = 0
+    while index < len(rest):
+        token = rest[index]
+        if token == "--state-dir" and index + 1 < len(rest):
+            state_dir_val = rest[index + 1]
+            index += 2
+            continue
+        if token.startswith("--state-dir="):
+            state_dir_val = token.split("=", 1)[1]
+        index += 1
+    if not state_dir_val:
+        return False
+    try:
+        return Path(state_dir_val).resolve() == state_path.resolve()
+    except OSError:
+        return False
 
 
 def resume_monitor(state_dir: str | Path, *, project_dir: str = ".") -> dict[str, Any]:
@@ -200,16 +287,9 @@ def resume_monitor(state_dir: str | Path, *, project_dir: str = ".") -> dict[str
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         return {"ok": False, "action": "resume", "error": f"launch metadata unavailable: {exc}"}
-    command = [str(item) for item in metadata.get("command", [])] if isinstance(metadata, dict) else []
-    state_candidates = {str(state_path).lower(), str(state_path.resolve()).lower()}
-    command_text = " ".join(command).lower()
-    trusted_entrypoint = (
-        "terminal_monitor.py" in command_text
-        or "supervisor.py" in command_text
-        or "-m terminal_monitor" in command_text
-        or "terminal_monitor.supervise" in command_text
-    )
-    if not command or not trusted_entrypoint or ("supervise" not in command_text and "--supervise" not in command_text) or not any(candidate in command_text for candidate in state_candidates):
+    raw_command = metadata.get("command") if isinstance(metadata, dict) else None
+    command = [item for item in raw_command if isinstance(item, str)] if isinstance(raw_command, list) else []
+    if len(command) != len(raw_command or []) or not _is_trusted_resume_command(command, state_path):
         return {"ok": False, "action": "resume", "error": "refusing untrusted monitor launch metadata"}
     with contextlib.suppress(OSError):
         (state_path / "stop").unlink()

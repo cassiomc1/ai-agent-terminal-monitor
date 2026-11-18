@@ -312,8 +312,25 @@ BUILTIN_PROFILES: dict[str, AgentProfile] = {
 }
 
 
+def _clone_profile(prof: AgentProfile, **overrides: Any) -> AgentProfile:
+    """Return an isolated copy of ``prof`` so callers cannot mutate shared singletons."""
+    return replace(
+        prof,
+        thinking_patterns=list(prof.thinking_patterns),
+        permission_patterns=list(prof.permission_patterns),
+        question_indicators=list(prof.question_indicators),
+        option_patterns=list(prof.option_patterns),
+        unsafe_phrases=list(prof.unsafe_phrases),
+        preferred_answers=list(prof.preferred_answers),
+        mode_patterns=dict(prof.mode_patterns),
+        plan_ready_patterns=list(prof.plan_ready_patterns),
+        completion_patterns=list(prof.completion_patterns),
+        **overrides,
+    )
+
+
 # claude-code is a full alias of the claude profile, derived to avoid duplication.
-BUILTIN_PROFILES["claude-code"] = replace(
+BUILTIN_PROFILES["claude-code"] = _clone_profile(
     BUILTIN_PROFILES["claude"],
     name="claude-code",
     description="Alias for Anthropic Claude Code CLI",
@@ -329,24 +346,24 @@ def get_profile(name_or_process: str | None = None, custom_profiles: dict[str, A
     if key in custom:
         val = custom[key]
         if isinstance(val, AgentProfile):
-            return val
+            return _clone_profile(val)
         if isinstance(val, dict):
             return AgentProfile(
                 name=key,
                 process=val.get("process", key),
                 description=val.get("description", ""),
-                thinking_patterns=val.get("thinking_patterns", []),
-                permission_patterns=val.get("permission_patterns", []),
-                question_indicators=val.get("question_indicators", []),
-                option_patterns=val.get("option_patterns", [r"^\s*[●○◉]\s+\S", r"^\s*\d+[.)\]]\s+\S"]),
-                unsafe_phrases=val.get("unsafe_phrases", list(UNSAFE_PHRASES)),
-                preferred_answers=val.get("preferred_answers", list(DEFAULT_PREFERRED_ANSWERS)),
+                thinking_patterns=list(val.get("thinking_patterns", [])),
+                permission_patterns=list(val.get("permission_patterns", [])),
+                question_indicators=list(val.get("question_indicators", [])),
+                option_patterns=list(val.get("option_patterns", [r"^\s*[●○◉]\s+\S", r"^\s*\d+[.)\]]\s+\S"])),
+                unsafe_phrases=list(val.get("unsafe_phrases", UNSAFE_PHRASES)),
+                preferred_answers=list(val.get("preferred_answers", DEFAULT_PREFERRED_ANSWERS)),
                 auto_permission_payload=val.get("auto_permission_payload", ""),
                 default_continue_text=val.get("default_continue_text"),
-                mode_patterns=val.get("mode_patterns", {}),
-                plan_ready_patterns=val.get("plan_ready_patterns", []),
+                mode_patterns=dict(val.get("mode_patterns", {})),
+                plan_ready_patterns=list(val.get("plan_ready_patterns", [])),
                 mode_switch_key=val.get("mode_switch_key", "tab"),
-                completion_patterns=val.get("completion_patterns", []),
+                completion_patterns=list(val.get("completion_patterns", [])),
                 todo_ratio_pattern=val.get("todo_ratio_pattern", AgentProfile.todo_ratio_pattern),
                 todo_all_complete_pattern=val.get("todo_all_complete_pattern", AgentProfile.todo_all_complete_pattern),
                 todo_no_pending_pattern=val.get("todo_no_pending_pattern", AgentProfile.todo_no_pending_pattern),
@@ -355,34 +372,19 @@ def get_profile(name_or_process: str | None = None, custom_profiles: dict[str, A
 
     # Match in built-in profiles
     if key in BUILTIN_PROFILES:
-        return BUILTIN_PROFILES[key]
+        return _clone_profile(BUILTIN_PROFILES[key])
 
     # Try matching process name against built-in profiles
     for prof in BUILTIN_PROFILES.values():
         if prof.process.lower() == key:
-            return prof
+            return _clone_profile(prof)
 
     # Fallback generic profile with the requested process name
-    generic = BUILTIN_PROFILES["generic"]
-    return AgentProfile(
+    return _clone_profile(
+        BUILTIN_PROFILES["generic"],
         name=key,
         process=key,
         description=f"Auto-generated profile for {key}",
-        thinking_patterns=list(generic.thinking_patterns),
-        permission_patterns=list(generic.permission_patterns),
-        question_indicators=list(generic.question_indicators),
-        option_patterns=list(generic.option_patterns),
-        unsafe_phrases=list(generic.unsafe_phrases),
-        preferred_answers=list(generic.preferred_answers),
-        auto_permission_payload=generic.auto_permission_payload,
-        mode_patterns=dict(generic.mode_patterns),
-        plan_ready_patterns=list(generic.plan_ready_patterns),
-        mode_switch_key=generic.mode_switch_key,
-        completion_patterns=list(generic.completion_patterns),
-        todo_ratio_pattern=generic.todo_ratio_pattern,
-        todo_all_complete_pattern=generic.todo_all_complete_pattern,
-        todo_no_pending_pattern=generic.todo_no_pending_pattern,
-        todo_final_complete_pattern=generic.todo_final_complete_pattern,
     )
 
 

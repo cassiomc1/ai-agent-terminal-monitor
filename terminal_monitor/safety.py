@@ -91,7 +91,7 @@ class PolicyEnvelope:
     def compose(self, dynamic: str, stage: str = "") -> str:
         low = dynamic.lower()
         npm_blocked = any("npm" in item.lower() and ("not" in item.lower() or "não" in item.lower()) for item in self.prohibitions)
-        if npm_blocked and re.search(r"\b(publish|publique|publicar|publique)\b.{0,30}\bnpm\b|\bnpm\s+publish\b", low):
+        if npm_blocked and re.search(r"\b(publish|publique|publicar)\b.{0,30}\bnpm\b|\bnpm\s+publish\b", low):
             raise ValueError("dynamic instruction conflicts with permanent npm prohibition")
         if classify_action_risk(dynamic) == "blocked":
             raise ValueError("dynamic instruction conflicts with permanent safety policy")

@@ -37,7 +37,7 @@ from .session_protocol import (
     receive_message,
     send_message,
 )
-from .state import _atomic_json_write, now_iso
+from .state import _atomic_json_write, _atomic_text_write, now_iso
 
 SESSION_METADATA_NAME = "managed-session.json"
 SESSION_TOKEN_NAME = "session-token"
@@ -312,14 +312,7 @@ class SessionHost:
 
     def _write_token(self) -> None:
         _, token_path, _ = self._paths()
-        token_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = token_path.with_name(f".{token_path.name}.{os.getpid()}.tmp")
-        tmp.write_text(self.token + "\n", encoding="utf-8")
-        with contextlib.suppress(OSError):
-            os.chmod(tmp, 0o600)
-        os.replace(tmp, token_path)
-        with contextlib.suppress(OSError):
-            os.chmod(token_path, 0o600)
+        _atomic_text_write(token_path, self.token + "\n")
 
     def _remove_known_artifacts(self, base: Path) -> None:
         # Only the three files this host owns; never directories, never
@@ -371,14 +364,9 @@ class SessionHost:
             return 2
 
         self._write_token()
-        pid, master = self._fork_child(cwd)
-        self._root_pid = pid
-        self._master_fd = master
-        with contextlib.suppress(OSError, ValueError):
-            os.set_blocking(master, False)
-        _apply_winsize(master, int(self.config.cols), int(self.config.rows))
 
-        # Bind control socket before announcing metadata.
+        # Bind control socket before spawning the child so bind failures exit
+        # immediately without leaving an orphan child or burning teardown grace.
         _, _, sock_path = self._paths()
         try:
             if sock_path.exists() or sock_path.is_symlink():
@@ -392,12 +380,27 @@ class SessionHost:
             listener.listen(16)
         except OSError as exc:
             print(f"E_SESSION_START_TIMEOUT: cannot bind control socket: {exc}", file=sys.stderr)
-            self._terminate_group()
             with contextlib.suppress(OSError):
                 listener.close()
+            self._remove_known_artifacts(base)
             return 2
         with contextlib.suppress(OSError):
             os.chmod(sock_path, 0o600)
+
+        try:
+            pid, master = self._fork_child(cwd)
+        except OSError as exc:
+            print(f"E_SESSION_START_TIMEOUT: cannot fork managed child: {exc}", file=sys.stderr)
+            with contextlib.suppress(OSError):
+                listener.close()
+            self._remove_known_artifacts(base)
+            return 2
+
+        self._root_pid = pid
+        self._master_fd = master
+        with contextlib.suppress(OSError, ValueError):
+            os.set_blocking(master, False)
+        _apply_winsize(master, int(self.config.cols), int(self.config.rows))
         self._listener = listener
         self._write_metadata("running")
 
@@ -431,10 +434,10 @@ class SessionHost:
                 return
             self._child_exited.set()
             self._shutdown.set()
+            budget = max(1, int(self.config.replay_bytes))
             with self._stream_lock:
                 for watch in list(self._stream_clients):
-                    with _suppress():
-                        watch.put_nowait(None)
+                    self._enqueue_stream_end_locked(watch, budget)
             try:
                 state = "exited" if self._exit_seen.is_set() else "stopped"
                 self._write_metadata(state)
@@ -571,6 +574,59 @@ class SessionHost:
         self._exit_seen.set()
         self._maybe_finalize()
 
+    @staticmethod
+    def _enqueue_stream_chunk_locked(watch: queue.Queue[bytes | None], chunk: bytes, budget: int) -> None:
+        try:
+            watch.put_nowait(chunk)
+            return
+        except queue.Full:
+            pass
+        merged = bytearray()
+        ended = False
+        while True:
+            try:
+                pending = watch.get_nowait()
+            except queue.Empty:
+                break
+            if pending is None:
+                ended = True
+                break
+            merged += pending
+        merged += chunk
+        if len(merged) > budget:
+            del merged[: len(merged) - budget]
+        if merged:
+            with _suppress():
+                watch.put_nowait(bytes(merged))
+        if ended:
+            # Preserve the end-of-session sentinel behind the backlog.
+            with _suppress():
+                watch.put_nowait(None)
+
+    @staticmethod
+    def _enqueue_stream_end_locked(watch: queue.Queue[bytes | None], budget: int) -> None:
+        try:
+            watch.put_nowait(None)
+            return
+        except queue.Full:
+            pass
+        merged = bytearray()
+        while True:
+            try:
+                pending = watch.get_nowait()
+            except queue.Empty:
+                break
+            if pending is None:
+                break
+            merged += pending
+        if len(merged) > budget:
+            del merged[: len(merged) - budget]
+        if merged:
+            with _suppress():
+                watch.put_nowait(bytes(merged))
+        with _suppress():
+            watch.put_nowait(None)
+
     def _fanout(self, chunk: bytes) -> None:
         """Deliver output to viewers, coalescing instead of dropping laggards.
 
@@ -582,35 +638,10 @@ class SessionHost:
         newest-wins buffer capped at the replay budget, so memory stays bounded
         while the byte stream stays gap-free at the tail.
         """
-        with self._stream_lock:
-            clients = list(self._stream_clients)
         budget = max(1, int(self.config.replay_bytes))
-        for watch in clients:
-            try:
-                watch.put_nowait(chunk)
-                continue
-            except queue.Full:
-                pass
-            merged = bytearray()
-            ended = False
-            while True:
-                try:
-                    pending = watch.get_nowait()
-                except queue.Empty:
-                    break
-                if pending is None:
-                    ended = True
-                    break
-                merged += pending
-            merged += chunk
-            if len(merged) > budget:
-                del merged[: len(merged) - budget]
-            with _suppress():
-                watch.put_nowait(bytes(merged))
-            if ended:
-                # Preserve the end-of-session sentinel behind the backlog.
-                with _suppress():
-                    watch.put_nowait(None)
+        with self._stream_lock:
+            for watch in list(self._stream_clients):
+                self._enqueue_stream_chunk_locked(watch, chunk, budget)
 
     # -- control plane -------------------------------------------------
     def _accept_loop(self, listener: socket.socket) -> None:
@@ -635,44 +666,55 @@ class SessionHost:
                 self._workers.append(worker)
 
     def _handle_connection(self, conn: socket.socket) -> None:
+        handed_off = False
         try:
             conn.settimeout(30.0)
             try:
                 request = receive_message(conn)
             except SessionProtocolError:
-                with _suppress():
-                    conn.close()
                 return
             if not isinstance(request, dict):
+                handed_off = True
                 self._send_error(conn, "E_SESSION_PROTOCOL_INVALID: Managed session control message is invalid.")
                 return
             if request.get("version") != PROTOCOL_VERSION:
+                handed_off = True
                 self._send_error(conn, "E_SESSION_PROTOCOL_INVALID: Managed session control message is invalid.")
                 return
             token = request.get("token")
             if not isinstance(token, str) or not secrets.compare_digest(token, self.token):
+                handed_off = True
                 self._send_error(conn, "E_SESSION_AUTH_FAILED: Managed session control authentication failed.")
                 return
             op = request.get("op")
             if op == "status":
+                handed_off = True
                 self._handle_status(conn)
             elif op == "snapshot":
+                handed_off = True
                 self._handle_snapshot(conn, request)
             elif op == "send":
+                handed_off = True
                 self._handle_send(conn, request)
             elif op == "send_start":
+                handed_off = True
                 self._handle_send_transfer(conn, request)
             elif op == "resize":
+                handed_off = True
                 self._handle_resize(conn, request)
             elif op == "stream":
+                handed_off = True
                 self._handle_stream(conn)
             elif op == "terminate":
+                handed_off = True
                 self._handle_terminate(conn)
             else:
+                handed_off = True
                 self._send_error(conn, "E_SESSION_PROTOCOL_INVALID: Managed session control message is invalid.")
         finally:
-            # Stream handler closes its own connection.
-            pass
+            if not handed_off:
+                with _suppress():
+                    conn.close()
 
     def _send_error(self, conn: socket.socket, message: str) -> None:
         with _suppress():
@@ -894,6 +936,8 @@ class SessionHost:
                     except OSError:
                         break
                     if self._child_exited.is_set():
+                        with contextlib.suppress(OSError, SessionProtocolError, ValueError):
+                            send_message(conn, {"event": "exit", "exit_code": self._exit_code})
                         break
                     continue
                 if item is None:

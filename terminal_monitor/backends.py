@@ -35,8 +35,13 @@ class TerminalIdentity:
             score += 5
         if self.title and self.title.lower() in str(candidate.get("title", "")).lower():
             score += 3
-        if self.root_pid is not None and int(candidate.get("root_pid", -1)) == self.root_pid:
-            score += 10
+        raw_pid = candidate.get("root_pid")
+        if self.root_pid is not None and raw_pid is not None:
+            try:
+                if int(raw_pid) == self.root_pid:
+                    score += 10
+            except (TypeError, ValueError):
+                pass
         return score
 def validate_process_name(process: str) -> str:
     """Ensure process name contains only safe alphanumeric/dash/underscore characters."""
@@ -443,14 +448,16 @@ class TmuxBackend(BaseTerminalBackend):
         if not shutil.which("tmux"):
             return None
         title = validate_title_filter(title)
-        code, out, _ = run_command(["tmux", "list-panes", "-a", "-F", "#{session_name}:#{window_index}.#{pane_index} #{pane_current_command} #{pane_title}"])
+        code, out, _ = run_command(
+            ["tmux", "list-panes", "-a", "-F", "#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_title}"]
+        )
         if code != 0 or not out:
             return None
         for line in out.splitlines():
-            parts = line.strip().split(maxsplit=2)
-            if not parts:
+            parts = line.split("\t", 2) if "\t" in line else line.strip().split(maxsplit=2)
+            if not parts or not parts[0]:
                 continue
-            target = parts[0]
+            target = parts[0].strip()
             cmd = parts[1] if len(parts) > 1 else ""
             pane_title = parts[2] if len(parts) > 2 else ""
             if (process.lower() in cmd.lower() or process.lower() in pane_title.lower()) and (
@@ -482,7 +489,11 @@ class TmuxBackend(BaseTerminalBackend):
         if not target:
             return False, "matching tmux pane not found"
         clean = re.sub(r"\s+", " ", payload).strip()
-        code, out, err = run_command(["tmux", "send-keys", "-t", target, clean, "Enter"])
+        if clean:
+            code, out, err = run_command(["tmux", "send-keys", "-t", target, "-l", "--", clean])
+            if code != 0:
+                return False, err or out
+        code, out, err = run_command(["tmux", "send-keys", "-t", target, "Enter"])
         return code == 0, "SENT" if code == 0 else err or out
 
     def send_key(self, process: str, title: str | None, key: str) -> tuple[bool, str]:
@@ -517,7 +528,7 @@ class TmuxBackend(BaseTerminalBackend):
         return code == 0, "SENT" if code == 0 else err or out
 
 
-def get_backend(backend_name: str = "auto") -> BaseTerminalBackend:
+def get_backend(backend_name: str = "auto", *, state_dir: str | None = None) -> BaseTerminalBackend:
     """Resolve terminal backend instance by name or environment."""
     choice = backend_name.lower().strip()
     if choice == "auto":
@@ -538,7 +549,7 @@ def get_backend(backend_name: str = "auto") -> BaseTerminalBackend:
     if choice in ("pty", "managed", "managed-pty"):
         from .managed_pty import ManagedPTYBackend
 
-        return ManagedPTYBackend()
+        return ManagedPTYBackend(state_dir=state_dir)
 
     raise ValueError(f"Unknown terminal backend: {backend_name}. Available: auto, terminal, iterm2, tmux, pty")
 
