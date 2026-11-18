@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import re
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
@@ -34,27 +35,31 @@ def json_safe(value: Any) -> Any:
 
 
 def _atomic_json_write(path: str | Path, data: dict[str, Any]) -> None:
-    target = Path(path).resolve()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(json_safe(data), indent=2, sort_keys=True), encoding="utf-8")
-    with contextlib.suppress(OSError):
-        os.chmod(temporary, 0o600)
-    os.replace(temporary, target)
-    with contextlib.suppress(OSError):
-        os.chmod(target, 0o600)
+    _atomic_text_write(path, json.dumps(json_safe(data), indent=2, sort_keys=True))
 
 
 def _atomic_text_write(path: str | Path, text: str) -> None:
     target = Path(path).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-    temporary.write_text(text, encoding="utf-8")
-    with contextlib.suppress(OSError):
-        os.chmod(temporary, 0o600)
-    os.replace(temporary, target)
-    with contextlib.suppress(OSError):
-        os.chmod(target, 0o600)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
+    try:
+        try:
+            handle = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            raise
+        with handle:
+            handle.write(text)
+        with contextlib.suppress(OSError):
+            os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, target)
+        with contextlib.suppress(OSError):
+            os.chmod(target, 0o600)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
 
 @dataclass(frozen=True)
 class TaskState:
@@ -290,7 +295,7 @@ def enable_debug_log(path: str | None) -> None:
 
 
 def _default_debug_log_path() -> str:
-    root = os.environ.get("TERMINAL_MONITOR_STATE_DIR") or "/tmp/terminal-monitor"
+    root = os.environ.get("TERMINAL_MONITOR_STATE_DIR") or str(Path.home() / ".cache" / "terminal-monitor")
     return os.path.join(root, "debug.log")
 
 

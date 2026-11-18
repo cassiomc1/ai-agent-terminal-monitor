@@ -146,23 +146,29 @@ def load_config_file(path: str | Path) -> dict[str, Any]:
     text = file_path.read_text(encoding="utf-8")
     ext = file_path.suffix.lower()
 
+    parsed: Any
     if ext == ".json":
-        return json.loads(text)
-    if ext == ".toml":
+        parsed = json.loads(text)
+    elif ext == ".toml":
         if tomllib is None:
             raise RuntimeError("TOML support requires Python 3.11+ or the 'tomli' package.")
-        return tomllib.loads(text)
+        parsed = tomllib.loads(text)
+    else:
+        # Try JSON first, then TOML
+        try:
+            parsed = json.loads(text)
+        except Exception as json_err:
+            if tomllib is not None:
+                try:
+                    parsed = tomllib.loads(text)
+                except Exception as toml_err:
+                    raise ValueError(f"Could not parse configuration file as JSON or TOML: {file_path}") from toml_err
+            else:
+                raise ValueError(f"Could not parse configuration file as JSON or TOML: {file_path}") from json_err
 
-    # Try JSON first, then TOML
-    try:
-        return json.loads(text)
-    except Exception as json_err:
-        if tomllib is not None:
-            try:
-                return tomllib.loads(text)
-            except Exception:
-                pass
-        raise ValueError(f"Could not parse configuration file as JSON or TOML: {file_path}") from json_err
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Configuration root must be a JSON/TOML object: {file_path}")
+    return parsed
 
 
 def generate_starter_config(format_type: str = "json") -> str:

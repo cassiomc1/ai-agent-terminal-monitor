@@ -346,9 +346,14 @@ class ManagedSessionClient:
         deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
         last_error: Exception | None = None
         while time.monotonic() < deadline:
+            exited = proc.poll()
             try:
                 client = cls.connect(state_dir)
             except (OSError, ValueError, SessionProtocolError) as exc:
+                if exited is not None:
+                    _reap_host_proc(state_dir, timeout=0)
+                    last_error = RuntimeError(f"E_SESSION_STALE: Managed SessionHost exited during startup (code {exited}): {exc}")
+                    break
                 last_error = exc
                 time.sleep(0.1)
                 continue
@@ -700,7 +705,11 @@ class ManagedPTYBackend(BaseTerminalBackend):
             "win": session,
             "tab": session,
             "title": session,
-            "busy": bool(status.alive),
+            # ``status.alive`` only confirms the managed agent process exists
+            # (already exposed via get_pids()), not active foreground work.
+            # Reporting busy=True while alive would force ProcessActivity.active
+            # and keep classify_state() trapped in "thinking" forever.
+            "busy": False,
             "wname": session,
             "hist": text,
         }

@@ -13,8 +13,9 @@ from typing import Any
 
 from .backends import validate_web_port
 from .config import DEFAULT_STATE_DIR
+from .gitinfo import ensure_private_dir
 from .safety import SPECIAL_KEY_CODES
-from .state import debug_swallow
+from .state import _atomic_text_write, debug_swallow
 from .status import _public_event_line, _public_status
 
 WEB_POST_BODY_LIMIT_BYTES = 64 * 1024
@@ -51,6 +52,22 @@ def _is_supported_web_key(key: str) -> bool:
     if len(clean) == 1 and clean.isprintable():
         return True
     return clean.lower() in WEB_KEY_ALLOWLIST
+
+
+def _safe_instance_url(value: Any) -> str:
+    """Allow only loopback HTTP(S) URLs for instance-picker navigation."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return ""
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return ""
+    if (parsed.hostname or "").lower() not in {"127.0.0.1", "localhost", "::1"}:
+        return ""
+    return raw
 # SSE loop tuning: bounded lifetime with an explicit reconnect hint so the
 # dashboard never dies silently; log tails are only re-read on file change.
 SSE_MAX_ITERATIONS = 3600
@@ -208,18 +225,21 @@ document.getElementById('instance-picker')?.addEventListener('change',e=>switchI
 function ansiToHtml(text){
   if(!text)return'';
   const c={'30':'#555','31':'#ff5c5c','32':'#00c758','33':'#edb200','34':'#4daafc','35':'#d180ff','36':'#00e5ff','37':'#e6e1d6','90':'#777','91':'#ff8a80','92':'#69f0ae','93':'#ffe57f','94':'#82b1ff','95':'#ea80fc','96':'#84ffff','97':'#ffffff'};
-  let t=esc(text);
-  return t.replace(/\\x1b\\[([0-9;]+)m/g,(m,p)=>{
-    const s=p.split(';');let st='';
-    for(let code of s){
-      if(code==='0')return'</span>';
+  let openSpans=0;
+  const out=esc(text).replace(/\\x1b\\[([0-9;]*)m/g,(m,p)=>{
+    const codes=p?p.split(';'):['0'];
+    let res='',st='';
+    for(const code of codes){
+      if(code===''||code==='0'){if(openSpans>0){res+='</span>'.repeat(openSpans);openSpans=0;}st='';continue;}
       if(code==='1')st+='font-weight:700;';
-      if(code==='2')st+='opacity:0.7;';
-      if(code==='4')st+='text-decoration:underline;';
-      if(c[code])st+='color:'+c[code]+';';
+      else if(code==='2')st+='opacity:0.7;';
+      else if(code==='4')st+='text-decoration:underline;';
+      else if(c[code])st+='color:'+c[code]+';';
     }
-    return st?'<span style="'+st+'">':'';
+    if(st){openSpans++;res+='<span style="'+st+'">';}
+    return res;
   });
+  return openSpans>0?out+'</span>'.repeat(openSpans):out;
 }
 function renderTaskList(){
   const search=(document.getElementById('task-search')?.value||'').toLowerCase();
@@ -241,8 +261,13 @@ function renderTaskList(){
     return '<div class="task-card"><div class="task-idx">'+num+'</div><div class="task-badge '+badgeText+'">'+badgeText+'</div><div class="task-label">'+esc(t.label)+'</div>'+dur+'</div>';
   }).join('');
 }
+function normalizePipelineStage(st){
+  if(st==='CI_PENDING'||st==='CI_GREEN'||st==='CI_RETRY_REQUIRED'||st==='FIX_REQUIRED')return'CI_CHECKS';
+  if(st==='POST_MERGE_VERIFY')return'MERGED';
+  return st;
+}
 function updatePipeline(curStage){
-  const idx=stages.indexOf(curStage);
+  const idx=stages.indexOf(normalizePipelineStage(curStage));
   stages.forEach((st,i)=>{
     const el=document.querySelector('[data-step="'+st+'"]');
     if(!el)return;
@@ -326,13 +351,16 @@ async function refreshInstances(){
   }catch(e){}
 }
 function switchInstance(url){if(url&&url!==window.location.href){window.location.href=url}}
+let pollTimer=null;
+function startPolling(){if(!pollTimer)pollTimer=setInterval(pollFallback,1000)}
+function stopPolling(){if(pollTimer){clearInterval(pollTimer);pollTimer=null}}
 function setupStream(){
   if(window.EventSource){
     const ev=new EventSource('/api/stream?token='+encodeURIComponent(TOKEN));
-    ev.onmessage=m=>{try{const d=JSON.parse(m.data);applySnapshot(d.status||{},d.events||{},d.terminal||{})}catch(e){}};
+    ev.onmessage=m=>{try{const d=JSON.parse(m.data);stopPolling();applySnapshot(d.status||{},d.events||{},d.terminal||{})}catch(e){}};
     ev.addEventListener('reset',()=>{ev.close();setTimeout(setupStream,250)});
-    ev.onerror=()=>{connection.textContent='POLLING ●';connection.classList.remove('reconnecting');setInterval(pollFallback,1000)};
-  }else{setInterval(pollFallback,1000)}
+    ev.onerror=()=>{connection.textContent='POLLING ●';connection.classList.remove('reconnecting');startPolling()};
+  }else{startPolling()}
 }
 setupStream();pollFallback();refreshInstances();
 </script></body></html>"""
@@ -513,7 +541,23 @@ class MonitorWebServer:
         class Handler(BaseHTTPRequestHandler):
             def _host_allowed(self) -> bool:
                 """Only loopback Host headers are accepted (DNS-rebinding defense)."""
-                host = (self.headers.get("Host") or "").split(":")[0].strip("[]").lower()
+                raw = (self.headers.get("Host") or "").strip().lower()
+                if raw.startswith("["):
+                    end = raw.find("]")
+                    if end < 0:
+                        return False
+                    host = raw[1:end]
+                    rest = raw[end + 1 :]
+                    if rest and not (rest.startswith(":") and rest[1:].isdigit()):
+                        return False
+                elif raw == "::1":
+                    host = raw
+                elif ":" in raw:
+                    host, port_part = raw.rsplit(":", 1)
+                    if not port_part.isdigit():
+                        return False
+                else:
+                    host = raw
                 return host in ("127.0.0.1", "localhost", "::1")
 
             def _token_ok(self) -> bool:
@@ -538,11 +582,12 @@ class MonitorWebServer:
             def do_GET(self) -> None:
                 if not self._guard(require_token=False):
                     return
-                if self.path == "/":
+                route = urllib.parse.urlsplit(self.path).path
+                if route == "/":
                     self._reply(200, "text/html; charset=utf-8", owner._dashboard_html())
-                elif self.path == "/app.css":
+                elif route == "/app.css":
                     self._reply(200, "text/css; charset=utf-8", DASHBOARD_CSS.encode())
-                elif self.path == "/api/status":
+                elif route == "/api/status":
                     if not self._token_ok():
                         self._reply(403, "application/json", b'{"ok":false,"error":"missing or invalid monitor token"}')
                         return
@@ -554,7 +599,7 @@ class MonitorWebServer:
                     except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError):
                         payload = b'{"state":"starting","pids":[]}'
                     self._reply(200, "application/json", payload)
-                elif self.path == "/api/events":
+                elif route == "/api/events":
                     if not self._token_ok():
                         self._reply(403, "application/json", b'{"ok":false,"error":"missing or invalid monitor token"}')
                         return
@@ -563,7 +608,7 @@ class MonitorWebServer:
                     except (OSError, UnicodeError):
                         lines = []
                     self._reply(200, "application/json", json.dumps({"lines": lines}).encode())
-                elif self.path == "/api/terminal":
+                elif route == "/api/terminal":
                     if not self._token_ok():
                         self._reply(403, "application/json", b'{"ok":false,"error":"missing or invalid monitor token"}')
                         return
@@ -572,7 +617,7 @@ class MonitorWebServer:
                     except (OSError, UnicodeError):
                         snapshot = ""
                     self._reply(200, "application/json", json.dumps({"snapshot": snapshot}).encode())
-                elif self.path == "/api/instances":
+                elif route == "/api/instances":
                     if not self._token_ok():
                         self._reply(403, "application/json", b'{"ok":false,"error":"missing or invalid monitor token"}')
                         return
@@ -590,12 +635,12 @@ class MonitorWebServer:
                                         "state": st.get("state", "unknown"),
                                         "running": st.get("running", False),
                                         "tasks": f"{st.get('todo', {}).get('completed', 0)}/{st.get('todo', {}).get('total', 0)}",
-                                        "web_url": st.get("web_url", ""),
+                                        "web_url": _safe_instance_url(st.get("web_url", "")),
                                     })
                                 except Exception as exc:
                                     debug_swallow("web_api_instances", exc)
                     self._reply(200, "application/json", json.dumps({"instances": instances}).encode())
-                elif self.path.startswith("/api/stream"):
+                elif route == "/api/stream":
                     if not self._token_ok():
                         self._reply(403, "application/json", b'{"ok":false,"error":"missing or invalid monitor token"}')
                         return
@@ -608,27 +653,37 @@ class MonitorWebServer:
                     last_hash = ""
                     log_signature: tuple[int, int] | None = None
                     events_lines: list[str] = []
+                    snap_signature: tuple[int, int] | None = None
+                    term_snap = ""
                     try:
                         iterations = 0
                         while not owner._shutdown_event.is_set() and iterations < SSE_MAX_ITERATIONS:
                             iterations += 1
                             try:
                                 status_raw = Path(owner.status_path).read_text(encoding="utf-8") if owner.status_path and os.path.exists(owner.status_path) else "{}"
-                                # Only re-read the log when it actually changed.
+                                # Only re-read the log or snapshot when it actually changed.
                                 if owner.log_path and os.path.exists(owner.log_path):
                                     stat = os.stat(owner.log_path)
                                     signature = (stat.st_mtime_ns, stat.st_size)
                                     if signature != log_signature:
                                         log_signature = signature
                                         events_lines = [_public_event_line(entry) for entry in Path(owner.log_path).read_text(encoding="utf-8").splitlines()[-LOG_TAIL_LINES:]]
-                                curr_hash = hashlib.sha256((status_raw + "\n" + "\n".join(events_lines)).encode("utf-8", "replace")).hexdigest()[:16]
+                                if owner.snapshot_path and os.path.exists(owner.snapshot_path):
+                                    snap_stat = os.stat(owner.snapshot_path)
+                                    sig = (snap_stat.st_mtime_ns, snap_stat.st_size)
+                                    if sig != snap_signature:
+                                        snap_signature = sig
+                                        term_snap = Path(owner.snapshot_path).read_text(encoding="utf-8")
+                                else:
+                                    snap_signature = None
+                                    term_snap = ""
+                                curr_hash = hashlib.sha256((status_raw + "\n" + "\n".join(events_lines) + "\n" + term_snap).encode("utf-8", "replace")).hexdigest()[:16]
                                 if curr_hash != last_hash:
                                     last_hash = curr_hash
                                     try:
                                         status_obj = json.loads(status_raw) if status_raw.strip() else {}
                                     except json.JSONDecodeError:
                                         status_obj = {}
-                                    term_snap = Path(owner.snapshot_path).read_text(encoding="utf-8") if owner.snapshot_path and os.path.exists(owner.snapshot_path) else ""
                                     combined = {
                                         "status": _public_status(status_obj),
                                         "events": {"lines": events_lines},
@@ -659,9 +714,18 @@ class MonitorWebServer:
             def do_POST(self) -> None:
                 if not self._guard(require_token=True):
                     return
-                if self.path in ("/api/send", "/api/answer"):
+                route = urllib.parse.urlsplit(self.path).path
+                if route in ("/api/send", "/api/answer"):
                     try:
-                        length = int(self.headers.get("Content-Length", 0))
+                        raw_length = self.headers.get("Content-Length", "0")
+                        try:
+                            length = int(raw_length)
+                        except ValueError:
+                            self._reply(400, "application/json", b'{"ok":false,"error":"invalid Content-Length"}')
+                            return
+                        if length < 0:
+                            self._reply(400, "application/json", b'{"ok":false,"error":"invalid Content-Length"}')
+                            return
                         if length > WEB_POST_BODY_LIMIT_BYTES:
                             self._reply(413, "application/json", b'{"ok":false,"error":"payload too large"}')
                             return
@@ -678,21 +742,22 @@ class MonitorWebServer:
                         payload = str(data.get("payload", "")).strip()
                         key = str(data.get("key", "")).strip()
                         target_path = owner.answer_path or str(Path(DEFAULT_STATE_DIR, "answer.txt"))
-                        Path(target_path).parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+                        ensure_private_dir(Path(target_path).parent)
                         if action == "key" and key:
                             if not _is_supported_web_key(key):
                                 self._reply(400, "application/json", json.dumps({"ok": False, "error": f"unsupported key: {key!r}"}).encode())
                                 return
-                            Path(target_path).write_text(f"KEY:{key.strip()}\n", encoding="utf-8")
+                            _atomic_text_write(target_path, f"KEY:{key.strip()}\n")
                             self._reply(200, "application/json", b'{"ok":true,"dispatched":"key"}')
                             return
                         if payload:
-                            Path(target_path).write_text(payload + "\n", encoding="utf-8")
+                            _atomic_text_write(target_path, payload + "\n")
                             self._reply(200, "application/json", b'{"ok":true,"dispatched":"payload"}')
                             return
                         self._reply(400, "application/json", b'{"ok":false,"error":"missing payload or key"}')
                     except Exception as exc:
-                        self._reply(500, "application/json", json.dumps({"ok": False, "error": str(exc)}).encode())
+                        debug_swallow("web_api_send", exc)
+                        self._reply(500, "application/json", b'{"ok":false,"error":"internal server error"}')
                 else:
                     self._reply(404, "application/json", b'{"error":"not found"}')
 

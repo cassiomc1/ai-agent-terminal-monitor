@@ -229,6 +229,44 @@ class SessionHostUnitTests(unittest.TestCase):
                 client_sock.close()
                 worker.join(5.0)
 
+    def test_finalize_delivers_exit_sentinel_on_full_viewer_queue(self):
+        import queue
+
+        from terminal_monitor.session_host import STREAM_QUEUE_MAX_ITEMS
+
+        with tempfile.TemporaryDirectory() as tmp:
+            host = SessionHost(SessionHostConfig(session_id="s", command=("true",), cwd=tmp, state_dir=tmp, replay_bytes=1024))
+            viewer_q: queue.Queue[bytes | None] = queue.Queue(maxsize=STREAM_QUEUE_MAX_ITEMS)
+            for index in range(STREAM_QUEUE_MAX_ITEMS):
+                viewer_q.put_nowait(f"m{index}:".encode())
+            self.assertTrue(viewer_q.full())
+            host._stream_clients.append(viewer_q)
+            host._exit_code = 0
+            host._exit_seen.set()
+            host._finalize()
+            items = []
+            while not viewer_q.empty():
+                items.append(viewer_q.get_nowait())
+            self.assertEqual(items[-1], None)
+            coalesced = b"".join(item for item in items if item is not None)
+            self.assertIn(b"m0:", coalesced)
+            self.assertIn(f"m{STREAM_QUEUE_MAX_ITEMS - 1}:".encode(), coalesced)
+
+    @unittest.skipIf(os.name != "posix", "managed PTY requires POSIX")
+    def test_run_does_not_fork_child_when_socket_bind_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = SessionHost(SessionHostConfig(session_id="s", command=("true",), cwd=tmp, state_dir=tmp))
+            fake_sock = mock.Mock()
+            fake_sock.bind.side_effect = OSError("bind failed")
+            with (
+                mock.patch.object(host_module.socket, "socket", return_value=fake_sock),
+                mock.patch.object(host, "_fork_child") as fork_mock,
+            ):
+                rc = host.run()
+            self.assertEqual(rc, 2)
+            fork_mock.assert_not_called()
+            self.assertFalse(pathlib.Path(tmp, "session-token").exists())
+
 
 @unittest.skipIf(os.name != "posix", "managed PTY requires POSIX")
 class InProcessHostRunTests(unittest.TestCase):

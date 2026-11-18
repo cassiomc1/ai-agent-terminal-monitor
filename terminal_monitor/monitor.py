@@ -57,7 +57,7 @@ from .processes import (
     pid_is_alive,
     process_is_running,
 )
-from .profiles import AgentProfile, get_profile
+from .profiles import AgentProfile, _clone_profile, get_profile
 from .safety import UNSAFE_PHRASES, PolicyEnvelope, redact_sensitive
 from .state import (
     AttemptLedger,
@@ -176,8 +176,8 @@ class TerminalMonitor:
         profile: AgentProfile | None = None,
     ) -> None:
         self.config = config
-        self.backend = backend or get_backend(config.backend)
-        self.profile = profile or get_profile(config.profile or config.process, config.custom_profiles)
+        self.backend = backend or get_backend(config.backend, state_dir=config.state_dir)
+        self.profile = _clone_profile(profile) if profile is not None else get_profile(config.profile or config.process, config.custom_profiles)
 
         # Merge profile process if config process was default
         if config.process in ("opencode", "agent", "") and self.profile.process != "generic":
@@ -651,6 +651,10 @@ class TerminalMonitor:
 
     def _recover_agent_loop(self, root_pids: list[int], activity: ProcessActivity, observed_state: str) -> tuple[bool, str]:
         """Stop only expensive descendant trees and guide the existing agent session."""
+        if self.config.dry_run:
+            self.log("DRY_RUN kind=loop_recovery skipped_interrupt")
+            self._record_policy_decision("loop_recovery", "ignored", "dry_run")
+            return False, "dry_run"
         targets = tuple(pid for pid in activity.expensive_roots if pid not in set(root_pids))
         if not targets:
             return False, "no_verified_expensive_child"
@@ -694,6 +698,9 @@ class TerminalMonitor:
         self.last_safe_snapshot = snapshot
         with contextlib.suppress(OSError):
             _atomic_text_write(self.terminal_snapshot_path, snapshot)
+
+    def _write_attention(self, content: str) -> None:
+        _atomic_text_write(self.attention_path, content)
 
     def _effective_threshold(self, state: str) -> float:
         """Idle seconds to wait before acting; actionable prompts act faster."""
@@ -909,9 +916,9 @@ class TerminalMonitor:
             return 0, "CANCELLED"
         return None
 
-    def _check_process_gone(self) -> tuple[int, str] | None:
-        pids = self.backend.get_pids(self.config.process)
-        if pids:
+    def _check_process_gone(self, pids: list[int] | None = None) -> tuple[int, str] | None:
+        resolved = self.backend.get_pids(self.config.process) if pids is None else pids
+        if resolved:
             self.last_seen = time.monotonic()
             return None
         if time.monotonic() - self.last_seen >= self.config.gone_seconds:
@@ -929,7 +936,7 @@ class TerminalMonitor:
         if not self.config.supervise:
             return None, "WAITING_QUEUED_ATTEMPT"
         self._record_policy_decision(str(queued_attempt.get("attempt_id", "")), "attention", "queued_attempt_stale")
-        Path(self.attention_path).write_text(json.dumps(queued_attempt, indent=2) + "\n" + ctx.safe_snapshot + "\n", encoding="utf-8")
+        self._write_attention(json.dumps(queued_attempt, indent=2) + "\n" + ctx.safe_snapshot + "\n")
         self.log(f"PAUSE kind=queued_attempt_stale age={queued_attempt['age_seconds']}")
         self.export_status_json(ctx.pids, "queued_attempt_stale", {"queued_attempt": queued_attempt})
         self._notify("AI Terminal Monitor: Attention Required", "Queued attempt is stale", "attention_required", {"reason": "queued_attempt_stale"})
@@ -991,7 +998,7 @@ class TerminalMonitor:
                 f"EVENT state={ctx.state} mode={ctx.mode or 'unknown'} roots={len(ctx.pids)} children={len(ctx.activity.descendants)} "
                 f"task={self.todo_progress.get('completed', 0)}/{self.todo_progress.get('total', 0)} git={ctx.git_status.head[:8] or 'none'}"
             )
-        if ctx.git_status.branch not in self.config.protected_branches:
+        if ctx.git_status.is_repo and ctx.git_status.branch and ctx.git_status.branch not in self.config.protected_branches:
             self._protected_branch_nudged = False
             if self.task_state.expected_branch in self.config.protected_branches or not self.task_state.expected_branch:
                 self.task_state = replace(self.task_state, expected_branch=ctx.git_status.branch, branch=ctx.git_status.branch)
@@ -1015,14 +1022,24 @@ class TerminalMonitor:
             and not self._protected_branch_nudged
             and not (self.config.expected_branch and self.config.expected_branch != ctx.git_status.branch)
         ):
-            self._protected_branch_nudged = True
-            self._protected_branch_nudge_time = time.monotonic()
             nudge_msg = (
                 f"Direct changes detected on protected branch '{ctx.git_status.branch}'. "
                 f"Please create and switch to a dedicated feature branch (e.g. 'git checkout -b <feature-name>') "
                 f"and commit your changes before proceeding."
             )
-            self._dispatch("branch_safety", nudge_msg, ctx.state)
+            if self.policy.objective or self.policy.prohibitions:
+                try:
+                    nudge_msg = self.policy.compose(nudge_msg, self.task_state.last_known_stage)
+                except ValueError as exc:
+                    self._record_policy_decision(nudge_msg, "blocked", str(exc))
+                    self._write_attention(ctx.safe_snapshot + "\n")
+                    self.log(f"PAUSE kind=policy_conflict reason={exc}")
+                    return 3, f"ATTENTION_REQUIRED kind=policy_conflict file={self.attention_path}"
+            _ok, _attempt_id, detail = self._dispatch("branch_safety", nudge_msg, ctx.state)
+            if detail == "dry_run":
+                return 0, "DRY_RUN kind=branch_safety"
+            self._protected_branch_nudged = True
+            self._protected_branch_nudge_time = time.monotonic()
             self.log(f"NUDGE kind=protected_branch_dirty branch={ctx.git_status.branch}")
             return None, "NUDGE_SENT kind=protected_branch_dirty"
         if (
@@ -1037,8 +1054,7 @@ class TerminalMonitor:
             "attention",
             reason,
         )
-        with open(self.attention_path, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps(repository_safety, indent=2) + "\n" + ctx.safe_snapshot + "\n")
+        self._write_attention(json.dumps(repository_safety, indent=2) + "\n" + ctx.safe_snapshot + "\n")
         self.log(f"PAUSE kind=repository_safety reason={reason}")
         self.export_status_json(ctx.pids, "branch_safety", {"repository_safety": repository_safety})
         self._notify("AI Terminal Monitor: Attention Required", f"Repository safety violation: {reason}", "attention_required", {"reason": reason})
@@ -1066,6 +1082,10 @@ class TerminalMonitor:
         if not (self.config.supervise and self.config.loop_guard and self.loop_assessment.detected):
             return None
         reason = self.loop_assessment.reason
+        if self.config.dry_run:
+            self.log(f"DRY_RUN kind=agent_loop reason={reason}")
+            self._record_policy_decision("agent_process_activity", "ignored", f"dry_run:{reason}")
+            return 0, f"DRY_RUN kind=agent_loop reason={reason}"
         attention = {
             "kind": "agent_loop",
             "reason": reason,
@@ -1078,11 +1098,11 @@ class TerminalMonitor:
             recovered, recovery_detail = self._recover_agent_loop(ctx.pids, ctx.activity, ctx.state)
             attention["recovery"] = {"ok": recovered, "detail": recovery_detail, "root_pids_protected": list(ctx.pids)}
             if recovered:
-                Path(self.attention_path).write_text(json.dumps(attention, indent=2) + "\n", encoding="utf-8")
+                self._write_attention(json.dumps(attention, indent=2) + "\n")
                 self.log(f"RECOVER kind=agent_loop reason={reason} {recovery_detail}")
                 self.export_status_json(ctx.pids, "loop_recovered", {"loop_guard": attention})
                 return None, f"LOOP_RECOVERED reason={reason} {recovery_detail}"
-        Path(self.attention_path).write_text(json.dumps(attention, indent=2) + "\n" + ctx.safe_snapshot + "\n", encoding="utf-8")
+        self._write_attention(json.dumps(attention, indent=2) + "\n" + ctx.safe_snapshot + "\n")
         self.log(f"PAUSE kind=agent_loop reason={reason}")
         self.export_status_json(ctx.pids, "agent_loop", {"loop_guard": attention})
         self._notify("AI Terminal Monitor: Loop Detected", f"Monitored agent loop: {reason}", "attention_required", {"reason": reason})
@@ -1094,7 +1114,7 @@ class TerminalMonitor:
                 "active": ctx.activity.active,
                 "descendants": list(ctx.activity.descendants),
                 "direct_descendants": list(ctx.activity.direct_descendants),
-                "commands": list(ctx.activity.commands),
+                "commands": [redact_sensitive(cmd) for cmd in ctx.activity.commands],
                 "cpu_percent": ctx.activity.cpu_percent,
                 "oldest_seconds": ctx.activity.oldest_seconds,
                 "git_changed": ctx.activity.git_changed,
@@ -1135,8 +1155,7 @@ class TerminalMonitor:
         if key_name is not None:
             if not _is_supported_manual_key(key_name):
                 self._record_policy_decision(manual_answer, "blocked", f"unsupported key: {key_name!r}")
-                with open(self.attention_path, "w", encoding="utf-8") as handle:
-                    handle.write(ctx.safe_snapshot + "\n")
+                self._write_attention(ctx.safe_snapshot + "\n")
                 self.log(f"PAUSE kind=policy_conflict reason=unsupported_key key={key_name!r}")
                 return 3, f"ATTENTION_REQUIRED kind=policy_conflict file={self.attention_path}"
             ok, attempt_id, detail = self._dispatch("manual_key", key_name, ctx.state, use_key=True)
@@ -1144,13 +1163,14 @@ class TerminalMonitor:
                 return 0, f"DRY_RUN kind=manual_key key={key_name}"
             self.export_status_json(ctx.pids, ctx.state, {"last_attempt_id": attempt_id})
             self.last_action = f"send:manual_key:{'accepted' if ok else 'failed'}"
-            self.session_tracker.mark_interaction(ctx.history)
-            self.task_state = replace(
-                self.task_state,
-                session_generation=self.session_tracker.generation,
-                interaction_marker=self.session_tracker.interaction_history,
-            )
-            self.task_state.save(self.task_state_path)
+            if ok:
+                self.session_tracker.mark_interaction(ctx.history)
+                self.task_state = replace(
+                    self.task_state,
+                    session_generation=self.session_tracker.generation,
+                    interaction_marker=self.session_tracker.interaction_history,
+                )
+                self.task_state.save(self.task_state_path)
             if self.on_send:
                 self.on_send("manual_key", key_name, ok)
             return (None, f"SENT kind=manual_key n={self.sends}") if ok else (1, f"SEND_FAILED kind=manual_key n={self.sends}")
@@ -1161,8 +1181,7 @@ class TerminalMonitor:
         )
         if not allowed:
             self._record_policy_decision(manual_answer, "blocked", policy_reason)
-            with open(self.attention_path, "w", encoding="utf-8") as handle:
-                handle.write(ctx.safe_snapshot + "\n")
+            self._write_attention(ctx.safe_snapshot + "\n")
             self.log(f"PAUSE kind=policy_conflict reason={policy_reason}")
             return 3, f"ATTENTION_REQUIRED kind=policy_conflict file={self.attention_path}"
         ok, attempt_id, detail = self._dispatch("manual", manual_answer, ctx.state)
@@ -1170,13 +1189,14 @@ class TerminalMonitor:
             return 0, f"DRY_RUN kind=manual payload={manual_answer}"
         self.export_status_json(ctx.pids, ctx.state, {"last_attempt_id": attempt_id})
         self.last_action = f"send:manual:{'accepted' if ok else 'failed'}"
-        self.session_tracker.mark_interaction(ctx.history)
-        self.task_state = replace(
-            self.task_state,
-            session_generation=self.session_tracker.generation,
-            interaction_marker=self.session_tracker.interaction_history,
-        )
-        self.task_state.save(self.task_state_path)
+        if ok:
+            self.session_tracker.mark_interaction(ctx.history)
+            self.task_state = replace(
+                self.task_state,
+                session_generation=self.session_tracker.generation,
+                interaction_marker=self.session_tracker.interaction_history,
+            )
+            self.task_state.save(self.task_state_path)
         if self.on_send:
             self.on_send("manual", manual_answer, ok)
         return (None, f"SENT kind=manual n={self.sends}") if ok else (1, f"SEND_FAILED kind=manual n={self.sends}")
@@ -1189,7 +1209,8 @@ class TerminalMonitor:
             self.log(f"WAIT completion_text_before_required_stage stage={self.task_state.last_known_stage}")
             return None, f"WAITING_FOR_REQUIRED_OUTCOME stage={self.task_state.last_known_stage}"
         if merge_required:
-            report = evaluate_final_state(collect_final_evidence(self.config.project_dir, self.task_state))
+            evidence = collect_final_evidence(self.config.project_dir, self.task_state)
+            report = evaluate_final_state(evidence)
             if not report.ok:
                 if time.monotonic() - self.last_send < self.config.cooldown_seconds:
                     return None, "WAITING_FINAL_VERIFICATION"
@@ -1200,23 +1221,7 @@ class TerminalMonitor:
                     return 0, "DRY_RUN kind=final_verification"
                 self.last_action = f"send:final_verification:{'accepted' if ok else 'failed'}"
                 return (None, "SENT kind=final_verification") if ok else (1, "SEND_FAILED kind=final_verification")
-            # Verified: persist the real evidence-backed report (never a
-            # synthetic ok=True) before declaring completion.
-            verified_evidence = collect_final_evidence(self.config.project_dir, self.task_state)
-            verified_report = evaluate_final_state(verified_evidence)
-            if not verified_report.ok:
-                # Evidence changed between the gate check and the final
-                # snapshot (or queries flaked): fail closed, do not complete.
-                if time.monotonic() - self.last_send < self.config.cooldown_seconds:
-                    return None, "WAITING_FINAL_VERIFICATION"
-                instruction = "Resolve the remaining final-verification checks: " + ", ".join(verified_report.failures)
-                payload = self.policy.compose(instruction, "POST_MERGE_VERIFY")
-                ok, _attempt_id, detail = self._dispatch("final_verification", payload, ctx.state)
-                if detail == "dry_run":
-                    return 0, "DRY_RUN kind=final_verification"
-                self.last_action = f"send:final_verification:{'accepted' if ok else 'failed'}"
-                return (None, "SENT kind=final_verification") if ok else (1, "SEND_FAILED kind=final_verification")
-            write_final_report(self.report_path, self.task_state, verified_evidence, verified_report)
+            write_final_report(self.report_path, self.task_state, evidence, report)
         self.log("SUCCESS: Completion indicators detected. Work complete.")
         if self.config.supervise and not merge_required:
             # Merge not required (e.g. required_outcome != "merged"): still
@@ -1243,15 +1248,7 @@ class TerminalMonitor:
         mode_threshold = self._effective_threshold("permission")
         if not (self.config.auto_switch_modes and ctx.mode == "plan" and self.profile.is_plan_ready(ctx.history) and ctx.stable_for >= mode_threshold):
             return None
-        self.log("MODE: Plan completed. Auto-switching mode via switch key.")
-        self.last_action = "mode_switch:queued"
-        ok, _attempt_id, detail = self._dispatch("mode_switch", self.profile.mode_switch_key, ctx.state, use_key=True)
-        if detail == "dry_run":
-            self._record_policy_decision("mode_switch", "ignored", "dry_run")
-            return 0, "DRY_RUN kind=mode_switch"
-        self.last_action = "mode_switch:accepted" if ok else "mode_switch:failed"
-        if not ok:
-            return 1, "SEND_FAILED kind=mode_switch"
+        composed_continue = ""
         if self.config.continue_text:
             raw_continue = self.config.continue_text
             composed_continue = raw_continue
@@ -1260,8 +1257,7 @@ class TerminalMonitor:
                     composed_continue = self.policy.compose(raw_continue, self.task_state.last_known_stage)
                 except ValueError as exc:
                     self._record_policy_decision(raw_continue, "blocked", str(exc))
-                    with open(self.attention_path, "w", encoding="utf-8") as handle:
-                        handle.write(ctx.safe_snapshot + "\n")
+                    self._write_attention(ctx.safe_snapshot + "\n")
                     self.log(f"PAUSE kind=policy_conflict reason={exc}")
                     return 3, f"ATTENTION_REQUIRED kind=policy_conflict file={self.attention_path}"
             allowed, policy_reason = self.policy.authorize_action(
@@ -1271,10 +1267,19 @@ class TerminalMonitor:
             )
             if not allowed:
                 self._record_policy_decision(composed_continue, "blocked", policy_reason)
-                with open(self.attention_path, "w", encoding="utf-8") as handle:
-                    handle.write(ctx.safe_snapshot + "\n")
+                self._write_attention(ctx.safe_snapshot + "\n")
                 self.log(f"PAUSE kind=policy_conflict reason={policy_reason}")
                 return 3, f"ATTENTION_REQUIRED kind=policy_conflict file={self.attention_path}"
+        self.log("MODE: Plan completed. Auto-switching mode via switch key.")
+        self.last_action = "mode_switch:queued"
+        ok, attempt_id, detail = self._dispatch("mode_switch", self.profile.mode_switch_key, ctx.state, use_key=True)
+        if detail == "dry_run":
+            self._record_policy_decision("mode_switch", "ignored", "dry_run")
+            return 0, "DRY_RUN kind=mode_switch"
+        self.last_action = "mode_switch:accepted" if ok else "mode_switch:failed"
+        if not ok:
+            return 1, "SEND_FAILED kind=mode_switch"
+        if composed_continue:
             time.sleep(MODE_SWITCH_SLEEP_SECONDS)
             ok_continue, attempt_continue, detail_continue = self._dispatch("mode_switch_continue", composed_continue, ctx.state)
             if detail_continue == "dry_run":
@@ -1296,6 +1301,19 @@ class TerminalMonitor:
                     return 0, "MAX_SENDS_REACHED"
             else:
                 return 1, "SEND_FAILED kind=mode_switch_continue"
+        else:
+            self.export_status_json(ctx.pids, ctx.state, {"last_attempt_id": attempt_id})
+            self.session_tracker.mark_interaction(ctx.history)
+            self.task_state = replace(
+                self.task_state,
+                session_generation=self.session_tracker.generation,
+                interaction_marker=self.session_tracker.interaction_history,
+            )
+            self.task_state.save(self.task_state_path)
+            if self.on_send:
+                self.on_send("mode_switch", self.profile.mode_switch_key, ok)
+            if self.sends >= self.config.max_sends:
+                return 0, "MAX_SENDS_REACHED"
         return None, "MODE_SWITCH_SENT"
 
     def _handle_prompt_decision(self, ctx: StepContext) -> tuple[int | None, str] | None:
@@ -1321,8 +1339,7 @@ class TerminalMonitor:
                 reason = "policy_conflict"
 
         if payload is None:
-            with open(self.attention_path, "w", encoding="utf-8") as handle:
-                handle.write(ctx.safe_snapshot + "\n")
+            self._write_attention(ctx.safe_snapshot + "\n")
             if self.on_attention:
                 self.on_attention(reason, ctx.safe_snapshot)
             self.log(f"PAUSE kind={reason} hash={ctx.digest}")
@@ -1335,8 +1352,7 @@ class TerminalMonitor:
         )
         if not allowed:
             self._record_policy_decision(payload, "blocked", policy_reason)
-            with open(self.attention_path, "w", encoding="utf-8") as handle:
-                handle.write(ctx.safe_snapshot + "\n")
+            self._write_attention(ctx.safe_snapshot + "\n")
             self.log(f"PAUSE kind=policy_conflict reason={policy_reason}")
             return 3, f"ATTENTION_REQUIRED kind=policy_conflict file={self.attention_path}"
 
@@ -1378,16 +1394,10 @@ class TerminalMonitor:
         early = self._check_stop_file()
         if early is not None:
             return early
-        early = self._check_process_gone()
+        pids = self.backend.get_pids(self.config.process)
+        early = self._check_process_gone(pids)
         if early is not None:
             return early
-
-        pids = self.backend.get_pids(self.config.process)
-        if pids:
-            self.last_seen = time.monotonic()
-        elif time.monotonic() - self.last_seen >= self.config.gone_seconds:
-            self._stop_status("agent_gone")
-            return 0, "PROCESS_GONE"
 
         tab = self._get_tab(pids)
         if not tab.get("ok"):

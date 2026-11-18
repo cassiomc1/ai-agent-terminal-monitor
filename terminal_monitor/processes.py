@@ -240,13 +240,19 @@ def collect_process_activity(root_pids: list[int]) -> ProcessActivity:
         with contextlib.suppress(ValueError):
             rows[int(parts[0])] = (int(parts[1]), parts[2], float(parts[3]), parts[4])
     roots = set(root_pids)
+    children_by_parent: dict[int, list[int]] = {}
+    for pid, row in rows.items():
+        children_by_parent.setdefault(row[0], []).append(pid)
     descendants: list[int] = []
-    pending = set(roots)
+    seen_descendants: set[int] = set()
+    pending = list(roots)
     while pending:
         parent = pending.pop()
-        children = [pid for pid, row in rows.items() if row[0] == parent and pid not in descendants]
-        descendants.extend(children)
-        pending.update(children)
+        for pid in children_by_parent.get(parent, ()):
+            if pid not in seen_descendants and pid not in roots:
+                seen_descendants.add(pid)
+                descendants.append(pid)
+                pending.append(pid)
     direct_descendants = tuple(pid for pid in descendants if pid in rows and rows[pid][0] in roots)
     commands = tuple(rows[pid][3] for pid in descendants if pid in rows)
     direct_labels = [canonical_expensive_command(rows[pid][3]) for pid in direct_descendants]

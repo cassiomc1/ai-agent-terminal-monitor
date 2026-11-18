@@ -573,6 +573,7 @@ def retry_infrastructure_checks(project_dir: str, pr: dict[str, Any], *, dry_run
     if dry_run:
         return []
     retried: list[int] = []
+    seen_runs: set[int] = set()
     for check in pr.get("statusCheckRollup") or pr.get("checks") or []:
         classification = classify_check_result(check)
         if not classification["retryable"]:
@@ -582,6 +583,9 @@ def retry_infrastructure_checks(project_dir: str, pr: dict[str, Any], *, dry_run
         if not match:
             continue
         run_id = int(match.group(1))
+        if run_id in seen_runs:
+            continue
+        seen_runs.add(run_id)
         code, _, _ = run_command(["gh", "run", "rerun", str(run_id), "--failed"], cwd=project_dir)
         if code == 0:
             retried.append(run_id)

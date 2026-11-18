@@ -140,7 +140,41 @@ class ManagedPTYTests(unittest.TestCase):
         tab = _wait_for(_ready_tab, timeout=10.0)
         self.assertIsNotNone(tab, "expected a tab snapshot containing READY")
         self.assertIn("READY", tab.get("hist", ""))
-        self.assertTrue(tab.get("busy"))
+        self.assertFalse(tab.get("busy"))
+
+    def test_monitor_with_managed_pty_reaches_idle_and_sends_prompt(self):
+        from terminal_monitor.config import MonitorConfig
+        from terminal_monitor.monitor import TerminalMonitor
+
+        tmp = self._state_dir()
+        config = MonitorConfig(
+            backend="pty",
+            agent_command=CHILD_ECHO,
+            continue_text="hello-pty",
+            idle_seconds=0.0,
+            cooldown_seconds=0.0,
+            smart_nudges=False,
+            web_ui=False,
+            desktop_notifications=False,
+            state_dir=tmp,
+            project_dir=tmp,
+        )
+        monitor = TerminalMonitor(config)
+        self.addCleanup(self._cleanup_backend, monitor.backend, tmp)
+        self.assertTrue(_wait_for(lambda: b"READY" in monitor.backend._client.snapshot(), timeout=10.0))
+        code, msg = monitor.step()
+        self.assertIsNone(code)
+        self.assertIn("SENT", msg)
+        self.assertEqual(monitor.current_state, "idle")
+        self.assertTrue(_wait_for(lambda: b"ECHO:hello-pty" in monitor.backend._client.snapshot(), timeout=10.0))
+
+    def test_start_fails_fast_when_host_exits_early(self):
+        tmp = self._state_dir()
+        missing_cwd = os.path.join(tmp, "does-not-exist")
+        started = time.monotonic()
+        with self.assertRaises(RuntimeError):
+            ManagedSessionClient.start(state_dir=tmp, command=CHILD_ECHO, cwd=missing_cwd)
+        self.assertLess(time.monotonic() - started, 4.0)
 
     def test_backend_send_appends_enter_once(self):
         tmp = self._state_dir()

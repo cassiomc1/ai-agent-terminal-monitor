@@ -200,3 +200,40 @@ by reproduction checks:
    text. The answer channel is now explicitly typed — `KEY:<name>` routes to
    `send_key` (allowlisted, `manual_key` ledger reason) and unsupported names
    are rejected (HTTP `400` at `/api/send`, attention in the monitor).
+
+## Implementation of the full-codebase hardening round
+
+A comprehensive security, correctness, and concurrency audit resolved the
+following gaps across the monitor, managed PTY host, web server, and CLI:
+
+- **Managed PTY idle classification & fast-fail startup**: `ManagedPTYBackend.get_tab`
+  no longer equates `status.alive` with `busy=True`, unblocking idle
+  classification, smart nudges, and mode switching in managed sessions;
+  `ManagedSessionClient._start_locked` now fails fast if the spawned host
+  process exits early instead of polling until timeout.
+- **SessionHost startup & stream-drain atomicity**: socket binding runs before
+  forking the child process, session tokens use atomic `0o600` temp-file
+  creation (`tempfile.mkstemp`), `_handle_connection` closes sockets on early
+  errors, and `_finalize` coalesces full viewer queues so slow stream consumers
+  still receive the terminal `exit` sentinel.
+- **Supervision & policy integrity**: mode-switch `continue_text` is validated
+  against `PolicyEnvelope` before sending the switch key, loop recovery/guard
+  honor `--dry-run` before signaling PIDs, `branch_safety` nudges compose with
+  `PolicyEnvelope` and respect `--dry-run`, `attention.txt` and `answer.txt`
+  write atomically with `0o600`, `activity.commands` in `status.json` are
+  redacted, `AgentProfile` singletons are cloned instead of mutated, and
+  duplicate `get_pids()` / `collect_final_evidence()` work per step is removed.
+- **Git, tmux, process tree, and CI helpers**: `_get_local_git_fields` keeps
+  intact paths when `run_command` strips leading spaces on `git status --porcelain`,
+  `_get_git_status_uncached` bypasses the open-PR cache too, notifications
+  escape AppleScript safely and avoid quote mangling on `notify-send`, webhooks
+  require HTTP(S) URLs, `TmuxBackend.send` uses `-l --` for literal payloads,
+  `collect_process_activity` guards against cycles and excludes root PIDs, and
+  `retry_infrastructure_checks` deduplicates workflow `run_id` retries.
+- **Resume/stop verification, web API, & CLI parity**: `resume_monitor` validates
+  argv structure/entrypoints strictly, `_monitor_process_matches` matches exact
+  `--state-dir` and `terminal-monitor` / `supervisor.py` invocations, web routing
+  strips query strings and rejects invalid/negative `Content-Length`, dashboard
+  JS fixes `ansiToHtml`, `updatePipeline`, and `pollTimer` deduplication, and
+  `cli.py` / `supervise.py` consistently handle `config.debug_log_path`,
+  `continue_file`, `state_dir` backend wiring, and unknown `--remote-provider`.

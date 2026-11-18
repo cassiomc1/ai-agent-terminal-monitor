@@ -118,12 +118,21 @@ Working directory clean.
         result = terminal_monitor.terminal_tab("codex_monitor_no_such_process_987")
         self.assertFalse(result["ok"])
         # Headless CI runners may hang osascript until the hard timeout kicks
-        # in; both outcomes mean "no tab found" from the caller's perspective.
+        # in, and sandboxed/unprivileged macOS sessions may return AppleEvent
+        # errors (-10000 / -1743 / -600); all mean "no tab found" safely.
         acceptable = {
             "matching Terminal tab not found",
             terminal_monitor.run_osascript_timeout_message(),
         }
-        self.assertIn(result["error"], acceptable)
+        apple_event_error = "execution error:" in result["error"] and any(
+            code in result["error"] for code in ("(-10000)", "(-1743)", "(-600)")
+        )
+        self.assertTrue(result["error"] in acceptable or apple_event_error, result["error"])
+
+    def test_terminal_app_backend_get_tab_returns_missing_when_osascript_reports_missing(self):
+        with mock.patch.object(terminal_monitor.backends, "run_osascript", return_value=(0, "MISSING")):
+            result = terminal_monitor.TerminalAppBackend().get_tab("opencode")
+        self.assertEqual(result, {"ok": False, "error": "matching Terminal tab not found"})
 
     def test_build_parser_requires_text_unless_file_is_given(self):
         parser = terminal_monitor.build_parser()
@@ -2044,6 +2053,460 @@ class ShellOnlineAvailabilityTests(unittest.TestCase):
 
         ok, _ = ShellOnlineProvider(binary="/nonexistent-shell-xyz").stop("bad id with spaces")
         self.assertFalse(ok)
+
+
+class HardeningReviewRegressionTests(unittest.TestCase):
+    def test_porcelain_path_preserves_first_character_when_leading_space_stripped(self):
+        def fake_run(cmd, cwd=None):
+            if cmd[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
+                return (0, "true", "")
+            if cmd[:2] == ["git", "branch"]:
+                return (0, "feat/fix", "")
+            if cmd[:2] == ["git", "rev-parse"]:
+                return (0, "a" * 40, "")
+            if cmd[:2] == ["git", "status"]:
+                return (0, "M terminal_monitor/web.py\n?? new.py", "")
+            if cmd[:2] == ["git", "log"]:
+                return (0, "abc123 msg", "")
+            return (1, "", "")
+
+        with mock.patch.object(terminal_monitor.gitinfo, "run_command", side_effect=fake_run):
+            fields = terminal_monitor.gitinfo._get_local_git_fields(".")
+        self.assertIsNotNone(fields)
+        assert fields is not None
+        self.assertEqual(fields[5], ("terminal_monitor/web.py", "new.py"))
+
+    def test_desktop_notification_escapes_applescript_and_uses_linux_separator(self):
+        with mock.patch("subprocess.Popen") as mock_popen, mock.patch("sys.platform", "darwin"):
+            ok = terminal_monitor.send_desktop_notification('Title "A"\\B\nLine2', 'Msg "X"\\Y\r\nLine2')
+            self.assertTrue(ok)
+            cmd = mock_popen.call_args.args[0]
+            self.assertEqual(cmd[:2], ["osascript", "-e"])
+            self.assertNotIn("\n", cmd[2])
+            self.assertIn('\\"A\\"\\\\B Line2', cmd[2])
+            self.assertIn('\\"X\\"\\\\Y Line2', cmd[2])
+
+        with mock.patch("subprocess.Popen") as mock_popen, mock.patch("sys.platform", "linux"), mock.patch(
+            "shutil.which", return_value="/usr/bin/notify-send"
+        ):
+            ok = terminal_monitor.send_desktop_notification("--icon=bad", 'Body "quoted"')
+            self.assertTrue(ok)
+            cmd = mock_popen.call_args.args[0]
+            self.assertEqual(cmd, ["notify-send", "--", "--icon=bad", 'Body "quoted"'])
+
+    def test_dispatch_webhook_blocks_non_http_schemes(self):
+        for bad in ("file:///etc/passwd", "ftp://example.com/hook", "javascript:alert(1)", "http://"):
+            with mock.patch("urllib.request.urlopen") as urlopen_mock:
+                self.assertFalse(terminal_monitor.dispatch_webhook(bad, "evt", {}), bad)
+                urlopen_mock.assert_not_called()
+
+    def test_get_git_status_uncached_bypasses_open_prs_cache(self):
+        gh_calls = []
+
+        def fake_run(cmd, cwd=None):
+            if cmd[:2] == ["gh", "pr"]:
+                gh_calls.append(len(gh_calls) + 1)
+                return (0, json.dumps([{"number": i} for i in range(len(gh_calls))]), "")
+            return (0, "", "")
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            terminal_monitor.gitinfo, "_get_local_git_fields", return_value=("main", "a" * 40, False, 0, 0, (), "")
+        ), mock.patch("shutil.which", return_value="/usr/bin/gh"), mock.patch.object(
+            terminal_monitor.gitinfo, "run_command", side_effect=fake_run
+        ):
+            first = terminal_monitor._get_git_status_uncached(directory)
+            second = terminal_monitor._get_git_status_uncached(directory)
+        self.assertEqual(len(gh_calls), 2)
+        self.assertEqual(first.open_prs_count, 1)
+        self.assertEqual(second.open_prs_count, 2)
+
+    def test_tmux_send_uses_literal_flag_and_separator_then_enter(self):
+        backend = terminal_monitor.TmuxBackend()
+        calls = []
+
+        def fake_run(cmd, cwd=None):
+            calls.append(cmd)
+            return (0, "SENT", "")
+
+        with mock.patch.object(backend, "_find_target", return_value="sess:0.0"), mock.patch.object(
+            terminal_monitor.backends, "run_command", side_effect=fake_run
+        ):
+            ok1, _ = backend.send("opencode", None, "-flag-like")
+            ok2, _ = backend.send("opencode", None, "Enter")
+        self.assertTrue(ok1)
+        self.assertTrue(ok2)
+        self.assertEqual(
+            calls,
+            [
+                ["tmux", "send-keys", "-t", "sess:0.0", "-l", "--", "-flag-like"],
+                ["tmux", "send-keys", "-t", "sess:0.0", "Enter"],
+                ["tmux", "send-keys", "-t", "sess:0.0", "-l", "--", "Enter"],
+                ["tmux", "send-keys", "-t", "sess:0.0", "Enter"],
+            ],
+        )
+
+    def test_terminal_identity_score_handles_non_numeric_root_pid(self):
+        identity = terminal_monitor.TerminalIdentity(project_path="/work/app", root_pid=42)
+        self.assertEqual(identity.score({"history": "/work/app", "root_pid": None}), 8)
+        self.assertEqual(identity.score({"history": "/work/app", "root_pid": "not-a-pid"}), 8)
+        self.assertEqual(identity.score({"history": "/work/app", "root_pid": "42"}), 18)
+
+    def test_get_backend_pty_wires_state_dir(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = terminal_monitor.get_backend("pty", state_dir=directory)
+            self.assertIsInstance(backend, terminal_monitor.ManagedPTYBackend)
+            self.assertEqual(backend._resolve_state_dir(), str(pathlib.Path(directory).resolve()))
+
+    def test_monitor_does_not_mutate_builtin_profile_unsafe_phrases(self):
+        before = list(terminal_monitor.BUILTIN_PROFILES["opencode"].unsafe_phrases)
+        with tempfile.TemporaryDirectory() as directory:
+            terminal_monitor.TerminalMonitor(
+                terminal_monitor.MonitorConfig(
+                    process="opencode",
+                    profile="opencode",
+                    unsafe_phrases=["brand-new-custom-unsafe-phrase"],
+                    state_dir=directory,
+                ),
+                backend=MockBackend(),
+            )
+        after = list(terminal_monitor.BUILTIN_PROFILES["opencode"].unsafe_phrases)
+        self.assertEqual(before, after)
+        self.assertNotIn("brand-new-custom-unsafe-phrase", after)
+
+    def test_mode_switch_blocks_prohibited_continue_text_before_sending_tab(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = MockBackend(
+                tab_response={
+                    "ok": True,
+                    "error": "",
+                    "hist": "Plan · Ox Alpha\nPlano pronto. Aprove para eu sair do modo plano.",
+                }
+            )
+            monitor = terminal_monitor.TerminalMonitor(
+                terminal_monitor.MonitorConfig(
+                    process="opencode",
+                    profile="opencode",
+                    continue_text="npm publish",
+                    idle_seconds=0.0,
+                    cooldown_seconds=0.0,
+                    auto_switch_modes=True,
+                    state_dir=directory,
+                ),
+                backend=backend,
+            )
+            code, msg = monitor.step()
+        self.assertEqual(code, 3)
+        self.assertIn("policy_conflict", msg)
+        self.assertEqual(backend.sent_keys, [])
+        self.assertEqual(backend.sent_payloads, [])
+
+    def test_loop_guard_and_recover_respect_dry_run_without_signaling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = MockBackend()
+            clean_git = terminal_monitor.GitStatus(is_repo=True, branch="feat/dry")
+            activity = terminal_monitor.ProcessActivity(
+                active=True,
+                descendants=(200,),
+                direct_descendants=(200,),
+                expensive_roots=(200,),
+                commands=("npm test",),
+            )
+            with (
+                mock.patch.object(terminal_monitor.monitor, "get_git_status", return_value=clean_git),
+                mock.patch.object(terminal_monitor.monitor, "capture_safety_baseline", return_value={"safetyBaselineCaptured": True}),
+                mock.patch.object(terminal_monitor.monitor, "get_current_pr_snapshot", return_value=None),
+                mock.patch.object(terminal_monitor.monitor, "collect_process_activity", return_value=activity),
+                mock.patch.object(terminal_monitor.monitor, "interrupt_process_tree") as interrupt_mock,
+            ):
+                monitor = terminal_monitor.TerminalMonitor(
+                    terminal_monitor.MonitorConfig(
+                        process="opencode",
+                        supervise=True,
+                        dry_run=True,
+                        loop_guard=True,
+                        expected_branch="feat/dry",
+                        state_dir=directory,
+                    ),
+                    backend=backend,
+                )
+                monitor.loop_assessment = terminal_monitor.LoopAssessment(
+                    True, "repeated_expensive_command_without_progress", ("full-test-suite",), 3
+                )
+                recovered, detail = monitor._recover_agent_loop([100], activity, "thinking")
+                self.assertFalse(recovered)
+                self.assertEqual(detail, "dry_run")
+                interrupt_mock.assert_not_called()
+
+                activity2 = terminal_monitor.ProcessActivity(
+                    active=True,
+                    descendants=(201,),
+                    direct_descendants=(201,),
+                    expensive_roots=(201,),
+                    commands=("npm test",),
+                )
+                monitor.agent_loop_guard = terminal_monitor.AgentLoopGuard(repeat_limit=2)
+                code1, _msg1 = monitor.step()
+                self.assertIsNone(code1)
+                with mock.patch.object(terminal_monitor.monitor, "collect_process_activity", return_value=activity2):
+                    code, msg = monitor.step()
+                self.assertEqual(code, 0)
+                self.assertIn("DRY_RUN kind=agent_loop", msg)
+                interrupt_mock.assert_not_called()
+
+    def test_refresh_git_context_does_not_overwrite_expected_branch_when_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = MockBackend()
+            monitor = terminal_monitor.TerminalMonitor(
+                terminal_monitor.MonitorConfig(
+                    process="opencode",
+                    supervise=False,
+                    expected_branch="feat/keep-me",
+                    state_dir=directory,
+                ),
+                backend=backend,
+            )
+            ctx = terminal_monitor.monitor.StepContext(
+                pids=[123],
+                tab={"ok": True},
+                history="",
+                snapshot="",
+                safe_snapshot="",
+                digest="d",
+                activity=terminal_monitor.ProcessActivity(),
+                state="idle",
+                mode=None,
+                test_progress=None,
+            )
+            with mock.patch.object(
+                terminal_monitor.monitor, "get_git_status", return_value=terminal_monitor.GitStatus(is_repo=False, branch="")
+            ):
+                monitor._refresh_git_context(ctx)
+            self.assertEqual(monitor.task_state.expected_branch, "feat/keep-me")
+
+    def test_manual_answer_does_not_advance_generation_when_send_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pathlib.Path(directory, "answer.txt").write_text("Continue work\n", encoding="utf-8")
+            backend = MockBackend(
+                tab_response={"ok": True, "error": "", "hist": "All tasks complete.\nReady"},
+                send_response=(False, "backend failed"),
+            )
+            monitor = terminal_monitor.TerminalMonitor(
+                terminal_monitor.MonitorConfig(process="opencode", state_dir=directory, cooldown_seconds=0.0),
+                backend=backend,
+            )
+            before_gen = monitor.session_tracker.generation
+            code, msg = monitor.step()
+            self.assertEqual(code, 1)
+            self.assertIn("SEND_FAILED kind=manual", msg)
+            self.assertEqual(monitor.session_tracker.generation, before_gen)
+            self.assertEqual(monitor.task_state.session_generation, before_gen)
+
+    def test_status_json_redacts_activity_commands_on_disk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status_path = pathlib.Path(directory, "status.json")
+            backend = MockBackend(tab_response={"ok": True, "error": "", "hist": "working...\nesc interrupt"})
+            monitor = terminal_monitor.TerminalMonitor(
+                terminal_monitor.MonitorConfig(process="opencode", state_dir=directory, status_json_path=str(status_path)),
+                backend=backend,
+            )
+            secret = "super-secret-cmd-token"
+            activity = terminal_monitor.ProcessActivity(active=True, descendants=(200,), commands=(f"curl --token={secret}",))
+            with mock.patch.object(terminal_monitor.monitor, "collect_process_activity", return_value=activity):
+                monitor.step()
+            raw = status_path.read_text(encoding="utf-8")
+            self.assertNotIn(secret, raw)
+            parsed = json.loads(raw)
+            self.assertIn("<redacted>", parsed["activity"]["commands"][0])
+
+    def test_collect_process_activity_handles_cycles_and_excludes_roots(self):
+        ps_output = "\n".join(
+            [
+                "100 201 00:10 0.0 opencode",
+                "200 100 00:05 1.0 pytest",
+                "201 200 00:04 0.0 python helper",
+            ]
+        )
+        with mock.patch.object(terminal_monitor.processes, "run_command", return_value=(0, ps_output, "")):
+            activity = terminal_monitor.collect_process_activity([100])
+        self.assertTrue(activity.active)
+        self.assertNotIn(100, activity.descendants)
+        self.assertEqual(set(activity.descendants), {200, 201})
+
+    def test_retry_infrastructure_checks_deduplicates_run_ids(self):
+        pr = {
+            "statusCheckRollup": [
+                {"name": "job-a", "conclusion": "cancelled", "detailsUrl": "https://github.com/o/r/actions/runs/555/jobs/1"},
+                {"name": "job-b", "conclusion": "timed_out", "detailsUrl": "https://github.com/o/r/actions/runs/555/jobs/2"},
+            ]
+        }
+        with mock.patch.object(terminal_monitor.github, "run_command", return_value=(0, "", "")) as run:
+            retried = terminal_monitor.retry_infrastructure_checks(".", pr)
+        self.assertEqual(retried, [555])
+        run.assert_called_once_with(["gh", "run", "rerun", "555", "--failed"], cwd=".")
+
+    def test_resume_monitor_rejects_injection_and_accepts_valid_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            resolved_dir = str(pathlib.Path(directory).resolve())
+            pathlib.Path(directory, "status.json").write_text(
+                json.dumps({"running": False, "git": {"branch": "main"}}),
+                encoding="utf-8",
+            )
+            bad_commands = [
+                ["/bin/sh", "-c", f"echo pwned # -m terminal_monitor supervise --state-dir {resolved_dir}"],
+                [sys.executable, "-c", f"import os # terminal_monitor.py supervise --state-dir {resolved_dir}"],
+                [sys.executable, "-m", "terminal_monitor", "supervise", "--state-dir", "/tmp/other-dir"],
+                [sys.executable, "-m", "terminal_monitor", "--once", "--state-dir", resolved_dir],
+            ]
+            for bad in bad_commands:
+                pathlib.Path(directory, "monitor.json").write_text(json.dumps({"command": bad}), encoding="utf-8")
+                res = terminal_monitor.resume_monitor(directory, project_dir=directory)
+                self.assertFalse(res["ok"], f"expected rejection for {bad}")
+                self.assertIn("untrusted", res["error"])
+
+            good_cmd = [sys.executable, "-m", "terminal_monitor", "supervise", "--state-dir", resolved_dir]
+            pathlib.Path(directory, "monitor.json").write_text(json.dumps({"command": good_cmd}), encoding="utf-8")
+            fake_proc = mock.Mock(pid=43210)
+            with mock.patch("subprocess.Popen", return_value=fake_proc) as popen_mock:
+                res = terminal_monitor.resume_monitor(directory, project_dir=directory)
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["pid"], 43210)
+            popen_mock.assert_called_once()
+            self.assertEqual(popen_mock.call_args.args[0], good_cmd)
+
+    def test_monitor_process_matches_validates_state_dir_and_console_scripts(self):
+        with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
+            p1 = str(pathlib.Path(d1).resolve())
+            p2 = str(pathlib.Path(d2).resolve())
+            with mock.patch.object(terminal_monitor.status, "pid_is_alive", return_value=True):
+                with mock.patch.object(
+                    terminal_monitor.status,
+                    "run_command",
+                    return_value=(0, f"/usr/bin/terminal-monitor supervise --state-dir {p1}", ""),
+                ):
+                    self.assertTrue(terminal_monitor._monitor_process_matches(123, p1))
+                    self.assertFalse(terminal_monitor._monitor_process_matches(123, p2))
+                with mock.patch.object(
+                    terminal_monitor.status,
+                    "run_command",
+                    return_value=(0, f"/usr/bin/python3 /app/supervisor.py --state-dir={p1}", ""),
+                ):
+                    self.assertTrue(terminal_monitor._monitor_process_matches(123, p1))
+                    self.assertFalse(terminal_monitor._monitor_process_matches(123, p2))
+
+    def test_web_server_host_query_routing_content_length_and_instances_sanitization(self):
+        import socket as _socket
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory, "state-root")
+            evil_inst = root / "evil-inst"
+            evil_inst.mkdir(parents=True)
+            (evil_inst / "status.json").write_text(
+                json.dumps({"state": "idle", "process": "opencode", "web_url": "javascript:alert(1)"}),
+                encoding="utf-8",
+            )
+            good_inst = root / "good-inst"
+            good_inst.mkdir(parents=True)
+            (good_inst / "status.json").write_text(
+                json.dumps({"state": "thinking", "process": "claude", "web_url": "http://127.0.0.1:9999/"}),
+                encoding="utf-8",
+            )
+            status_path = pathlib.Path(directory, "status.json")
+            log_path = pathlib.Path(directory, "monitor.log")
+            answer_path = pathlib.Path(directory, "answer.txt")
+            status_path.write_text(json.dumps({"state": "thinking", "pids": [10]}), encoding="utf-8")
+            log_path.write_text("START\n", encoding="utf-8")
+            server = terminal_monitor.MonitorWebServer(
+                str(status_path),
+                str(log_path),
+                port=0,
+                answer_path=str(answer_path),
+                state_root=str(root),
+            )
+            server.start()
+            try:
+                # Query-string token on GET /api/status works.
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{server.port}/api/status?token={urllib.parse.quote(server.token)}",
+                    timeout=2,
+                ) as resp:
+                    self.assertEqual(json.loads(resp.read())["state"], "thinking")
+
+                # Bracketed IPv6 Host header allowed; spoofed Host rejected.
+                with _socket.create_connection(("127.0.0.1", server.port), timeout=2) as sock:
+                    req = f"GET /api/status HTTP/1.1\r\nHost: [::1]:{server.port}\r\nX-Monitor-Token: {server.token}\r\nConnection: close\r\n\r\n"
+                    sock.sendall(req.encode("ascii"))
+                    raw_resp = sock.recv(4096).decode("utf-8", "replace")
+                self.assertIn("200 OK", raw_resp)
+
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    web_json(server, "api/status", headers={"Host": f"evil.example:{server.port}"}, timeout=2)
+                self.assertEqual(ctx.exception.code, 403)
+
+                # Negative and non-numeric Content-Length -> 400.
+                for bad_len in ("-1", "abc"):
+                    with _socket.create_connection(("127.0.0.1", server.port), timeout=2) as sock:
+                        raw_req = (
+                            f"POST /api/send HTTP/1.1\r\n"
+                            f"Host: 127.0.0.1:{server.port}\r\n"
+                            f"X-Monitor-Token: {server.token}\r\n"
+                            f"Content-Length: {bad_len}\r\n"
+                            f"Connection: close\r\n\r\n"
+                        )
+                        sock.sendall(raw_req.encode("ascii"))
+                        raw_resp = sock.recv(4096).decode("utf-8", "replace")
+                    self.assertIn("400", raw_resp, bad_len)
+                self.assertFalse(answer_path.exists())
+
+                # /api/instances strips javascript: URLs and keeps loopback HTTP URLs.
+                instances = web_json(server, "api/instances", timeout=2)["instances"]
+                by_id = {item["id"]: item for item in instances}
+                self.assertEqual(by_id["evil-inst"]["web_url"], "")
+                self.assertEqual(by_id["good-inst"]["web_url"], "http://127.0.0.1:9999/")
+            finally:
+                server.stop()
+
+        self.assertIn("normalizePipelineStage", terminal_monitor.DASHBOARD_HTML)
+        self.assertIn("CI_PENDING", terminal_monitor.DASHBOARD_HTML)
+        self.assertIn("POST_MERGE_VERIFY", terminal_monitor.DASHBOARD_HTML)
+        self.assertIn("pollTimer", terminal_monitor.DASHBOARD_HTML)
+
+    def test_config_and_cli_validation_hardening(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bad_cfg = pathlib.Path(directory, "bad.json")
+            bad_cfg.write_text("[]", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                terminal_monitor.load_config_file(bad_cfg)
+
+            cont_file = pathlib.Path(directory, "prompt.txt")
+            cont_file.write_text("  Keep moving  \n", encoding="utf-8")
+            cfg_file = pathlib.Path(directory, ".terminal-monitor.json")
+            cfg_file.write_text(json.dumps({"continue_file": str(cont_file)}), encoding="utf-8")
+            parser = terminal_monitor.build_parser()
+            args = parser.parse_args(["--project-dir", directory])
+            cfg = terminal_monitor.config_from_args(args)
+            self.assertEqual(cfg.continue_text, "Keep moving")
+            self.assertEqual(cfg.continue_file, str(cont_file))
+
+            cfg_file.write_text(json.dumps({"continue_file": str(pathlib.Path(directory, "missing.txt"))}), encoding="utf-8")
+            with self.assertRaises(FileNotFoundError):
+                terminal_monitor.config_from_args(args)
+            cfg_file.unlink()
+
+            stop_args = parser.parse_args(["stop", "-d", directory])
+            self.assertEqual(stop_args.project_dir, directory)
+            attach_args = parser.parse_args(["attach", "-d", directory, "--read-only"])
+            self.assertEqual(attach_args.project_dir, directory)
+
+            from terminal_monitor import cli as cli_module
+
+            with mock.patch.object(sys, "argv", ["terminal_monitor", "--project-dir", directory, "--state-dir", directory, "--remote-provider", "bogus"]):
+                import io as _io
+
+                err = _io.StringIO()
+                with mock.patch.object(sys, "stderr", err):
+                    rc = cli_module.main()
+            self.assertEqual(rc, 2)
+            self.assertIn("E_REMOTE_PROVIDER_UNAVAILABLE", err.getvalue())
 
 
 if __name__ == "__main__":
